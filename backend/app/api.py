@@ -126,6 +126,50 @@ async def get_install_log():
     return {"error": "Installation log file not found."}
 
 
+@router.get("/debug/opencode-path")
+async def debug_opencode_path(directory: str = "/data/workspaces"):
+    """Show the RAW response from opencode /path endpoint for debugging."""
+    try:
+        async with httpx.AsyncClient(base_url="http://127.0.0.1:4096", timeout=10.0) as c:
+            import urllib.parse
+            r = await c.get(f"/path?directory={urllib.parse.quote(directory, safe='/')}")  
+            return {
+                "status": r.status_code,
+                "raw": r.text[:4000],
+                "json": r.json() if r.headers.get("content-type", "").startswith("application/json") else None,
+                "directory": directory
+            }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@router.get("/debug/opencode-log")
+async def debug_opencode_log():
+    """Show opencode serve startup log."""
+    for path in ["/data/logs/opencode-serve.log", "/tmp/logs/opencode-serve.log"]:
+        if os.path.exists(path):
+            with open(path, "r", errors="replace") as f:
+                content = f.read()
+            return {"log": content[-5000:], "path": path}
+    return {"error": "Log not found"}
+
+
+@router.get("/debug/workspace-ls")
+async def debug_workspace_ls():
+    """List actual files in workspace on the server."""
+    wp = os.environ.get("WORKSPACE_PATH", "/data/workspaces")
+    result = {}
+    try:
+        result["workspace"] = wp
+        result["exists"] = os.path.exists(wp)
+        result["contents"] = os.listdir(wp) if os.path.exists(wp) else []
+        result["home"] = os.environ.get("HOME", "N/A")
+        result["home_contents"] = os.listdir(os.environ.get("HOME", "/root")) if os.path.exists(os.environ.get("HOME", "/root")) else []
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
 @router.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
     """Receive Telegram updates via webhook (for HuggingFace Spaces / environments without outbound access)."""
