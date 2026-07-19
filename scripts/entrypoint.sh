@@ -61,14 +61,14 @@ for i in $(seq 1 45); do
         cat /data/logs/opencode-serve.log 2>/dev/null || true
         break
     fi
-    if ss -tlnp 2>/dev/null | grep -q ':4096'; then
+    # Check if port 4096 is responding
+    if curl -sf http://127.0.0.1:4096/global/health >/dev/null 2>&1; then
         echo "opencode serve is ready on port 4096 (attempt $i)"
         READY=1
         break
     fi
     if [ $((i % 10)) -eq 0 ]; then
-        echo "  [attempt $i] Still waiting... (last log lines):"
-        tail -3 /data/logs/opencode-serve.log 2>/dev/null || true
+        echo "  [attempt $i] Still waiting..."
     fi
     sleep 1
 done
