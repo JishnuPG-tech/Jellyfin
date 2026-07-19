@@ -20,5 +20,8 @@ if [ ! -f /usr/local/bin/opencode ] && command -v opencode >/dev/null 2>&1; then
     ln -sf "$(command -v opencode)" /usr/local/bin/opencode || true
 fi
 
+echo "Starting opencode serve on port 4096..."
+opencode serve --port 4096 --hostname 127.0.0.1 >/data/logs/opencode-serve.log 2>&1 &
+
 echo "Starting uvicorn on port ${PORT:-7860}..."
 exec uvicorn backend.app.main:app --host 0.0.0.0 --port "${PORT:-7860}" --log-level info

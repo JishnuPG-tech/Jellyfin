@@ -42,5 +42,47 @@ try:
     @app.get("/healthz")
     async def health():
         return await healthz()
+
+    # ── Transparent Reverse Proxy to local opencode serve (port 4096) ──
+    import httpx
+    from fastapi import Request, HTTPException
+    from fastapi.responses import StreamingResponse
+
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+    async def proxy_request(request: Request, path: str):
+        if request.headers.get("upgrade", "").lower() == "websocket":
+            raise HTTPException(status_code=400, detail="Websocket upgrade not supported on proxy")
+            
+        headers = dict(request.headers)
+        headers.pop("host", None)
+        content = await request.body()
+        
+        async def stream_response():
+            async with httpx.AsyncClient() as c:
+                req = c.build_request(
+                    method=request.method,
+                    url=f"http://127.0.0.1:4096/{path}" + (f"?{request.url.query}" if request.url.query else ""),
+                    headers=headers,
+                    content=content,
+                    timeout=120.0
+                )
+                r = await c.send(req, stream=True)
+                yield r
+                
+        try:
+            stream_gen = stream_response()
+            r = await stream_gen.__anext__()
+            
+            response_headers = dict(r.headers)
+            response_headers.pop("content-length", None)
+            
+            return StreamingResponse(
+                r.iter_bytes(),
+                status_code=r.status_code,
+                headers=response_headers,
+                media_type=r.headers.get("content-type")
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Proxy error: {str(e)}")
 except Exception:
     app = None
