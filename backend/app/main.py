@@ -94,7 +94,7 @@ try:
             response_headers.pop("content-length", None)
             
             return StreamingResponse(
-                r.iter_bytes(),
+                r.aiter_bytes(),
                 status_code=r.status_code,
                 headers=response_headers,
                 media_type=r.headers.get("content-type")
