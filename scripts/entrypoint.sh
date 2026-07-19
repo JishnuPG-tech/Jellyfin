@@ -20,6 +20,10 @@ if [ ! -f /usr/local/bin/opencode ] && command -v opencode >/dev/null 2>&1; then
     ln -sf "$(command -v opencode)" /usr/local/bin/opencode || true
 fi
 
+# Create symlinks in home directories to allow the file explorer to browse workspaces
+ln -sf "$WORKSPACE_PATH" /root/workspaces || true
+ln -sf "$WORKSPACE_PATH" /home/appuser/workspaces || true
+
 echo "Starting opencode serve on port 4096..."
 cd "${WORKSPACE_PATH}" || true
 opencode serve --port 4096 --hostname 127.0.0.1 >/data/logs/opencode-serve.log 2>&1 &
