@@ -176,23 +176,18 @@ try:
         if request.url.query:
             url += f"?{request.url.query}"
 
-        req = httpx.Request(
-            method=request.method,
-            url=f"http://127.0.0.1:{port}{url}",
-            headers=headers,
-            content=content,
-        )
-
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            try:
-                r = await client.send(req, stream=True)
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                r = await client.request(
+                    method=request.method,
+                    url=f"http://127.0.0.1:{port}{url}",
+                    headers=headers,
+                    content=content,
+                )
 
                 async def stream_bytes():
-                    try:
-                        async for chunk in r.aiter_bytes():
-                            yield chunk
-                    finally:
-                        await r.aclose()
+                    for chunk in r.iter_bytes():
+                        yield chunk
 
                 response_headers = dict(r.headers)
                 response_headers.pop("content-length", None)
@@ -203,8 +198,8 @@ try:
                     headers=response_headers,
                     media_type=r.headers.get("content-type"),
                 )
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Proxy error: {str(e)}")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Proxy error: {str(e)}")
 
     # ── Default HTTP reverse proxy (backward compat, single workspace) ─
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
@@ -254,22 +249,18 @@ try:
         if request.url.query:
             url += f"?{request.url.query}"
 
-        async with httpx.AsyncClient(base_url="http://127.0.0.1:4096", timeout=120.0) as client:
-            try:
-                r = await client.build_request(
+        try:
+            async with httpx.AsyncClient(base_url="http://127.0.0.1:4096", timeout=120.0) as client:
+                r = await client.request(
                     method=request.method,
                     url=url,
                     headers=headers,
                     content=content,
                 )
-                r = await client.send(r, stream=True)
 
                 async def stream_bytes():
-                    try:
-                        async for chunk in r.aiter_bytes():
-                            yield chunk
-                    finally:
-                        await r.aclose()
+                    for chunk in r.iter_bytes():
+                        yield chunk
 
                 response_headers = dict(r.headers)
                 response_headers.pop("content-length", None)
@@ -280,8 +271,8 @@ try:
                     headers=response_headers,
                     media_type=r.headers.get("content-type"),
                 )
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Proxy error: {str(e)}")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Proxy error: {str(e)}")
 
 except Exception:
     app = None

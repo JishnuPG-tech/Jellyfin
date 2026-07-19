@@ -47,15 +47,15 @@ ln -sf "$WORKSPACE_PATH" /data/workspaces 2>/dev/null || true
 
 echo "Starting default opencode serve on port 4096..."
 cd "${WORKSPACE_PATH}" || true
-opencode serve --port 4096 --hostname 127.0.0.1 >/data/logs/opencode-serve.log 2>&1 &
+opencode serve --port 4096 --hostname 127.0.0.1 > /data/logs/opencode-serve.log 2>&1 &
 OPENCODE_PID=$!
 echo "opencode serve started (PID: $OPENCODE_PID)"
 cd /app || true
 
-# Wait up to 30s for opencode serve to bind to port 4096
+# Wait up to 45s for opencode serve to bind to port 4096
 echo "Waiting for opencode serve to be ready..."
 READY=0
-for i in $(seq 1 30); do
+for i in $(seq 1 45); do
     if ! kill -0 "$OPENCODE_PID" 2>/dev/null; then
         echo "  opencode serve process exited! Log:"
         cat /data/logs/opencode-serve.log 2>/dev/null || true
@@ -66,12 +66,18 @@ for i in $(seq 1 30); do
         READY=1
         break
     fi
-    echo "  [attempt $i] Port 4096 not bound yet..."
+    if [ $((i % 10)) -eq 0 ]; then
+        echo "  [attempt $i] Still waiting... (last log lines):"
+        tail -3 /data/logs/opencode-serve.log 2>/dev/null || true
+    fi
     sleep 1
 done
 
 if [ "$READY" = "0" ]; then
-    echo "WARNING: opencode serve not ready after 30s. Starting uvicorn anyway."
+    echo "WARNING: opencode serve not ready after 45s."
+    echo "Full log:"
+    cat /data/logs/opencode-serve.log 2>/dev/null || true
+    echo "Starting uvicorn anyway..."
     sleep 2
 fi
 
