@@ -140,13 +140,86 @@ async def telegram_webhook(request: Request):
     return {"ok": True}
 
 
+# ── Workspace management ──
+import shutil
+
+class WorkspaceCloneReq(BaseModel):
+    user_id: int
+    repo_url: str
+    folder_name: str | None = None
+
+class WorkspaceDeleteReq(BaseModel):
+    user_id: int
+    folder_name: str
+
+@router.get("/workspace/list")
+async def list_workspaces(user_id: int):
+    sm = SessionManager(settings)
+    user_dir = os.path.join(sm.workspace_root, f"user_{user_id}")
+    if not os.path.exists(user_dir):
+        return {"folders": ["default"]}
+    try:
+        folders = [
+            d for d in os.listdir(user_dir)
+            if os.path.isdir(os.path.join(user_dir, d)) and not d.startswith(".")
+        ]
+        if "default" not in folders:
+            folders.insert(0, "default")
+        return {"folders": folders}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/workspace/clone")
+async def clone_workspace(req: WorkspaceCloneReq):
+    sm = SessionManager(settings)
+    user_dir = os.path.join(sm.workspace_root, f"user_{req.user_id}")
+    os.makedirs(user_dir, exist_ok=True)
+    
+    folder_name = req.folder_name
+    if not folder_name:
+        folder_name = req.repo_url.rstrip("/").split("/")[-1]
+        if folder_name.endswith(".git"):
+            folder_name = folder_name[:-4]
+            
+    target_path = os.path.join(user_dir, folder_name)
+    if os.path.exists(target_path):
+        raise HTTPException(status_code=400, detail="Folder already exists")
+        
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "clone", req.repo_url, target_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise Exception(stderr.decode().strip())
+        return {"status": "cloned", "folder": folder_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Clone failed: {str(e)}")
+
+@router.post("/workspace/delete")
+async def delete_workspace(req: WorkspaceDeleteReq):
+    sm = SessionManager(settings)
+    target_path = os.path.join(sm.workspace_root, f"user_{req.user_id}", req.folder_name)
+    if not os.path.exists(target_path):
+        raise HTTPException(status_code=404, detail="Folder not found")
+    if req.folder_name == "default":
+        raise HTTPException(status_code=400, detail="Cannot delete default workspace")
+    try:
+        shutil.rmtree(target_path)
+        return {"status": "deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.websocket("/ws/session/{user_id}")
-async def websocket_session(websocket: WebSocket, user_id: str):
+async def websocket_session(websocket: WebSocket, user_id: str, project: str = "default"):
     await websocket.accept()
     sm = SessionManager(settings)
     from bot.telegram_bot import clean_terminal_output
     
-    sm.ensure_session(user_id)
+    sm.ensure_session(user_id, project=project)
     
     async def stream_to_client():
         try:

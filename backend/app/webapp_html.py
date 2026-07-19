@@ -198,6 +198,14 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
 <div class="topbar">
     <span class="topbar-title">opencode</span>
+    <div style="margin-left: 20px; display: flex; align-items: center; gap: 8px;">
+        <span style="font-size: 11px; color: #555; font-weight: 500;">WORKSPACE:</span>
+        <select id="workspace-select" style="background: #0f0f0f; color: #bbb; border: 1px solid #222; border-radius: 4px; padding: 3px 8px; font-size: 11px; font-family: 'JetBrains Mono', monospace; outline: none; cursor: pointer;" onchange="changeWorkspace()">
+            <option value="default">default</option>
+        </select>
+        <button onclick="promptClone()" style="background: #22c55e; border: none; color: #000; font-size: 10px; font-weight: 700; padding: 4px 10px; border-radius: 4px; cursor: pointer; text-transform: uppercase; font-family: 'JetBrains Mono', monospace;">CLONE REPO</button>
+        <button onclick="promptDelete()" style="background: #ef4444; border: none; color: #fff; font-size: 10px; font-weight: 700; padding: 4px 10px; border-radius: 4px; cursor: pointer; text-transform: uppercase; font-family: 'JetBrains Mono', monospace;">DELETE</button>
+    </div>
     <div class="topbar-status">
         <div class="topbar-dot" id="ws-dot"></div>
         <span id="ws-label">connecting</span>
@@ -237,13 +245,115 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const cmdInput = document.getElementById('cmd');
     const wsDot = document.getElementById('ws-dot');
     const wsLabel = document.getElementById('ws-label');
+    const wsSelect = document.getElementById('workspace-select');
     let ws = null;
     let lastContent = '';
+    let currentProject = 'default';
+    let reconnectTimer = null;
+
+    // ── Workspace Functions ──
+    async function loadWorkspaces() {
+        try {
+            const resp = await fetch(`/api/workspace/list?user_id=${userId}`);
+            const data = await resp.json();
+            if (data.folders) {
+                const prevSel = wsSelect.value || currentProject;
+                wsSelect.innerHTML = '';
+                data.folders.forEach(f => {
+                    const opt = document.createElement('option');
+                    opt.value = f;
+                    opt.textContent = f;
+                    wsSelect.appendChild(opt);
+                });
+                if (data.folders.includes(prevSel)) {
+                    wsSelect.value = prevSel;
+                } else {
+                    currentProject = data.folders[0] || 'default';
+                    wsSelect.value = currentProject;
+                }
+            }
+        } catch (e) {
+            console.error("Failed to load workspaces:", e);
+        }
+    }
+
+    window.changeWorkspace = function() {
+        currentProject = wsSelect.value;
+        term.innerHTML = `<span style="color:#555;">Switching to workspace: ${currentProject}...</span>\n<span class="cursor" id="cursor"></span>`;
+        if (ws) {
+            if (reconnectTimer) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+            ws.onclose = null;
+            ws.close();
+        }
+        connect();
+    };
+
+    window.promptClone = async function() {
+        const repoUrl = prompt("Enter Git Repository URL to clone (e.g. https://github.com/username/project.git):");
+        if (!repoUrl) return;
+        const folderName = prompt("Enter local folder name (optional, defaults to repo name):");
+        
+        term.innerHTML = `<span style="color:#22c55e;">Cloning ${repoUrl}... (this may take a few moments)</span>\n<span class="cursor" id="cursor"></span>`;
+        
+        try {
+            const resp = await fetch('/api/workspace/clone', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: parseInt(userId), repo_url: repoUrl, folder_name: folderName || null })
+            });
+            const data = await resp.json();
+            if (resp.ok) {
+                alert(`Successfully cloned: ${data.folder}`);
+                await loadWorkspaces();
+                wsSelect.value = data.folder;
+                changeWorkspace();
+            } else {
+                alert(`Clone failed: ${data.detail || 'Unknown error'}`);
+                term.innerHTML = `<span style="color:#ef4444;">Clone failed: ${data.detail || 'Unknown error'}</span>\n<span class="cursor" id="cursor"></span>`;
+            }
+        } catch (e) {
+            alert(`Clone failed: ${e.message}`);
+            term.innerHTML = `<span style="color:#ef4444;">Clone failed: ${e.message}</span>\n<span class="cursor" id="cursor"></span>`;
+        }
+    };
+
+    window.promptDelete = async function() {
+        const activeFolder = wsSelect.value;
+        if (activeFolder === 'default') {
+            alert("Cannot delete the default workspace.");
+            return;
+        }
+        if (!confirm(`Are you sure you want to delete workspace "${activeFolder}"? This will delete all files permanently.`)) {
+            return;
+        }
+        try {
+            const resp = await fetch('/api/workspace/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ user_id: parseInt(userId), folder_name: activeFolder })
+            });
+            const data = await resp.json();
+            if (resp.ok) {
+                alert(`Deleted workspace: ${activeFolder}`);
+                await loadWorkspaces();
+                changeWorkspace();
+            } else {
+                alert(`Delete failed: ${data.detail || 'Unknown error'}`);
+            }
+        } catch (e) {
+            alert(`Delete failed: ${e.message}`);
+        }
+    };
 
     // ── WebSocket ──
     function connect() {
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        ws = new WebSocket(`${proto}://${location.host}/api/ws/session/${userId}`);
+        const projectParam = encodeURIComponent(currentProject);
+        ws = new WebSocket(`${proto}://${location.host}/api/ws/session/${userId}?project=${projectParam}`);
+        lastContent = '';
 
         wsDot.className = 'topbar-dot connecting';
         wsLabel.textContent = 'connecting';
@@ -265,14 +375,14 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         ws.onclose = () => {
             wsDot.className = 'topbar-dot';
             wsLabel.textContent = 'disconnected';
-            setTimeout(connect, 3000);
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(connect, 3000);
         };
 
         ws.onerror = () => ws.close();
     }
 
     function renderOutput(text) {
-        // Clean ANSI
         let clean = text
             .replace(/\x1b\]8;[^\x1b\x07]*[\x1b\x07]/g, '')
             .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
@@ -284,7 +394,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
         if (!clean) return;
 
-        // Google login detection
         const googleMatch = clean.match(/https:\/\/accounts\.google\.com\/o\/oauth2\/auth\?[^\s'"]+/);
         if (googleMatch) {
             const url = googleMatch[0].replace(/[)\]]+$/, '');
@@ -298,12 +407,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             return;
         }
 
-        // Avoid redundant updates
         if (clean === lastContent) return;
         lastContent = clean;
 
         term.textContent = clean;
-        term.appendChild(cursor);
+        term.appendChild(document.getElementById('cursor') || cursor);
         term.scrollTop = term.scrollHeight;
     }
 
@@ -336,10 +444,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         }
     });
 
-    // Focus input on tap
     term.addEventListener('click', () => cmdInput.focus());
 
-    connect();
+    loadWorkspaces().then(() => connect());
 })();
 </script>
 </body>
