@@ -21,7 +21,9 @@ if [ ! -f /usr/local/bin/opencode ] && command -v opencode >/dev/null 2>&1; then
 fi
 
 echo "Starting opencode serve on port 4096..."
+cd "${WORKSPACE_PATH}" || true
 opencode serve --port 4096 --hostname 127.0.0.1 >/data/logs/opencode-serve.log 2>&1 &
+cd /app || true
 
 echo "Starting uvicorn on port ${PORT:-7860}..."
 exec uvicorn backend.app.main:app --host 0.0.0.0 --port "${PORT:-7860}" --log-level info
