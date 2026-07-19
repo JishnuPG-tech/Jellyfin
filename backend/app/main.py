@@ -7,27 +7,44 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app):
     import asyncio
+    import logging
+
+    # Start workspace manager
+    wm = None
     try:
         from services.workspace_process_manager import get_workspace_manager
         wm = get_workspace_manager()
         wm.start_idle_checker()
     except Exception as e:
-        import logging
         logging.error(f"Failed to init workspace manager: {e}")
-    bot_task = asyncio.create_task(run_bot_async())
+
+    # Start Telegram bot
+    bot_task = None
+    try:
+        from bot.telegram_bot import run_bot_async
+        bot_task = asyncio.create_task(run_bot_async())
+    except Exception as e:
+        logging.error(f"Failed to start Telegram bot: {e}")
+
     yield
-    await stop_bot_async()
-    bot_task.cancel()
+
+    # Shutdown
     try:
-        await bot_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        from services.workspace_process_manager import get_workspace_manager
-        wm = get_workspace_manager()
-        await wm.shutdown_all()
+        from bot.telegram_bot import stop_bot_async
+        await stop_bot_async()
     except Exception:
         pass
+    if bot_task:
+        bot_task.cancel()
+        try:
+            await bot_task
+        except asyncio.CancelledError:
+            pass
+    if wm:
+        try:
+            await wm.shutdown_all()
+        except Exception:
+            pass
 
 
 try:
