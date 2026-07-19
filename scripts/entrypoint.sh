@@ -43,10 +43,9 @@ for dir in "${WORKSPACE_PATH}/projects" "${WORKSPACE_PATH}/my-code" "${WORKSPACE
 done
 
 # Make workspaces directly visible from HOME (/data)
-# opencode's find/file will search $HOME by default
 ln -sf "$WORKSPACE_PATH" /data/workspaces 2>/dev/null || true
 
-echo "Starting opencode serve on port 4096..."
+echo "Starting default opencode serve on port 4096..."
 cd "${WORKSPACE_PATH}" || true
 opencode serve --port 4096 --hostname 127.0.0.1 >/data/logs/opencode-serve.log 2>&1 &
 OPENCODE_PID=$!
@@ -57,13 +56,11 @@ cd /app || true
 echo "Waiting for opencode serve to be ready..."
 READY=0
 for i in $(seq 1 30); do
-    # Check if process is still alive
     if ! kill -0 "$OPENCODE_PID" 2>/dev/null; then
         echo "  opencode serve process exited! Log:"
         cat /data/logs/opencode-serve.log 2>/dev/null || true
         break
     fi
-    # Check if port 4096 is bound
     if ss -tlnp 2>/dev/null | grep -q ':4096'; then
         echo "opencode serve is ready on port 4096 (attempt $i)"
         READY=1

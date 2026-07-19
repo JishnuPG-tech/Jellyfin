@@ -3,9 +3,12 @@ from pydantic import BaseModel
 from backend.app.config import settings
 from sessions.db import SessionStore
 from core.session_manager import SessionManager
+from services.workspace_process_manager import get_workspace_manager
+from services.process_registry import get_registry
 import asyncio
 import logging
 import os
+import shutil
 
 router = APIRouter()
 
@@ -128,11 +131,10 @@ async def get_install_log():
 
 @router.get("/debug/opencode-path")
 async def debug_opencode_path(directory: str = "/data/workspaces"):
-    """Show the RAW response from opencode /path endpoint for debugging."""
     try:
         async with httpx.AsyncClient(base_url="http://127.0.0.1:4096", timeout=10.0) as c:
             import urllib.parse
-            r = await c.get(f"/path?directory={urllib.parse.quote(directory, safe='/')}")  
+            r = await c.get(f"/path?directory={urllib.parse.quote(directory, safe='/')}")
             return {
                 "status": r.status_code,
                 "raw": r.text[:4000],
@@ -145,7 +147,6 @@ async def debug_opencode_path(directory: str = "/data/workspaces"):
 
 @router.get("/debug/opencode-log")
 async def debug_opencode_log():
-    """Show opencode serve startup log."""
     for path in ["/data/logs/opencode-serve.log", "/tmp/logs/opencode-serve.log"]:
         if os.path.exists(path):
             with open(path, "r", errors="replace") as f:
@@ -156,7 +157,6 @@ async def debug_opencode_log():
 
 @router.get("/debug/workspace-ls")
 async def debug_workspace_ls():
-    """List actual files in workspace on the server."""
     wp = os.environ.get("WORKSPACE_PATH", "/data/workspaces")
     result = {}
     try:
@@ -172,7 +172,6 @@ async def debug_workspace_ls():
 
 @router.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
-    """Receive Telegram updates via webhook (for HuggingFace Spaces / environments without outbound access)."""
     from bot.telegram_bot import telegram_app, _handle_webhook_update
     if not telegram_app:
         return {"error": "bot not running"}
@@ -185,7 +184,6 @@ async def telegram_webhook(request: Request):
 
 
 # ── Workspace management ──
-import shutil
 
 class WorkspaceCloneReq(BaseModel):
     user_id: int
@@ -218,17 +216,17 @@ async def clone_workspace(req: WorkspaceCloneReq):
     sm = SessionManager(settings)
     user_dir = os.path.join(sm.workspace_root, f"user_{req.user_id}")
     os.makedirs(user_dir, exist_ok=True)
-    
+
     folder_name = req.folder_name
     if not folder_name:
         folder_name = req.repo_url.rstrip("/").split("/")[-1]
         if folder_name.endswith(".git"):
             folder_name = folder_name[:-4]
-            
+
     target_path = os.path.join(user_dir, folder_name)
     if os.path.exists(target_path):
         raise HTTPException(status_code=400, detail="Folder already exists")
-        
+
     try:
         proc = await asyncio.create_subprocess_exec(
             "git", "clone", req.repo_url, target_path,
@@ -238,6 +236,12 @@ async def clone_workspace(req: WorkspaceCloneReq):
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             raise Exception(stderr.decode().strip())
+
+        # Register in process registry
+        wm = get_workspace_manager()
+        ws_id = f"user_{req.user_id}_{folder_name}"
+        wm.get_or_create_workspace(str(req.user_id), folder_name, target_path)
+
         return {"status": "cloned", "folder": folder_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Clone failed: {str(e)}")
@@ -250,6 +254,13 @@ async def delete_workspace(req: WorkspaceDeleteReq):
         raise HTTPException(status_code=404, detail="Folder not found")
     if req.folder_name == "default":
         raise HTTPException(status_code=400, detail="Cannot delete default workspace")
+
+    # Stop process if running
+    wm = get_workspace_manager()
+    ws_id = f"user_{req.user_id}_{req.folder_name}"
+    await wm.stop(ws_id)
+    wm.registry.remove(ws_id)
+
     try:
         shutil.rmtree(target_path)
         return {"status": "deleted"}
@@ -257,14 +268,63 @@ async def delete_workspace(req: WorkspaceDeleteReq):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Per-workspace process management ──
+
+class StartWorkspaceReq(BaseModel):
+    user_id: int
+    folder_name: str
+
+@router.post("/workspace/start")
+async def start_workspace(req: StartWorkspaceReq):
+    wm = get_workspace_manager()
+    ws_id = f"user_{req.user_id}_{req.folder_name}"
+    ws = wm.registry.get(ws_id)
+    if not ws:
+        # Auto-create registry entry if folder exists
+        sm = SessionManager(settings)
+        path = os.path.join(sm.workspace_root, f"user_{req.user_id}", req.folder_name)
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="Workspace folder not found")
+        ws = wm.get_or_create_workspace(str(req.user_id), req.folder_name, path)
+
+    try:
+        result = await wm.start(ws_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/workspace/stop")
+async def stop_workspace(req: StartWorkspaceReq):
+    wm = get_workspace_manager()
+    ws_id = f"user_{req.user_id}_{req.folder_name}"
+    await wm.stop(ws_id)
+    return {"status": "stopped"}
+
+@router.get("/workspace/status")
+async def workspace_status(user_id: int):
+    wm = get_workspace_manager()
+    workspaces = wm.registry.get_by_user(str(user_id))
+    return {
+        "workspaces": [
+            {
+                "id": ws["id"],
+                "name": ws["name"],
+                "status": ws.get("status", "stopped"),
+                "port": ws.get("port"),
+            }
+            for ws in workspaces
+        ]
+    }
+
+
 @router.websocket("/ws/session/{user_id}")
 async def websocket_session(websocket: WebSocket, user_id: str, project: str = "default"):
     await websocket.accept()
     sm = SessionManager(settings)
     from bot.telegram_bot import clean_terminal_output
-    
+
     sm.ensure_session(user_id, project=project)
-    
+
     async def stream_to_client():
         try:
             async for chunk in sm.stream_output(user_id):
@@ -281,7 +341,7 @@ async def websocket_session(websocket: WebSocket, user_id: str, project: str = "
             logging.error(f"Error in stream_to_client: {e}")
 
     streamer_task = asyncio.create_task(stream_to_client())
-    
+
     try:
         while True:
             data = await websocket.receive_json()

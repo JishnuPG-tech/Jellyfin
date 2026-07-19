@@ -252,17 +252,31 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     let reconnectTimer = null;
 
     // ── Workspace Functions ──
+    let workspaceStatuses = {};
+
     async function loadWorkspaces() {
         try {
-            const resp = await fetch(`/api/workspace/list?user_id=${userId}`);
-            const data = await resp.json();
+            const [listResp, statusResp] = await Promise.all([
+                fetch(`/api/workspace/list?user_id=${userId}`),
+                fetch(`/api/workspace/status?user_id=${userId}`).catch(() => ({ json: () => ({ workspaces: [] }) }))
+            ]);
+            const data = await listResp.json();
+            const statusData = await statusResp.json();
+
+            workspaceStatuses = {};
+            (statusData.workspaces || []).forEach(ws => {
+                workspaceStatuses[ws.name] = ws;
+            });
+
             if (data.folders) {
                 const prevSel = wsSelect.value || currentProject;
                 wsSelect.innerHTML = '';
                 data.folders.forEach(f => {
                     const opt = document.createElement('option');
                     opt.value = f;
-                    opt.textContent = f;
+                    const st = workspaceStatuses[f];
+                    const indicator = st && st.status === 'running' ? ' ●' : '';
+                    opt.textContent = f + indicator;
                     wsSelect.appendChild(opt);
                 });
                 if (data.folders.includes(prevSel)) {
