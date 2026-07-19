@@ -9,26 +9,42 @@ DATA_ROOT="/data"
 if [ ! -w /data ]; then
     echo "/data is not writable; falling back to /tmp"
     DATA_ROOT="/tmp"
+    mkdir -p "$DATA_ROOT/workspaces" "$DATA_ROOT/bin" "$DATA_ROOT/logs" 2>/dev/null || true
 fi
 
 export PYTHONPATH="/app:${PYTHONPATH:-}"
 export WORKSPACE_PATH="${WORKSPACE_PATH:-$DATA_ROOT/workspaces}"
 mkdir -p "$WORKSPACE_PATH" "$DATA_ROOT/bin" "$DATA_ROOT/logs" 2>/dev/null || true
 
-# Opencode server auth credentials (can be overridden via HF Space secrets)
-export OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
-export OPENCODE_SERVER_PASSWORD="${OPENCODE_SERVER_PASSWORD:-password}"
+# ── Set HOME to /data so opencode's folder picker defaults to /data/workspaces ──
+export HOME="/data"
+mkdir -p /data/.config /data/.local 2>/dev/null || true
 
 # Ensure opencode is in PATH
+if ! command -v opencode >/dev/null 2>&1; then
+    echo "ERROR: opencode binary not found!"
+    exit 1
+fi
 if [ ! -f /usr/local/bin/opencode ] && command -v opencode >/dev/null 2>&1; then
     ln -sf "$(command -v opencode)" /usr/local/bin/opencode || true
 fi
 
-# Create symlinks in home directories so file explorer can browse workspaces
-ln -sf "$WORKSPACE_PATH" /root/workspaces 2>/dev/null || true
-
-# Create a default 'projects' placeholder so file explorer is never empty
+# ── Pre-populate workspace folders so the file picker always has content ──
 mkdir -p "${WORKSPACE_PATH}/projects"
+mkdir -p "${WORKSPACE_PATH}/my-code"
+mkdir -p "${WORKSPACE_PATH}/scratch"
+
+# Create README in each so they're obviously navigable
+for dir in "${WORKSPACE_PATH}/projects" "${WORKSPACE_PATH}/my-code" "${WORKSPACE_PATH}/scratch"; do
+    if [ ! -f "$dir/README.md" ]; then
+        echo "# $(basename $dir)" > "$dir/README.md"
+        echo "Workspace folder on cloud server." >> "$dir/README.md"
+    fi
+done
+
+# Make workspaces directly visible from HOME (/data)
+# opencode's find/file will search $HOME by default
+ln -sf "$WORKSPACE_PATH" /data/workspaces 2>/dev/null || true
 
 echo "Starting opencode serve on port 4096..."
 cd "${WORKSPACE_PATH}" || true
@@ -43,25 +59,23 @@ READY=0
 for i in $(seq 1 30); do
     # Check if process is still alive
     if ! kill -0 "$OPENCODE_PID" 2>/dev/null; then
-        echo "  opencode serve process exited early! Check /data/logs/opencode-serve.log"
-        cat /data/logs/opencode-serve.log || true
+        echo "  opencode serve process exited! Log:"
+        cat /data/logs/opencode-serve.log 2>/dev/null || true
         break
     fi
-    # Check if port 4096 is bound (works without curl auth complications)
-    if ss -tlnp 2>/dev/null | grep -q ':4096' || \
-       netstat -tlnp 2>/dev/null | grep -q ':4096'; then
+    # Check if port 4096 is bound
+    if ss -tlnp 2>/dev/null | grep -q ':4096'; then
         echo "opencode serve is ready on port 4096 (attempt $i)"
         READY=1
         break
     fi
-    echo "  [attempt $i] Port 4096 not bound yet, retrying..."
+    echo "  [attempt $i] Port 4096 not bound yet..."
     sleep 1
 done
 
 if [ "$READY" = "0" ]; then
-    echo "WARNING: opencode serve may not be fully ready, starting uvicorn anyway"
-    # Give it one extra grace period
-    sleep 3
+    echo "WARNING: opencode serve not ready after 30s. Starting uvicorn anyway."
+    sleep 2
 fi
 
 echo "Starting uvicorn on port ${PORT:-7860}..."
