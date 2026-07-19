@@ -46,31 +46,23 @@ try:
     app.include_router(api_router, prefix="/api")
 
     # ── Folder helpers ───────────────────────────────────────────────
-    def list_workspace_folders(base_path: str = None):
-        """Return all directories under the workspace as opencode path entries."""
+    def list_workspace_entries(base_path: str = None, query: str = ""):
+        """Return workspace folder entries matching opencode's find/file format: ['name/', ...]."""
         base_path = base_path or WORKSPACE_PATH
         entries = []
         try:
             for entry in sorted(os.scandir(base_path), key=lambda e: e.name):
-                if not entry.name.startswith("."):
-                    entries.append({
-                        "name": entry.name,
-                        "path": entry.path,
-                        "type": "directory" if entry.is_dir(follow_symlinks=True) else "file",
-                    })
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir(follow_symlinks=True):
+                    name = entry.name + "/"
+                else:
+                    name = entry.name
+                if not query or query.lower() in name.lower():
+                    entries.append(name)
         except Exception:
             pass
         return entries
-
-    def make_path_response(directory: str):
-        """Build response matching opencode's /path endpoint format."""
-        entries = list_workspace_folders(directory)
-        return {
-            "path": directory,
-            "home": os.environ.get("HOME", "/data"),
-            "root": directory in ("/", ""),
-            "entries": entries,
-        }
 
     # ── WebSocket reverse proxy ──────────────────────────────────────
     @app.websocket("/{path:path}")
@@ -114,15 +106,23 @@ try:
         if request.headers.get("upgrade", "").lower() == "websocket":
             raise HTTPException(status_code=400, detail="WebSocket upgrade must use ws:// endpoint")
 
-        # ── Intercept /find/file — inject real workspace folders ──────
+        # ── Intercept /find/file — opencode returns ["folder/", ...] string array
         if path == "find/file":
-            params = dict(request.query_params)
-            query = params.get("query", "").lower()
+            query = request.query_params.get("query", "")
+            directory = request.query_params.get("directory", "")
+            # Fix garbled/missing directory
+            if not directory or "\ufffd" in directory:
+                directory = WORKSPACE_PATH
             # Forward to opencode first
             try:
-                oc_url = "/find/file"
-                if request.url.query:
-                    oc_url += f"?{request.url.query}"
+                import urllib.parse
+                oc_url = f"/find/file?directory={urllib.parse.quote(directory, safe='/')}"
+                if query:
+                    oc_url += f"&query={urllib.parse.quote(query)}"
+                # Preserve other params (type, limit)
+                for k, v in request.query_params.items():
+                    if k not in ("directory", "query"):
+                        oc_url += f"&{k}={urllib.parse.quote(v)}"
                 fwd_headers = dict(request.headers)
                 fwd_headers.pop("host", None)
                 fwd_headers["authorization"] = _OC_AUTH_HEADER
@@ -130,44 +130,18 @@ try:
                 oc_r = await http_client.send(oc_req)
                 if oc_r.status_code == 200:
                     oc_data = oc_r.json()
-                    # If opencode returned something real, pass it through
-                    items = oc_data if isinstance(oc_data, list) else oc_data.get("files", oc_data.get("entries", []))
-                    if items:
-                        return JSONResponse(content=oc_data, status_code=200)
+                    # opencode returns a plain list of strings like ['my-code/', 'projects/']
+                    if isinstance(oc_data, list) and oc_data:
+                        return JSONResponse(content=oc_data)
             except Exception:
                 pass
-            # Fallback: return workspace entries
-            entries = list_workspace_folders(WORKSPACE_PATH)
-            if query:
-                entries = [e for e in entries if query in e["name"].lower()]
+            # Fallback: return workspace entries in same string-array format
+            entries = list_workspace_entries(directory, query)
             return JSONResponse(content=entries)
 
-        # ── Intercept /path — fix garbled directory, always pass through ──
-        if path == "path":
-            directory = request.query_params.get("directory", "")
-            # Fix garbled unicode or empty directory
-            if not directory or "\ufffd" in directory or len(directory.strip()) < 2:
-                directory = WORKSPACE_PATH
-            fwd_headers = dict(request.headers)
-            fwd_headers.pop("host", None)
-            fwd_headers["authorization"] = _OC_AUTH_HEADER
-            try:
-                import urllib.parse
-                oc_url = f"/path?directory={urllib.parse.quote(directory, safe='/')}"
-                oc_req = http_client.build_request("GET", oc_url, headers=fwd_headers)
-                oc_r = await http_client.send(oc_req)
-                if oc_r.status_code == 200:
-                    # Always pass through opencode's real response
-                    from fastapi.responses import Response as RawResponse
-                    return RawResponse(
-                        content=oc_r.content,
-                        status_code=200,
-                        media_type="application/json",
-                    )
-            except Exception:
-                pass
-            # Fallback with correct opencode format {path, home, root, entries}
-            return JSONResponse(content=make_path_response(directory))
+        # NOTE: /path is just metadata ({home, config, worktree, directory})
+        # NOT a folder listing. Don't intercept it — pass directly through.
+
 
         # ── All other requests: transparent proxy ─────────────────────
         headers = dict(request.headers)
