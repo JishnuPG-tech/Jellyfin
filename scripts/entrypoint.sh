@@ -50,5 +50,17 @@ OPENCODE_PID=$!
 echo "opencode serve started (PID: $OPENCODE_PID)"
 cd /app || true
 
+# Wait until opencode serve is healthy (up to 30s)
+echo "Waiting for opencode serve to be ready..."
+for i in $(seq 1 30); do
+    STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:4096/global/health 2>/dev/null || echo "000")
+    if [ "$STATUS" = "200" ]; then
+        echo "opencode serve is ready (attempt $i)"
+        break
+    fi
+    echo "  [attempt $i] Not ready yet (HTTP $STATUS), retrying..."
+    sleep 1
+done
+
 echo "Starting uvicorn on port ${PORT:-7860}..."
 exec uvicorn backend.app.main:app --host 0.0.0.0 --port "${PORT:-7860}" --log-level info
