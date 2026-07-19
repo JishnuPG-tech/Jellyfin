@@ -27,26 +27,43 @@ try:
     app = FastAPI(title="Opencode Bridge", lifespan=lifespan)
     app.include_router(api_router, prefix="/api")
 
-    @app.get("/")
-    async def root():
-        return {
-            "status": "ok",
-            "service": "Opencode Bridge",
-            "routes": ["/healthz", "/docs", "/api/sessions/new", "/webapp"],
-        }
-
-    @app.get("/webapp", response_class=HTMLResponse)
-    async def get_webapp():
-        return HTML_CONTENT
-
-    @app.get("/healthz")
-    async def health():
-        return await healthz()
-
     # ── Transparent Reverse Proxy to local opencode serve (port 4096) ──
     import httpx
-    from fastapi import Request, HTTPException
+    import asyncio
+    import websockets
+    from fastapi import Request, HTTPException, WebSocket
     from fastapi.responses import StreamingResponse
+
+    @app.websocket("/{path:path}")
+    async def websocket_proxy(client_ws: WebSocket, path: str):
+        await client_ws.accept()
+        uri = f"ws://127.0.0.1:4096/{path}"
+        if client_ws.query_params:
+            uri += f"?{client_ws.query_params}"
+            
+        async with websockets.connect(uri) as server_ws:
+            async def client_to_server():
+                try:
+                    while True:
+                        msg = await client_ws.receive()
+                        if "text" in msg:
+                            await server_ws.send(msg["text"])
+                        elif "bytes" in msg:
+                            await server_ws.send(msg["bytes"])
+                except Exception:
+                    pass
+
+            async def server_to_client():
+                try:
+                    async for msg in server_ws:
+                        if isinstance(msg, str):
+                            await client_ws.send_text(msg)
+                        else:
+                            await client_ws.send_bytes(msg)
+                except Exception:
+                    pass
+
+            await asyncio.gather(client_to_server(), server_to_client())
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
     async def proxy_request(request: Request, path: str):
