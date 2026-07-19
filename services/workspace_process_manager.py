@@ -76,8 +76,20 @@ class WorkspaceProcessManager:
 
         logger.info(f"Started opencode serve for {workspace_id} on port {port} (PID: {proc.pid})")
 
-        # Wait briefly for the process to bind
-        await asyncio.sleep(0.5)
+        # Wait for the process to bind to the port
+        import urllib.request
+        for i in range(30):
+            await asyncio.sleep(1)
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{port}/global/health")
+                resp = urllib.request.urlopen(req, timeout=2)
+                if resp.status == 200:
+                    logger.info(f"opencode serve ready on port {port} (attempt {i+1})")
+                    break
+            except Exception:
+                if i == 29:
+                    logger.warning(f"opencode serve not ready after 30s on port {port}")
+                continue
 
         return {"port": port, "pid": proc.pid}
 

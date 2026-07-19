@@ -186,11 +186,15 @@ try:
     @app.api_route("/proxy/{workspace_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
     async def proxy_to_workspace(request: Request, workspace_id: str, path: str):
         """Proxy requests to a specific workspace's opencode instance."""
+        import logging
         wm = get_workspace_manager()
         try:
             info = await wm.ensure_running(workspace_id)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            logging.error(f"proxy ensure_running error: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to start workspace: {str(e)}")
 
         port = info["port"]
 
@@ -204,7 +208,7 @@ try:
             url += f"?{request.url.query}"
 
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 r = await client.request(
                     method=request.method,
                     url=f"http://127.0.0.1:{port}{url}",
@@ -225,7 +229,11 @@ try:
                     headers=response_headers,
                     media_type=r.headers.get("content-type"),
                 )
+        except httpx.ConnectError as e:
+            logging.error(f"proxy connect error to port {port}: {e}")
+            raise HTTPException(status_code=502, detail=f"Workspace not reachable on port {port}: {str(e)}")
         except Exception as e:
+            logging.error(f"proxy error: {e}")
             raise HTTPException(status_code=502, detail=f"Proxy error: {str(e)}")
 
     # ── Default HTTP reverse proxy (backward compat, single workspace) ─
