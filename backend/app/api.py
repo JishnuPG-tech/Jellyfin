@@ -237,13 +237,15 @@ async def clone_workspace(req: WorkspaceCloneReq):
         if proc.returncode != 0:
             raise Exception(stderr.decode().strip())
 
-        # Register in process registry
-        wm = get_workspace_manager()
-        ws_id = f"user_{req.user_id}_{folder_name}"
-        wm.get_or_create_workspace(str(req.user_id), folder_name, target_path)
+        try:
+            wm = get_workspace_manager()
+            wm.get_or_create_workspace(str(req.user_id), folder_name, target_path)
+        except Exception as reg_err:
+            logging.error(f"Registry update failed: {reg_err}")
 
         return {"status": "cloned", "folder": folder_name}
     except Exception as e:
+        logging.error(f"clone_workspace error: {e}")
         raise HTTPException(status_code=500, detail=f"Clone failed: {str(e)}")
 
 @router.post("/workspace/delete")
@@ -302,19 +304,36 @@ async def stop_workspace(req: StartWorkspaceReq):
 
 @router.get("/workspace/status")
 async def workspace_status(user_id: int):
-    wm = get_workspace_manager()
-    workspaces = wm.registry.get_by_user(str(user_id))
-    return {
-        "workspaces": [
-            {
-                "id": ws["id"],
-                "name": ws["name"],
-                "status": ws.get("status", "stopped"),
-                "port": ws.get("port"),
-            }
-            for ws in workspaces
-        ]
-    }
+    try:
+        wm = get_workspace_manager()
+        workspaces = wm.registry.get_by_user(str(user_id))
+        return {
+            "workspaces": [
+                {
+                    "id": ws["id"],
+                    "name": ws["name"],
+                    "status": ws.get("status", "stopped"),
+                    "port": ws.get("port"),
+                }
+                for ws in workspaces
+            ]
+        }
+    except Exception as e:
+        logging.error(f"workspace_status error: {e}")
+        return {"workspaces": [], "error": str(e)}
+
+
+@router.get("/workspace/test")
+async def test_workspace_manager():
+    try:
+        wm = get_workspace_manager()
+        return {
+            "registry_count": len(wm.registry.list_all()),
+            "workspaces": wm.registry.list_all(),
+        }
+    except Exception as e:
+        logging.error(f"test_workspace_manager error: {e}")
+        return {"error": str(e)}
 
 
 @router.websocket("/ws/session/{user_id}")
