@@ -299,8 +299,9 @@ async def start_workspace(req: StartWorkspaceReq):
 async def stop_workspace(req: StartWorkspaceReq):
     wm = get_workspace_manager()
     ws_id = f"user_{req.user_id}_{req.folder_name}"
-    await wm.stop(ws_id)
-    return {"status": "stopped"}
+    # Fire and forget - don't wait for process to fully die
+    asyncio.create_task(wm.stop(ws_id))
+    return {"status": "stopping"}
 
 @router.get("/workspace/status")
 async def workspace_status(user_id: int):
