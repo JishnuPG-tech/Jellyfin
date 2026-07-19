@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, HTTPException, WebSocket, WebSocketDisconnect, Request
 from pydantic import BaseModel
 from backend.app.config import settings
 from sessions.db import SessionStore
@@ -124,6 +124,20 @@ async def get_install_log():
             except Exception as e:
                 return {"error": f"Failed to read {path}: {str(e)}"}
     return {"error": "Installation log file not found."}
+
+
+@router.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    """Receive Telegram updates via webhook (for HuggingFace Spaces / environments without outbound access)."""
+    from bot.telegram_bot import telegram_app, _handle_webhook_update
+    if not telegram_app:
+        return {"error": "bot not running"}
+    try:
+        data = await request.json()
+        await _handle_webhook_update(data)
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+    return {"ok": True}
 
 
 @router.websocket("/ws/session/{user_id}")

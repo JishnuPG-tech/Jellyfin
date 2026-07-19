@@ -364,8 +364,250 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await refresh_terminal_screen(query, user_id)
 
 
+BOT_COMMANDS = [
+    BotCommand("start", "Open interactive terminal console"),
+    BotCommand("cancel", "Send Ctrl-C to terminal"),
+    BotCommand("list", "List workspace files"),
+    BotCommand("download", "Download file from workspace"),
+]
+
+
 # Global application reference for async execution
 telegram_app = None
+
+# Handler references for webhook mode (registered before initialize)
+_handler_map = {}
+
+def _register_handler(name, handler_fn, handler_type="command"):
+    _handler_map[(handler_type, name)] = handler_fn
+
+
+async def _handle_webhook_update(data: dict):
+    """Manually route a raw Telegram update dict to the correct handler.
+
+    Used in webhook mode on HuggingFace where the bot can't call initialize()
+    (no outbound HTTP), so python-telegram-bot's process_update is unavailable.
+    """
+    msg = data.get("message") or data.get("callback_query")
+    if not msg:
+        return
+
+    # Callback query (inline keyboard button press)
+    if "callback_query" in data:
+        cq = data["callback_query"]
+        query_data = cq.get("data", "")
+        user_id = str(cq["from"]["id"])
+        chat_id = cq["message"]["chat"]["id"]
+        msg_id = cq["message"]["message_id"]
+
+        if not is_authorized(int(user_id)):
+            return
+
+        action = query_data
+        logger.info(f"[Webhook CB] {user_id} -> {action}")
+
+        opencode_mgr.start_for_user(user_id)
+
+        if action.startswith("key_"):
+            key_name = action.split("_", 1)[1]
+            try:
+                session = opencode_mgr.sm._session_name(user_id)
+                subprocess.run(["tmux", "send-keys", "-t", session, key_name], check=True)
+            except Exception as e:
+                logger.error(f"Error sending key {key_name}: {e}")
+
+        elif action == "control_interrupt":
+            opencode_mgr.sm.interrupt(user_id)
+
+        elif action == "control_refresh":
+            pass  # handled below
+
+        elif action == "control_opencode":
+            opencode_mgr.start_for_user(user_id)
+            opencode_mgr.send_command(user_id, "opencode")
+
+        elif action == "control_config":
+            opencode_mgr.send_command(user_id, "/config")
+
+        # Send updated terminal screen
+        await asyncio.sleep(0.15)
+        output = opencode_mgr.read(user_id, lines=40)
+        display, is_card = clean_terminal_output(output)
+        if display:
+            code_text = "```\n" + display + "\n```"
+        else:
+            code_text = "`Terminal output is empty.`"
+
+        # Answer callback query (remove loading spinner)
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                token = os.getenv("BOT_TOKEN") or settings.bot_token
+                base_url = os.getenv("TELEGRAM_BASE_URL", "https://api.telegram.org")
+                await client.get(
+                    f"{base_url}/bot{token}/answerCallbackQuery",
+                    params={"callback_query_id": cq["id"]}
+                )
+                await client.post(
+                    f"{base_url}/bot{token}/editMessageText",
+                    json={
+                        "chat_id": chat_id,
+                        "message_id": msg_id,
+                        "text": code_text,
+                        "parse_mode": "Markdown",
+                        "reply_markup": _keyboard_to_dict(get_control_keyboard(user_id)),
+                    }
+                )
+        except Exception as e:
+            logger.debug(f"Webhook callback answer error: {e}")
+        return
+
+    # Regular message
+    message = msg
+    text = (message.get("text") or "").strip()
+    user_id = str(message["from"]["id"])
+    chat_id = message["chat"]["id"]
+
+    if not is_authorized(int(user_id)):
+        return
+
+    # Handle / commands
+    if text.startswith("/"):
+        cmd = text.split()[0].lower()
+        if cmd == "/start":
+            await _handle_start_webhook(user_id, chat_id, message["from"].get("first_name", "User"))
+            return
+        elif cmd == "/cancel":
+            opencode_mgr.sm.interrupt(user_id)
+            await _send_telegram_message(chat_id, "Interrupted.")
+            return
+        elif cmd == "/list":
+            await _handle_list_webhook(user_id, chat_id)
+            return
+        elif cmd in ("/download", "/get"):
+            filename = text.split(maxsplit=1)[1].strip() if len(text.split()) > 1 else ""
+            await _handle_download_webhook(user_id, chat_id, filename)
+            return
+        return
+
+    # Text input → send to tmux
+    if not text:
+        return
+
+    opencode_mgr.start_for_user(user_id)
+    opencode_mgr.send_command(user_id, text)
+
+    # Send "Running..." then the terminal output
+    await _send_telegram_message(chat_id, "Running...", reply_markup=_keyboard_to_dict(get_control_keyboard(user_id)))
+    await asyncio.sleep(0.5)
+    output = opencode_mgr.read(user_id, lines=40)
+    display, is_card = clean_terminal_output(output)
+    if display:
+        code_text = "```\n" + display + "\n```"
+    else:
+        code_text = "`Starting...`"
+    await _send_telegram_message(chat_id, code_text, parse_mode="Markdown", reply_markup=_keyboard_to_dict(get_control_keyboard(user_id)))
+
+
+async def _handle_start_webhook(user_id: str, chat_id: int, name: str):
+    opencode_mgr.start_for_user(user_id)
+    try:
+        session = opencode_mgr.sm._session_name(user_id)
+        subprocess.run(["tmux", "resize-window", "-t", session, "-x", "100", "-y", "40"], capture_output=True)
+    except Exception:
+        pass
+    # Launch opencode if not running
+    try:
+        res = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", f"{session}:0.0", "-F", "#{pane_current_command}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        cmd = res.stdout.strip()
+        if cmd in ("", "bash", "sh"):
+            opencode_mgr.send_command(user_id, "opencode")
+    except Exception:
+        opencode_mgr.send_command(user_id, "opencode")
+
+    text = (
+        f"👋 *OpenCode Mobile Terminal Ready.*\n\n"
+        f"• Click the button below to open your fully interactive Web Console.\n"
+        f"• Upload any document/file/photo to save it directly to your workspace.\n"
+        f"• Use `/list` to view your workspace files, and `/download <filename>` to retrieve them."
+    )
+    await _send_telegram_message(chat_id, text, parse_mode="Markdown", reply_markup=_keyboard_to_dict(get_control_keyboard(user_id)))
+
+
+async def _handle_list_webhook(user_id: str, chat_id: int):
+    ws = os.path.join(opencode_mgr.sm.workspace_root, f"user_{user_id}", "default")
+    os.makedirs(ws, exist_ok=True)
+    files = [f for f in os.listdir(ws) if os.path.isfile(os.path.join(ws, f)) and not f.startswith(".")]
+    if not files:
+        await _send_telegram_message(chat_id, "Your workspace directory is currently empty.")
+        return
+    file_list = "\n".join([f"• `{name}`" for name in files])
+    await _send_telegram_message(
+        chat_id,
+        f"📁 *Workspace Files ({len(files)}):*\n\n{file_list}\n\n"
+        f"Use `/download <filename>` to retrieve.",
+        parse_mode="Markdown"
+    )
+
+
+async def _handle_download_webhook(user_id: str, chat_id: int, filename: str):
+    if not filename:
+        await _send_telegram_message(chat_id, "Usage: `/download <filename>`", parse_mode="Markdown")
+        return
+    filename = os.path.basename(filename)
+    ws = os.path.join(opencode_mgr.sm.workspace_root, f"user_{user_id}", "default")
+    file_path = os.path.join(ws, filename)
+    if not os.path.exists(file_path):
+        await _send_telegram_message(chat_id, f"File `{filename}` not found.", parse_mode="Markdown")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            token = os.getenv("BOT_TOKEN") or settings.bot_token
+            base_url = os.getenv("TELEGRAM_BASE_URL", "https://api.telegram.org")
+            with open(file_path, "rb") as f:
+                import aiofiles
+                file_data = await asyncio.to_thread(f.read)
+            await client.post(
+                f"{base_url}/bot{token}/sendDocument",
+                data={"chat_id": chat_id, "caption": f"`{filename}`", "parse_mode": "Markdown"},
+                files={"document": (filename, file_data)}
+            )
+    except Exception as e:
+        await _send_telegram_message(chat_id, f"Upload failed: {e}")
+
+
+def _keyboard_to_dict(markup):
+    """Convert InlineKeyboardMarkup to a JSON-serializable dict for raw HTTP calls."""
+    if not markup:
+        return None
+    rows = []
+    for row in markup.inline_keyboard:
+        rows.append([
+            {"text": btn.text, "callback_data": btn.callback_data,
+             "url": btn.url} if btn.web_app is None else
+            {"text": btn.text, "web_app": {"url": btn.web_app.url}}
+            for btn in row
+        ])
+    return {"inline_keyboard": rows}
+
+
+async def _send_telegram_message(chat_id: int, text: str, parse_mode: str = None, reply_markup: dict = None):
+    """Send a message via raw HTTP (works without bot.initialize())."""
+    import httpx as _httpx
+    try:
+        token = os.getenv("BOT_TOKEN") or settings.bot_token
+        base_url = os.getenv("TELEGRAM_BASE_URL", "https://api.telegram.org")
+        payload = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(f"{base_url}/bot{token}/sendMessage", json=payload)
+    except Exception as e:
+        logger.error(f"Failed to send message: {e}")
 
 async def run_bot_async() -> None:
     global telegram_app
@@ -390,19 +632,41 @@ async def run_bot_async() -> None:
         telegram_app.add_handler(CommandHandler("download", download_file))
         telegram_app.add_handler(CommandHandler("get", download_file))
         telegram_app.add_handler(CallbackQueryHandler(handle_callback))
-        
+
         telegram_app.add_handler(MessageHandler(
-            (filters.TEXT | filters.Document.ALL | filters.PHOTO) & (~filters.COMMAND), 
+            (filters.TEXT | filters.Document.ALL | filters.PHOTO) & (~filters.COMMAND),
             handle_message
         ))
 
+        # HuggingFace Spaces: no outbound HTTP — skip initialize/start/set_webhook.
+        # The user must set the webhook manually (see instructions below).
+        public_url = os.getenv("HF_URL")
+        if public_url:
+            logger.info("HF_URL detected — running in webhook-only mode (no outbound HTTP).")
+            logger.info("Telegram updates will arrive at: " + public_url.rstrip('/') + "/api/telegram-webhook")
+            logger.info("SET YOUR WEBHOOK MANUALLY with this command from your local machine:")
+            logger.info(f'  curl "https://api.telegram.org/bot{token}/setWebhook?url={public_url.rstrip("/")}/api/telegram-webhook&drop_pending_updates=true"')
+            # Register the app but do NOT call initialize/start (they need outbound HTTP)
+            telegram_app.post_init = None
+            telegram_app.post_shutdown = None
+            logger.info("Bot handlers registered. Waiting for webhook updates.")
+            return
+
+        # Render / local: normal initialization with outbound HTTP + polling
         logger.info("Initializing Telegram bot application...")
         await telegram_app.initialize()
+        try:
+            await telegram_app.bot.set_my_commands(BOT_COMMANDS)
+        except Exception:
+            pass
         logger.info("Starting Telegram bot application...")
         await telegram_app.start()
         logger.info("Starting Telegram bot polling...")
-        await telegram_app.updater.start_polling()
-        logger.info("Telegram bot is running and actively polling!")
+        await telegram_app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        logger.info("Telegram bot is running!")
     except Exception as e:
         logger.error(f"FATAL ERROR starting Telegram bot: {e}", exc_info=True)
 
@@ -412,7 +676,8 @@ async def stop_bot_async() -> None:
     if telegram_app:
         logger.info("Stopping Telegram bot...")
         try:
-            await telegram_app.updater.stop()
+            if telegram_app.updater and telegram_app.updater.running:
+                await telegram_app.updater.stop()
             await telegram_app.stop()
             await telegram_app.shutdown()
         except Exception as e:

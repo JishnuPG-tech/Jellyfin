@@ -1,663 +1,347 @@
 HTML_CONTENT = r"""<!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Opencode Web Console</title>
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=block" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <title>OpenCode CLI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
-        :root {
-            /* Theme Green Matrix (default) */
-            --bg-base: #000000;
-            --term-bg: #020402;
-            --text-color: #39FF14;
-            --accent-color: #00ff9c;
-            --border-color: rgba(57, 255, 20, 0.2);
-            --panel-bg: #0e1418;
-            --btn-bg: rgba(57, 255, 20, 0.05);
-            --glow-color: rgba(0, 255, 156, 0.3);
-            --on-surface: #dde3e9;
-            --text-secondary: #8e8e9f;
-        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
 
-        /* Tokyo Night Theme */
-        [data-theme="tokyo"] {
-            --bg-base: #1a1b26;
-            --term-bg: #16161e;
-            --text-color: #7aa2f7;
-            --accent-color: #bb9af3;
-            --border-color: #292e42;
-            --panel-bg: #16161e;
-            --btn-bg: rgba(187, 154, 243, 0.08);
-            --glow-color: rgba(187, 154, 243, 0.3);
-            --on-surface: #a9b1d6;
-            --text-secondary: #565f89;
-        }
-
-        /* Solarized Dark Theme */
-        [data-theme="solarized"] {
-            --bg-base: #00212b;
-            --term-bg: #073642;
-            --text-color: #93a1a1;
-            --accent-color: #2aa198;
-            --border-color: #586e75;
-            --panel-bg: #073642;
-            --btn-bg: rgba(42, 161, 152, 0.08);
-            --glow-color: rgba(42, 161, 152, 0.3);
-            --on-surface: #93a1a1;
-            --text-secondary: #586e75;
-        }
-
-        /* Amber CRT Theme */
-        [data-theme="amber"] {
-            --bg-base: #000000;
-            --term-bg: #080500;
-            --text-color: #FFB000;
-            --accent-color: #FFB000;
-            --border-color: #3d2a00;
-            --panel-bg: #0f0a00;
-            --btn-bg: rgba(255, 176, 0, 0.05);
-            --glow-color: rgba(255, 176, 0, 0.3);
-            --on-surface: #ffda79;
-            --text-secondary: #845e00;
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            user-select: none;
-            -webkit-user-select: none;
-        }
-
-        body {
-            font-family: 'Geist', sans-serif;
-            background: var(--bg-base);
-            color: var(--on-surface);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-            transition: background 0.3s, color 0.3s;
-        }
-
-        /* CRT Scanline Overlay */
-        .scanline {
-            width: 100%;
+        html, body {
             height: 100%;
-            z-index: 100;
-            background: linear-gradient(0deg, rgba(0, 0, 0, 0) 50%, rgba(255, 255, 255, 0.02) 50%);
-            background-size: 100% 4px;
-            pointer-events: none;
-            position: fixed;
-            top: 0;
-            left: 0;
+            background: #000;
+            color: #e0e0e0;
+            font-family: 'JetBrains Mono', 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.45;
+            overflow: hidden;
+            -webkit-font-smoothing: antialiased;
         }
 
-        /* System Dashboard Header */
-        .dashboard-header {
-            background-color: rgba(14, 20, 24, 0.7);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            border-bottom: 1px solid var(--border-color);
-            padding: 10px 16px;
+        /* ── Top Bar ── */
+        .topbar {
+            height: 36px;
+            background: #0a0a0a;
+            border-bottom: 1px solid #1a1a1a;
             display: flex;
-            justify-content: space-between;
             align-items: center;
-            z-index: 10;
+            padding: 0 12px;
+            gap: 10px;
+            flex-shrink: 0;
         }
 
-        .dashboard-metrics {
-            display: flex;
-            gap: 20px;
-            overflow-x: auto;
-        }
-
-        .metric-col {
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-        }
-
-        .metric-label {
-            font-size: 10px;
-            color: var(--text-secondary);
+        .topbar-title {
+            color: #555;
+            font-size: 11px;
+            letter-spacing: 0.5px;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
         }
 
-        .metric-value {
-            font-size: 12px;
-            font-weight: bold;
-            color: var(--accent-color);
-            display: flex;
-            align-items: center;
-            gap: 4px;
-            font-family: 'JetBrains Mono', monospace;
-        }
-
-        .load-bar-bg {
-            width: 50px;
-            height: 6px;
-            background-color: rgba(255, 255, 255, 0.05);
-            border-radius: 3px;
-            overflow: hidden;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .load-bar-fill {
-            height: 100%;
-            background-color: var(--accent-color);
-            box-shadow: 0 0 6px var(--accent-color);
-            width: 42%;
-            transition: width 0.5s ease;
-        }
-
-        .status-badge {
+        .topbar-status {
+            margin-left: auto;
             display: flex;
             align-items: center;
             gap: 6px;
-            padding: 4px 8px;
-            background-color: rgba(255, 255, 255, 0.02);
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            font-size: 10px;
-            font-weight: bold;
-            text-transform: uppercase;
+            font-size: 11px;
+            color: #444;
         }
 
-        .status-dot {
+        .topbar-dot {
             width: 6px;
             height: 6px;
-            background-color: var(--text-color);
             border-radius: 50%;
-            box-shadow: 0 0 8px var(--text-color);
-            animation: pulse-glow 1.5s infinite;
+            background: #333;
         }
 
-        @keyframes pulse-glow {
-            0% { transform: scale(0.9); opacity: 0.6; }
-            50% { transform: scale(1.1); opacity: 1; }
-            100% { transform: scale(0.9); opacity: 0.6; }
-        }
+        .topbar-dot.connected { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+        .topbar-dot.connecting { background: #eab308; animation: pulse 1s infinite; }
 
-        /* Console View Container */
-        .console-container {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-            position: relative;
-        }
+        @keyframes pulse { 50% { opacity: 0.4; } }
 
-        /* Terminal Window */
-        .terminal-window {
-            flex: 1;
-            background-color: var(--bg-base);
-            padding: 16px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 13px;
-            line-height: 1.5;
-            overflow-y: auto;
-            white-space: pre-wrap;
-            word-break: break-all;
-            color: var(--text-color);
-        }
-
-        .cursor {
-            display: inline-block;
-            width: 8px;
-            height: 15px;
-            background-color: var(--text-color);
-            margin-left: 2px;
-            vertical-align: middle;
-            box-shadow: 0 0 6px var(--text-color);
-            animation: blink 1s step-start infinite;
-        }
-
-        @keyframes blink {
-            50% { opacity: 0; }
-        }
-
-        /* Control Panel */
-        .control-panel {
-            padding: 12px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            background-color: var(--panel-bg);
-            border-t: 1px solid var(--border-color);
-        }
-
-        .input-row {
-            display: flex;
-            gap: 8px;
-        }
-
-        .text-input {
-            flex: 1;
-            background: rgba(0, 0, 0, 0.4);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            color: var(--text-color);
-            padding: 10px 14px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 14px;
-            outline: none;
-        }
-
-        .text-input:focus {
-            border-color: var(--accent-color);
-            box-shadow: 0 0 8px var(--glow-color);
-        }
-
-        .btn-send {
-            background: var(--accent-color);
-            color: #000;
-            border: none;
-            border-radius: 8px;
-            padding: 0 20px;
-            font-weight: bold;
-            cursor: pointer;
-        }
-
-        /* Keypad Accessory Bar */
-        .keypad-row {
-            display: flex;
-            gap: 6px;
-            overflow-x: auto;
-            padding-bottom: 4px;
-        }
-
-        .key-btn {
-            background-color: var(--btn-bg);
-            border: 1px solid var(--border-color);
-            color: var(--text-color);
-            border-radius: 6px;
-            padding: 8px 12px;
-            font-size: 11px;
-            font-weight: bold;
-            cursor: pointer;
-            min-width: 50px;
-            text-align: center;
-        }
-
-        .key-btn:active {
-            background-color: var(--accent-color);
-            color: #000;
-        }
-
-        /* Navigation Bar */
-        nav {
-            height: 56px;
-            border-top: 1px solid var(--border-color);
-            background-color: rgba(14, 20, 24, 0.9);
-            display: flex;
-            justify-content: space-around;
-            align-items: center;
-            padding-bottom: env(safe-area-inset-bottom);
-        }
-
-        .nav-item {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            color: var(--text-secondary);
-            text-decoration: none;
-            font-size: 9px;
-            text-transform: uppercase;
-            gap: 2px;
-            cursor: pointer;
-        }
-
-        .nav-item.active {
-            color: var(--accent-color);
-            text-shadow: 0 0 6px var(--glow-color);
-        }
-
-        .nav-item .material-symbols-outlined {
-            font-size: 20px;
-        }
-
-        /* Settings view overlay */
-        .config-overlay {
+        /* ── Terminal ── */
+        #terminal {
             position: absolute;
-            top: 0;
+            top: 36px;
             left: 0;
             right: 0;
             bottom: 0;
-            background-color: var(--panel-bg);
-            z-index: 50;
-            padding: 24px;
-            display: none;
-            flex-direction: column;
-            gap: 16px;
+            padding: 12px 14px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            white-space: pre-wrap;
+            word-break: break-all;
+            color: #c8c8c8;
+            scroll-behavior: smooth;
         }
 
-        .config-title {
-            font-size: 20px;
-            font-weight: bold;
-            color: #FFF;
-            margin-bottom: 12px;
+        #terminal::-webkit-scrollbar { width: 6px; }
+        #terminal::-webkit-scrollbar-track { background: transparent; }
+        #terminal::-webkit-scrollbar-thumb { background: #222; border-radius: 3px; }
+
+        .cursor {
+            display: inline-block;
+            width: 7px;
+            height: 14px;
+            background: #c8c8c8;
+            vertical-align: text-bottom;
+            animation: blink 1s step-end infinite;
         }
 
-        .config-group {
+        @keyframes blink { 50% { opacity: 0; } }
+
+        /* ── Input Bar ── */
+        .input-bar {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: #0a0a0a;
+            border-top: 1px solid #1a1a1a;
+            padding: 8px 10px;
             display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
-
-        .config-label {
-            font-size: 12px;
-            color: var(--text-secondary);
-        }
-
-        .config-input {
-            background: rgba(0, 0, 0, 0.4);
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            color: #FFF;
-            padding: 10px;
-            outline: none;
-        }
-
-        .theme-select {
-            display: flex;
-            flex-wrap: wrap;
+            align-items: center;
             gap: 8px;
+            z-index: 20;
+            padding-bottom: max(8px, env(safe-area-inset-bottom));
         }
 
-        .theme-btn {
-            border: 1px solid var(--border-color);
-            background-color: transparent;
-            color: var(--text-secondary);
-            padding: 8px 12px;
-            border-radius: 6px;
-            font-size: 11px;
-            cursor: pointer;
+        .prompt-symbol {
+            color: #22c55e;
+            font-weight: 700;
+            font-size: 13px;
+            flex-shrink: 0;
         }
 
-        .theme-btn.active {
-            border-color: var(--accent-color);
-            background-color: var(--btn-bg);
-            color: var(--accent-color);
-        }
-
-        .btn-save {
-            background-color: var(--accent-color);
-            color: #000;
-            font-weight: bold;
+        #cmd {
+            flex: 1;
+            background: transparent;
             border: none;
-            padding: 12px;
-            border-radius: 8px;
+            outline: none;
+            color: #e0e0e0;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            caret-color: #22c55e;
+        }
+
+        #cmd::placeholder { color: #333; }
+
+        /* ── Key Row ── */
+        .keyrow {
+            position: fixed;
+            bottom: 48px;
+            left: 0;
+            right: 0;
+            background: #050505;
+            border-top: 1px solid #111;
+            padding: 6px 8px;
+            display: flex;
+            gap: 5px;
+            overflow-x: auto;
+            z-index: 19;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .keyrow::-webkit-scrollbar { display: none; }
+
+        .kbtn {
+            flex-shrink: 0;
+            background: #0f0f0f;
+            border: 1px solid #1a1a1a;
+            color: #666;
+            border-radius: 4px;
+            padding: 6px 10px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            font-weight: 500;
             cursor: pointer;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .kbtn:active {
+            background: #1a1a1a;
+            color: #aaa;
+            border-color: #333;
+        }
+
+        .kbtn.accent {
+            color: #22c55e;
+            border-color: #166534;
+        }
+
+        /* ── Login Card ── */
+        .login-card {
+            background: #0a0a0a;
+            border: 1px solid #1a1a1a;
+            border-radius: 8px;
+            padding: 24px;
+            margin: 16px 0;
+            text-align: center;
+        }
+
+        .login-card a {
+            display: inline-block;
             margin-top: 12px;
+            padding: 8px 20px;
+            background: #22c55e;
+            color: #000;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 12px;
         }
     </style>
 </head>
 <body>
-    <!-- CRT Scanline Effect -->
-    <div class="scanline"></div>
 
-    <!-- Top System Dashboard -->
-    <section class="dashboard-header">
-        <div class="dashboard-metrics">
-            <div class="metric-col">
-                <span class="metric-label">Active Model</span>
-                <span class="metric-value">
-                    <span class="material-symbols-outlined" style="font-size:12px;">neurology</span>
-                    OPENCODE-1.5-PRO
-                </span>
-            </div>
-            <div class="metric-col">
-                <span class="metric-label">System Load</span>
-                <div style="display:flex; align-items:center; gap:6px;">
-                    <div class="load-bar-bg"><div class="load-bar-fill" id="load-fill"></div></div>
-                    <span class="metric-value" style="font-size:10px;" id="load-text">42.8%</span>
-                </div>
-            </div>
-            <div class="metric-col">
-                <span class="metric-label">AI Latency</span>
-                <span class="metric-value" id="latency-text">284ms</span>
-            </div>
-        </div>
-        <div class="status-badge">
-            <div class="status-dot"></div>
-            <span>Stable</span>
-        </div>
-    </section>
-
-    <!-- Main Views -->
-    <div class="console-container">
-        <!-- Terminal Window View -->
-        <div class="terminal-window" id="terminal">Initializing tunnel connection...<span class="cursor"></span></div>
-
-        <!-- Setup Profile View (Config Overlay) -->
-        <div class="config-overlay" id="config-view">
-            <div class="config-title">Profile Configuration</div>
-            
-            <div class="config-group">
-                <label class="config-label">Telegram User ID</label>
-                <input type="text" class="config-input" id="userid-input" value="1769298522">
-            </div>
-
-            <div class="config-group">
-                <label class="config-label">Active Theme Color Mode</label>
-                <div class="theme-select">
-                    <button class="theme-btn active" onclick="setTheme('matrix', this)">Matrix Green</button>
-                    <button class="theme-btn" onclick="setTheme('tokyo', this)">Tokyo Night</button>
-                    <button class="theme-btn" onclick="setTheme('solarized', this)">Solarized Dark</button>
-                    <button class="theme-btn" onclick="setTheme('amber', this)">Amber CRT</button>
-                </div>
-            </div>
-
-            <button class="btn-save" onclick="applyProfileSettings()">Apply Configuration</button>
-        </div>
+<div class="topbar">
+    <span class="topbar-title">opencode</span>
+    <div class="topbar-status">
+        <div class="topbar-dot" id="ws-dot"></div>
+        <span id="ws-label">connecting</span>
     </div>
+</div>
 
-    <!-- Accessory Keypad Panel -->
-    <div class="control-panel" id="control-panel">
-        <div class="keypad-row">
-            <button class="key-btn" onclick="sendKey('Tab')">TAB</button>
-            <button class="key-btn" onclick="sendKey('Up')">UP (↑)</button>
-            <button class="key-btn" onclick="sendKey('Down')">DOWN (↓)</button>
-            <button class="key-btn" onclick="sendKey('Left')">LEFT (←)</button>
-            <button class="key-btn" onclick="sendKey('Right')">RIGHT (→)</button>
-            <button class="key-btn" onclick="sendKey('BSpace')">BKSP</button>
-            <button class="key-btn" onclick="sendKey('Enter')">ENTER</button>
-            <button class="key-btn" onclick="sendInterrupt()">CTRL+C</button>
-            <button class="key-btn" onclick="launchOpencode()">LAUNCH OPENCODE</button>
-        </div>
-        <div class="input-row">
-            <input type="text" id="command-input" class="text-input" placeholder="Type prompt or command here..." autocomplete="off">
-            <button class="btn-send" onclick="sendCommand()">Send</button>
-        </div>
-    </div>
+<div id="terminal"><span class="cursor" id="cursor"></span></div>
 
-    <!-- Bottom Nav Bar -->
-    <nav>
-        <div class="nav-item active" id="nav-shell" onclick="switchView('shell')">
-            <span class="material-symbols-outlined">terminal</span>
-            <span>Shell</span>
-        </div>
-        <div class="nav-item" id="nav-config" onclick="switchView('config')">
-            <span class="material-symbols-outlined">settings</span>
-            <span>Config</span>
-        </div>
-    </nav>
+<div class="keyrow" id="keyrow">
+    <button class="kbtn" onclick="sendKey('Tab')">Tab</button>
+    <button class="kbtn" onclick="sendKey('Up')">Up</button>
+    <button class="kbtn" onclick="sendKey('Down')">Down</button>
+    <button class="kbtn" onclick="sendKey('Left')">Left</button>
+    <button class="kbtn" onclick="sendKey('Right')">Right</button>
+    <button class="kbtn" onclick="sendKey('Escape')">Esc</button>
+    <button class="kbtn" onclick="sendKey('BSpace')">Bksp</button>
+    <button class="kbtn" onclick="sendKey('PPage')">PgUp</button>
+    <button class="kbtn" onclick="sendKey('NPage')">PgDn</button>
+    <button class="kbtn" onclick="sendKey('Home')">Home</button>
+    <button class="kbtn" onclick="sendKey('End')">End</button>
+    <button class="kbtn" onclick="sendCtrl('C-c')">Ctrl+C</button>
+    <button class="kbtn" onclick="sendCtrl('C-d')">Ctrl+D</button>
+    <button class="kbtn accent" onclick="sendCommand('opencode')">Launch</button>
+</div>
 
-    <script>
-        const urlParams = new URLSearchParams(window.location.search);
-        const userId = urlParams.get('user_id') || '1769298522';
-        document.getElementById('userid-input').value = userId;
+<div class="input-bar">
+    <span class="prompt-symbol">&gt;</span>
+    <input type="text" id="cmd" placeholder="type command..." autocomplete="off" autocapitalize="off" spellcheck="false">
+</div>
 
-        const terminalEl = document.getElementById('terminal');
-        const commandInput = document.getElementById('command-input');
-        const configOverlay = document.getElementById('config-view');
-        const controlPanel = document.getElementById('control-panel');
+<script>
+(function() {
+    const params = new URLSearchParams(location.search);
+    const userId = params.get('user_id') || '1769298522';
+    const term = document.getElementById('terminal');
+    const cursor = document.getElementById('cursor');
+    const cmdInput = document.getElementById('cmd');
+    const wsDot = document.getElementById('ws-dot');
+    const wsLabel = document.getElementById('ws-label');
+    let ws = null;
+    let lastContent = '';
 
-        let currentTheme = 'matrix';
+    // ── WebSocket ──
+    function connect() {
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        ws = new WebSocket(`${proto}://${location.host}/api/ws/session/${userId}`);
 
-        function setTheme(themeKey, btn) {
-            currentTheme = themeKey;
-            document.querySelectorAll('.theme-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-        }
+        wsDot.className = 'topbar-dot connecting';
+        wsLabel.textContent = 'connecting';
 
-        function applyProfileSettings() {
-            const id = document.getElementById('userid-input').value;
-            if (currentTheme === 'matrix') {
-                document.documentElement.removeAttribute('data-theme');
-            } else {
-                document.documentElement.setAttribute('data-theme', currentTheme);
-            }
-            switchView('shell');
-        }
+        ws.onopen = () => {
+            wsDot.className = 'topbar-dot connected';
+            wsLabel.textContent = 'connected';
+        };
 
-        function switchView(viewName) {
-            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-            if (viewName === 'shell') {
-                document.getElementById('nav-shell').classList.add('active');
-                configOverlay.style.display = 'none';
-                controlPanel.style.display = 'flex';
-            } else if (viewName === 'config') {
-                document.getElementById('nav-config').classList.add('active');
-                configOverlay.style.display = 'flex';
-                controlPanel.style.display = 'none';
-            }
-        }
-
-        function cleanTerminal(text) {
-            if (!text) return "";
-            
-            const match = text.match(/https:\/\/accounts\.google\.com\/o\/oauth2\/auth\?[^\s'"\\<>]+/);
-            if (match) {
-                let authUrl = match[0];
-                authUrl = authUrl.split(/[\\\[\]\s]/)[0];
-                authUrl = authUrl.replace(/\]8;;$/, '').replace(/\\$/, '').replace(/\]8$/, '');
-                
-                return `
-<div class="login-card" style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding:30px; text-align:center; gap:16px;">
-    <div style="font-size:3rem;">🔑</div>
-    <div style="font-size:1.2rem; font-weight:bold; color:#FFF;">Authentication Required</div>
-    <div style="color:var(--text-secondary); font-size:0.9rem;">Please authorize your Google account to enable the Opencode AI Agent to run.</div>
-    <a href="${authUrl}" target="_blank" style="background:var(--accent-color); color:#000; font-weight:bold; padding:12px 28px; border-radius:30px; text-decoration:none;">🔗 Log In (Google)</a>
-    <div style="color:var(--text-secondary); font-size:0.8rem;">After logging in, copy the code and paste it into the console input field below.</div>
-</div>`;
-            }
-
-            let cleaned = text.replace(/\\x1b\\]8;[^\\x1b\\x07]*(?:\\x1b\\\\|\\x07)/g, '');
-            cleaned = cleaned.replace(/\\x1b\\[[0-9;?]*[a-zA-Z]/g, '');
-            cleaned = cleaned.replace(/\\x1b./g, '');
-            cleaned = cleaned.replace(/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]/g, '');
-            
-            cleaned = cleaned.replace(/\\[\\?2004[lh]/g, '');
-            cleaned = cleaned.replace(/\\[[0-9;?]*[mJKhHdDL]/g, '');
-            
-            return cleaned.trim();
-        }
-
-        async function refresh() {
+        ws.onmessage = (e) => {
             try {
-                const response = await fetch(`/api/sessions/${userId}/output?lines=50`);
-                if (!response.ok) throw new Error("Connection error");
-                
-                const data = await response.json();
-                const cleaned = cleanTerminal(data.output);
-                
-                if (cleaned.includes('Authentication Required')) {
-                    terminalEl.innerHTML = cleaned;
-                } else {
-                    terminalEl.textContent = cleaned || "Console screen is blank.";
-                    const cursor = document.createElement('span');
-                    cursor.className = 'cursor';
-                    terminalEl.appendChild(cursor);
-                    terminalEl.scrollTop = terminalEl.scrollHeight;
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'output' && msg.text) {
+                    renderOutput(msg.text);
                 }
-            } catch (err) {
-                console.error(err);
-            }
+            } catch {}
+        };
+
+        ws.onclose = () => {
+            wsDot.className = 'topbar-dot';
+            wsLabel.textContent = 'disconnected';
+            setTimeout(connect, 3000);
+        };
+
+        ws.onerror = () => ws.close();
+    }
+
+    function renderOutput(text) {
+        // Clean ANSI
+        let clean = text
+            .replace(/\x1b\]8;[^\x1b\x07]*[\x1b\x07]/g, '')
+            .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+            .replace(/\x1b./g, '')
+            .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+            .replace(/\[?2004[lh]/g, '')
+            .replace(/\[[0-9;?]*[mJKhHdDL]/g, '')
+            .trimEnd();
+
+        if (!clean) return;
+
+        // Google login detection
+        const googleMatch = clean.match(/https:\/\/accounts\.google\.com\/o\/oauth2\/auth\?[^\s'"]+/);
+        if (googleMatch) {
+            const url = googleMatch[0].replace(/[)\]]+$/, '');
+            term.innerHTML = `
+                <div class="login-card">
+                    <div style="font-size:14px;color:#eab308;margin-bottom:8px;">Authentication Required</div>
+                    <div style="font-size:11px;color:#666;margin-bottom:12px;">Google sign-in detected. Click below to authorize.</div>
+                    <a href="${url}" target="_blank" rel="noopener">Sign in with Google</a>
+                    <div style="font-size:10px;color:#444;margin-top:10px;">Paste the code into the input after signing in.</div>
+                </div>`;
+            return;
         }
 
-        async function sendCommand() {
-            const text = commandInput.value.trim();
-            if (!text) return;
-            commandInput.value = "";
-            try {
-                await fetch('/api/sessions/send', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: parseInt(userId), text: text })
-                });
-                setTimeout(refresh, 200);
-            } catch (err) {
-                console.error(err);
-            }
+        // Avoid redundant updates
+        if (clean === lastContent) return;
+        lastContent = clean;
+
+        term.textContent = clean;
+        term.appendChild(cursor);
+        term.scrollTop = term.scrollHeight;
+    }
+
+    // ── Send ──
+    window.sendCommand = function(text) {
+        if (!text) text = cmdInput.value;
+        if (!text.trim()) return;
+        cmdInput.value = '';
+        if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'command', text: text }));
         }
+    };
 
-        async function sendKey(key) {
-            try {
-                await fetch('/api/sessions/key', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: parseInt(userId), key: key })
-                });
-                setTimeout(refresh, 150);
-            } catch (err) {
-                console.error(err);
-            }
+    window.sendKey = function(key) {
+        if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'key', key: key }));
         }
+    };
 
-        async function sendInterrupt() {
-            try {
-                await fetch('/api/sessions/interrupt', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: parseInt(userId) })
-                });
-                setTimeout(refresh, 150);
-            } catch (err) {
-                console.error(err);
-            }
+    window.sendCtrl = function(key) {
+        if (ws && ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'key', key: key }));
         }
+    };
 
-        async function launchOpencode() {
-            try {
-                await fetch('/api/sessions/new', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: parseInt(userId), project: "default" })
-                });
-                await fetch('/api/sessions/send', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: parseInt(userId), text: "opencode" })
-                });
-                setTimeout(refresh, 300);
-            } catch (err) {
-                console.error(err);
-            }
+    cmdInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            sendCommand();
         }
+    });
 
-        setInterval(() => {
-            const load = (35 + Math.random() * 15).toFixed(1);
-            document.getElementById('load-fill').style.width = `${load}%`;
-            document.getElementById('load-text').textContent = `${load}%`;
-            
-            const lat = Math.floor(250 + Math.random() * 80);
-            document.getElementById('latency-text').textContent = `${lat}ms`;
-        }, 3000);
+    // Focus input on tap
+    term.addEventListener('click', () => cmdInput.focus());
 
-        commandInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                sendCommand();
-            }
-        });
-
-        refresh();
-        setInterval(refresh, 2000);
-    </script>
+    connect();
+})();
+</script>
 </body>
 </html>
 """
