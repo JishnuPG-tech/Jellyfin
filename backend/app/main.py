@@ -2,15 +2,18 @@ import os
 import json
 import base64
 from contextlib import asynccontextmanager
-from bot.telegram_bot import run_bot_async, stop_bot_async
-from services.workspace_process_manager import get_workspace_manager
 
 
 @asynccontextmanager
 async def lifespan(app):
     import asyncio
-    wm = get_workspace_manager()
-    wm.start_idle_checker()
+    try:
+        from services.workspace_process_manager import get_workspace_manager
+        wm = get_workspace_manager()
+        wm.start_idle_checker()
+    except Exception as e:
+        import logging
+        logging.error(f"Failed to init workspace manager: {e}")
     bot_task = asyncio.create_task(run_bot_async())
     yield
     await stop_bot_async()
@@ -19,7 +22,12 @@ async def lifespan(app):
         await bot_task
     except asyncio.CancelledError:
         pass
-    await wm.shutdown_all()
+    try:
+        from services.workspace_process_manager import get_workspace_manager
+        wm = get_workspace_manager()
+        await wm.shutdown_all()
+    except Exception:
+        pass
 
 
 try:
@@ -29,6 +37,8 @@ try:
     from fastapi import FastAPI, Request, HTTPException, WebSocket
     from fastapi.responses import StreamingResponse, JSONResponse
     from backend.app.api import router as api_router
+    from bot.telegram_bot import run_bot_async, stop_bot_async
+    from services.workspace_process_manager import get_workspace_manager
 
     # ── Auth credentials for opencode serve ──────────────────────────
     _OC_USERNAME = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
