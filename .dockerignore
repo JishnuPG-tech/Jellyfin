@@ -1,7 +1,0 @@
-.git
-.gitignore
-__pycache__
-*.pyc
-logs/
-workspaces/
-node_modules/
