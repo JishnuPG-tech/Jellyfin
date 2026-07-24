@@ -291,6 +291,15 @@ try:
         except Exception:
             pass
 
+    # ── Webapp at root ──
+    from backend.app.webapp_html import HTML_CONTENT
+    from fastapi.responses import HTMLResponse
+
+    @app.get("/", response_class=HTMLResponse)
+    async def webapp_root():
+        """Serve the main webapp (xterm.js terminal with workspace management)."""
+        return HTML_CONTENT
+
     # ── HTTP reverse proxy with folder interception ──────────────────
     @app.api_route("/proxy/{workspace_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
     async def proxy_to_workspace(request: Request, workspace_id: str, path: str):

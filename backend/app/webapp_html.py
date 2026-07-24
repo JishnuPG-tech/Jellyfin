@@ -6,6 +6,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     <title>OpenCode CLI</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -39,6 +40,13 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             text-transform: uppercase;
         }
 
+        .topbar-actions {
+            margin-left: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
         .topbar-status {
             margin-left: auto;
             display: flex;
@@ -67,130 +75,42 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             left: 0;
             right: 0;
             bottom: 0;
-            padding: 12px 14px;
-            overflow-y: auto;
-            overflow-x: hidden;
-            white-space: pre-wrap;
-            word-break: break-all;
-            color: #c8c8c8;
-            scroll-behavior: smooth;
         }
 
-        #terminal::-webkit-scrollbar { width: 6px; }
-        #terminal::-webkit-scrollbar-track { background: transparent; }
-        #terminal::-webkit-scrollbar-thumb { background: #222; border-radius: 3px; }
-
-        .cursor {
-            display: inline-block;
-            width: 7px;
-            height: 14px;
-            background: #c8c8c8;
-            vertical-align: text-bottom;
-            animation: blink 1s step-end infinite;
-        }
-
-        @keyframes blink { 50% { opacity: 0; } }
-
-        /* ── Input Bar ── */
-        .input-bar {
-            position: fixed;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            background: #0a0a0a;
-            border-top: 1px solid #1a1a1a;
-            padding: 8px 10px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            z-index: 20;
-            padding-bottom: max(8px, env(safe-area-inset-bottom));
-        }
-
-        .prompt-symbol {
-            color: #22c55e;
-            font-weight: 700;
-            font-size: 13px;
-            flex-shrink: 0;
-        }
-
-        #cmd {
-            flex: 1;
-            background: transparent;
-            border: none;
-            outline: none;
-            color: #e0e0e0;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 13px;
-            caret-color: #22c55e;
-        }
-
-        #cmd::placeholder { color: #333; }
-
-        /* ── Key Row ── */
-        .keyrow {
-            position: fixed;
-            bottom: 48px;
-            left: 0;
-            right: 0;
-            background: #050505;
-            border-top: 1px solid #111;
-            padding: 6px 8px;
-            display: flex;
-            gap: 5px;
-            overflow-x: auto;
-            z-index: 19;
-            -webkit-overflow-scrolling: touch;
-        }
-
-        .keyrow::-webkit-scrollbar { display: none; }
-
-        .kbtn {
-            flex-shrink: 0;
+        /* ── Workspace Select ── */
+        .workspace-select {
             background: #0f0f0f;
-            border: 1px solid #1a1a1a;
-            color: #666;
+            color: #bbb;
+            border: 1px solid #222;
             border-radius: 4px;
-            padding: 6px 10px;
+            padding: 3px 8px;
+            font-size: 11px;
             font-family: 'JetBrains Mono', monospace;
+            outline: none;
+            cursor: pointer;
+        }
+
+        .btn {
+            background: #22c55e;
+            border: none;
+            color: #000;
             font-size: 10px;
-            font-weight: 500;
+            font-weight: 700;
+            padding: 4px 10px;
+            border-radius: 4px;
             cursor: pointer;
             text-transform: uppercase;
-            letter-spacing: 0.3px;
+            font-family: 'JetBrains Mono', monospace;
         }
 
-        .kbtn:active {
-            background: #1a1a1a;
-            color: #aaa;
-            border-color: #333;
+        .btn-danger {
+            background: #ef4444;
+            color: #fff;
         }
 
-        .kbtn.accent {
-            color: #22c55e;
-            border-color: #166534;
-        }
-
-        /* ── Login Card ── */
-        .login-card {
-            background: #0a0a0a;
-            border: 1px solid #1a1a1a;
-            border-radius: 8px;
-            padding: 24px;
-            margin: 16px 0;
-            text-align: center;
-        }
-
-        .login-card a {
-            display: inline-block;
-            margin-top: 12px;
-            padding: 8px 20px;
-            background: #22c55e;
-            color: #000;
-            text-decoration: none;
-            border-radius: 6px;
-            font-weight: 700;
-            font-size: 12px;
+        .btn-secondary {
+            background: #3b82f6;
+            color: #fff;
         }
     </style>
 </head>
@@ -198,14 +118,13 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
 <div class="topbar">
     <span class="topbar-title">opencode</span>
-    <div style="margin-left: 20px; display: flex; align-items: center; gap: 8px;">
+    <div class="topbar-actions">
         <span style="font-size: 11px; color: #555; font-weight: 500;">WORKSPACE:</span>
-        <select id="workspace-select" style="background: #0f0f0f; color: #bbb; border: 1px solid #222; border-radius: 4px; padding: 3px 8px; font-size: 11px; font-family: 'JetBrains Mono', monospace; outline: none; cursor: pointer;" onchange="changeWorkspace()">
+        <select id="workspace-select" class="workspace-select" onchange="changeWorkspace()">
             <option value="default">default</option>
         </select>
-        <button onclick="promptClone()" style="background: #22c55e; border: none; color: #000; font-size: 10px; font-weight: 700; padding: 4px 10px; border-radius: 4px; cursor: pointer; text-transform: uppercase; font-family: 'JetBrains Mono', monospace;">CLONE REPO</button>
-        <button onclick="promptDelete()" style="background: #ef4444; border: none; color: #fff; font-size: 10px; font-weight: 700; padding: 4px 10px; border-radius: 4px; cursor: pointer; text-transform: uppercase; font-family: 'JetBrains Mono', monospace;">DELETE</button>
-        <button onclick="window.open('/terminal', '_blank')" style="background: #22c55e; border: none; color: #000; font-size: 10px; font-weight: 700; padding: 4px 10px; border-radius: 4px; cursor: pointer; text-transform: uppercase; font-family: 'JetBrains Mono', monospace;">TERMINAL</button>
+        <button class="btn" onclick="promptClone()">CLONE REPO</button>
+        <button class="btn btn-danger" onclick="promptDelete()">DELETE</button>
     </div>
     <div class="topbar-status">
         <div class="topbar-dot" id="ws-dot"></div>
@@ -213,48 +132,72 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     </div>
 </div>
 
-<div id="terminal"><span class="cursor" id="cursor"></span></div>
+<div id="terminal"></div>
 
-<div class="keyrow" id="keyrow">
-    <button class="kbtn" onclick="sendKey('Tab')">Tab</button>
-    <button class="kbtn" onclick="sendKey('Up')">Up</button>
-    <button class="kbtn" onclick="sendKey('Down')">Down</button>
-    <button class="kbtn" onclick="sendKey('Left')">Left</button>
-    <button class="kbtn" onclick="sendKey('Right')">Right</button>
-    <button class="kbtn" onclick="sendKey('Escape')">Esc</button>
-    <button class="kbtn" onclick="sendKey('BSpace')">Bksp</button>
-    <button class="kbtn" onclick="sendKey('PPage')">PgUp</button>
-    <button class="kbtn" onclick="sendKey('NPage')">PgDn</button>
-    <button class="kbtn" onclick="sendKey('Home')">Home</button>
-    <button class="kbtn" onclick="sendKey('End')">End</button>
-    <button class="kbtn" onclick="sendCtrl('C-c')">Ctrl+C</button>
-    <button class="kbtn" onclick="sendCtrl('C-d')">Ctrl+D</button>
-    <button class="kbtn accent" onclick="sendCommand('opencode')">Launch</button>
-</div>
-
-<div class="input-bar">
-    <span class="prompt-symbol">&gt;</span>
-    <input type="text" id="cmd" placeholder="type command..." autocomplete="off" autocapitalize="off" spellcheck="false">
-</div>
-
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 <script>
 (function() {
     const params = new URLSearchParams(location.search);
     const userId = params.get('user_id') || '1769298522';
-    const term = document.getElementById('terminal');
-    const cursor = document.getElementById('cursor');
-    const cmdInput = document.getElementById('cmd');
+    const termDiv = document.getElementById('terminal');
     const wsDot = document.getElementById('ws-dot');
     const wsLabel = document.getElementById('ws-label');
     const wsSelect = document.getElementById('workspace-select');
+    
+    let xterm = null;
+    let fitAddon = null;
     let ws = null;
-    let lastContent = '';
-    let currentProject = 'default';
     let reconnectTimer = null;
-
-    // ── Workspace Functions ──
+    let currentProject = 'default';
     let workspaceStatuses = {};
 
+    // ── Initialize xterm.js ──
+    function initTerminal() {
+        xterm = new Terminal({
+            cursorBlink: true,
+            fontSize: 13,
+            fontFamily: 'JetBrains Mono',
+            theme: { background: '#000', foreground: '#c8c8c8', cursor: '#c8c8c8' },
+            convertEol: true,
+            scrollback: 10000
+        });
+        fitAddon = new FitAddon.FitAddon();
+        xterm.loadAddon(fitAddon);
+        xterm.open(termDiv);
+        fitAddon.fit();
+        window.addEventListener('resize', () => fitAddon.fit());
+    }
+
+    // ── WebSocket to ttyd ──
+    function connectTerminal() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${proto}//${location.host}/terminal/ws`);
+        ws.binaryType = 'arraybuffer';
+        
+        wsDot.className = 'topbar-dot connecting';
+        wsLabel.textContent = 'connecting';
+
+        ws.onopen = () => {
+            wsDot.className = 'topbar-dot connected';
+            wsLabel.textContent = 'connected';
+        };
+
+        ws.onmessage = (e) => {
+            if (xterm) xterm.write(new Uint8Array(e.data));
+        };
+
+        ws.onclose = () => {
+            wsDot.className = 'topbar-dot';
+            wsLabel.textContent = 'disconnected';
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(connectTerminal, 3000);
+        };
+
+        ws.onerror = () => ws.close();
+    }
+
+    // ── Workspace Functions ──
     async function loadWorkspaces() {
         try {
             const [listResp, statusResp] = await Promise.all([
@@ -292,18 +235,17 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         }
     }
 
-    window.changeWorkspace = function() {
+    window.changeWorkspace = async function() {
         currentProject = wsSelect.value;
-        term.innerHTML = `<span style="color:#555;">Switching to workspace: ${currentProject}...</span>\n<span class="cursor" id="cursor"></span>`;
         if (ws) {
-            if (reconnectTimer) {
-                clearTimeout(reconnectTimer);
-                reconnectTimer = null;
-            }
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
             ws.onclose = null;
             ws.close();
         }
-        connect();
+        // When workspace changes, we need to reconnect to ttyd with the new working directory
+        // ttyd doesn't support dynamic cwd change, so we'll just reconnect (it will start in the default cwd)
+        // For true per-workspace terminals, we'd need a separate ttyd instance per workspace
+        connectTerminal();
     };
 
     window.promptClone = async function() {
@@ -311,7 +253,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         if (!repoUrl) return;
         const folderName = prompt("Enter local folder name (optional, defaults to repo name):");
         
-        term.innerHTML = `<span style="color:#22c55e;">Cloning ${repoUrl}... (this may take a few moments)</span>\n<span class="cursor" id="cursor"></span>`;
+        if (xterm) {
+            xterm.write('\r\n\x1b[32mCloning ' + repoUrl + '... (this may take a few moments)\x1b[0m\r\n');
+        }
         
         try {
             const resp = await fetch('/api/workspace/clone', {
@@ -327,11 +271,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
                 changeWorkspace();
             } else {
                 alert(`Clone failed: ${data.detail || 'Unknown error'}`);
-                term.innerHTML = `<span style="color:#ef4444;">Clone failed: ${data.detail || 'Unknown error'}</span>\n<span class="cursor" id="cursor"></span>`;
+                if (xterm) xterm.write('\r\n\x1b[31mClone failed: ' + (data.detail || 'Unknown error') + '\x1b[0m\r\n');
             }
         } catch (e) {
             alert(`Clone failed: ${e.message}`);
-            term.innerHTML = `<span style="color:#ef4444;">Clone failed: ${e.message}</span>\n<span class="cursor" id="cursor"></span>`;
+            if (xterm) xterm.write('\r\n\x1b[31mClone failed: ' + e.message + '\x1b[0m\r\n');
         }
     };
 
@@ -363,107 +307,29 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         }
     };
 
-    // ── WebSocket ──
-    function connect() {
-        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const projectParam = encodeURIComponent(currentProject);
-        ws = new WebSocket(`${proto}://${location.host}/api/ws/session/${userId}?project=${projectParam}`);
-        lastContent = '';
-
-        wsDot.className = 'topbar-dot connecting';
-        wsLabel.textContent = 'connecting';
-
-        ws.onopen = () => {
-            wsDot.className = 'topbar-dot connected';
-            wsLabel.textContent = 'connected';
-        };
-
-        ws.onmessage = (e) => {
-            try {
-                const msg = JSON.parse(e.data);
-                if (msg.type === 'output' && msg.text) {
-                    renderOutput(msg.text);
-                }
-            } catch {}
-        };
-
-        ws.onclose = () => {
-            wsDot.className = 'topbar-dot';
-            wsLabel.textContent = 'disconnected';
-            if (reconnectTimer) clearTimeout(reconnectTimer);
-            reconnectTimer = setTimeout(connect, 3000);
-        };
-
-        ws.onerror = () => ws.close();
+    // ── Input handling ──
+    function sendInput(data) {
+        if (ws && ws.readyState === 1) {
+            ws.send(data);
+        }
     }
 
-    function renderOutput(text) {
-        let clean = text
-            .replace(/\x1b\]8;[^\x1b\x07]*[\x1b\x07]/g, '')
-            .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
-            .replace(/\x1b./g, '')
-            .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
-            .replace(/\[?2004[lh]/g, '')
-            .replace(/\[[0-9;?]*[mJKhHdDL]/g, '')
-            .trimEnd();
+    // Initialize
+    initTerminal();
+    connectTerminal();
+    loadWorkspaces().then(() => {});
 
-        if (!clean) return;
-
-        const googleMatch = clean.match(/https:\/\/accounts\.google\.com\/o\/oauth2\/auth\?[^\s'"]+/);
-        if (googleMatch) {
-            const url = googleMatch[0].replace(/[)\]]+$/, '');
-            term.innerHTML = `
-                <div class="login-card">
-                    <div style="font-size:14px;color:#eab308;margin-bottom:8px;">Authentication Required</div>
-                    <div style="font-size:11px;color:#666;margin-bottom:12px;">Google sign-in detected. Click below to authorize.</div>
-                    <a href="${url}" target="_blank" rel="noopener">Sign in with Google</a>
-                    <div style="font-size:10px;color:#444;margin-top:10px;">Paste the code into the input after signing in.</div>
-                </div>`;
-            return;
-        }
-
-        if (clean === lastContent) return;
-        lastContent = clean;
-
-        term.textContent = clean;
-        term.appendChild(document.getElementById('cursor') || cursor);
-        term.scrollTop = term.scrollHeight;
-    }
-
-    // ── Send ──
-    window.sendCommand = function(text) {
-        if (!text) text = cmdInput.value;
-        if (!text.trim()) return;
-        cmdInput.value = '';
-        if (ws && ws.readyState === 1) {
-            ws.send(JSON.stringify({ type: 'command', text: text }));
-        }
-    };
-
-    window.sendKey = function(key) {
-        if (ws && ws.readyState === 1) {
-            ws.send(JSON.stringify({ type: 'key', key: key }));
-        }
-    };
-
-    window.sendCtrl = function(key) {
-        if (ws && ws.readyState === 1) {
-            ws.send(JSON.stringify({ type: 'key', key: key }));
-        }
-    };
-
-    cmdInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-            e.preventDefault();
-            sendCommand();
-        }
+    // Handle keyboard input
+    document.addEventListener('keydown', (e) => {
+        // Let xterm handle most keys, but we can intercept special combos if needed
     });
 
-    term.addEventListener('click', () => cmdInput.focus());
-
-    loadWorkspaces().then(() => connect());
+    // Focus terminal on click
+    termDiv.addEventListener('click', () => xterm.focus());
 })();
 </script>
 </body>
 </html>
 """
+
+(End of file - total 469 lines)
