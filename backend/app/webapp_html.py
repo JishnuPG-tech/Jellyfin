@@ -205,6 +205,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         </select>
         <button onclick="promptClone()" style="background: #22c55e; border: none; color: #000; font-size: 10px; font-weight: 700; padding: 4px 10px; border-radius: 4px; cursor: pointer; text-transform: uppercase; font-family: 'JetBrains Mono', monospace;">CLONE REPO</button>
         <button onclick="promptDelete()" style="background: #ef4444; border: none; color: #fff; font-size: 10px; font-weight: 700; padding: 4px 10px; border-radius: 4px; cursor: pointer; text-transform: uppercase; font-family: 'JetBrains Mono', monospace;">DELETE</button>
+        <button onclick="window.open('/terminal', '_blank')" style="background: #22c55e; border: none; color: #000; font-size: 10px; font-weight: 700; padding: 4px 10px; border-radius: 4px; cursor: pointer; text-transform: uppercase; font-family: 'JetBrains Mono', monospace;">TERMINAL</button>
     </div>
     <div class="topbar-status">
         <div class="topbar-dot" id="ws-dot"></div>

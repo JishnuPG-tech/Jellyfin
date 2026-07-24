@@ -182,6 +182,115 @@ try:
         except Exception:
             pass
 
+    # ── Terminal (ttyd) reverse proxy ──────────────────────────────────
+    TTYD_PORT = int(os.environ.get("TTYD_PORT", "7681"))
+
+    from fastapi.responses import HTMLResponse
+
+    TERMINAL_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>OpenCode Terminal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; background: #000; color: #c8c8c8; font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1.45; overflow: hidden; }
+        #topbar { height: 32px; background: #0a0a0a; border-bottom: 1px solid #1a1a1a; display: flex; align-items: center; padding: 0 12px; gap: 10px; flex-shrink: 0; }
+        #topbar-title { color: #555; font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; }
+        #topbar-status { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 11px; color: #444; }
+        #ws-dot { width: 6px; height: 6px; border-radius: 50%; background: #333; }
+        #ws-dot.connected { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+        #ws-dot.connecting { background: #eab308; animation: pulse 1s infinite; }
+        @keyframes pulse { 50% { opacity: 0.4; } }
+        #terminal { position: absolute; top: 32px; left: 0; right: 0; bottom: 0; }
+    </style>
+</head>
+<body>
+<div id="topbar">
+    <span id="topbar-title">opencode terminal</span>
+    <div id="topbar-status">
+        <div id="ws-dot"></div>
+        <span id="ws-label">connecting</span>
+    </div>
+</div>
+<div id="terminal"></div>
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script>
+(function() {
+    const term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: 'JetBrains Mono', theme: { background: '#000', foreground: '#c8c8c8', cursor: '#c8c8c8' } });
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(document.getElementById('terminal'));
+    fitAddon.fit();
+    window.addEventListener('resize', () => fitAddon.fit());
+
+    const wsDot = document.getElementById('ws-dot');
+    const wsLabel = document.getElementById('ws-label');
+    let ws = null, reconnectTimer = null;
+
+    function connect() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${proto}//${location.host}/terminal/ws`);
+        ws.binaryType = 'arraybuffer';
+        wsDot.className = 'connecting';
+        wsLabel.textContent = 'connecting';
+
+        ws.onopen = () => { wsDot.className = 'connected'; wsLabel.textContent = 'connected'; };
+        ws.onmessage = (e) => { term.write(new Uint8Array(e.data)); };
+        ws.onclose = () => { wsDot.className = ''; wsLabel.textContent = 'disconnected'; if (reconnectTimer) clearTimeout(reconnectTimer); reconnectTimer = setTimeout(connect, 3000); };
+        ws.onerror = () => ws.close();
+    }
+    connect();
+    term.onData((data) => { if (ws && ws.readyState === 1) ws.send(data); });
+})();
+</script>
+</body>
+</html>"""
+
+    @app.get("/terminal", response_class=HTMLResponse)
+    async def terminal_page():
+        """Serve the xterm.js terminal page."""
+        return TERMINAL_HTML
+
+    @app.websocket("/terminal/ws")
+    async def terminal_ws_proxy(client_ws: WebSocket):
+        """Proxy WebSocket to ttyd."""
+        await client_ws.accept()
+        uri = f"ws://127.0.0.1:{TTYD_PORT}/terminal/ws"
+        if client_ws.query_params:
+            uri += f"?{client_ws.query_params}"
+        try:
+            async with websockets.connect(uri) as server_ws:
+                async def client_to_server():
+                    try:
+                        while True:
+                            msg = await client_ws.receive()
+                            if "text" in msg:
+                                await server_ws.send(msg["text"])
+                            elif "bytes" in msg:
+                                await server_ws.send(msg["bytes"])
+                    except Exception:
+                        pass
+
+                async def server_to_client():
+                    try:
+                        async for msg in server_ws:
+                            if isinstance(msg, str):
+                                await client_ws.send_text(msg)
+                            else:
+                                await client_ws.send_bytes(msg)
+                    except Exception:
+                        pass
+
+                await asyncio.gather(client_to_server(), server_to_client())
+        except Exception:
+            pass
+
     # ── HTTP reverse proxy with folder interception ──────────────────
     @app.api_route("/proxy/{workspace_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
     async def proxy_to_workspace(request: Request, workspace_id: str, path: str):

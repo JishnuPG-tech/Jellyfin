@@ -45,6 +45,15 @@ done
 # Make workspaces directly visible from HOME (/data)
 ln -sf "$WORKSPACE_PATH" /data/workspaces 2>/dev/null || true
 
+# Start ttyd on TTYD_PORT (default 7681) for embedded terminal
+# Shares same filesystem, env, working dir, and user as the rest of the container
+echo "Starting ttyd on port ${TTYD_PORT:-7681}..."
+ttyd --port "${TTYD_PORT:-7681}" --host 0.0.0.0 --writable \
+    --base-path /terminal \
+    bash -l > /data/logs/ttyd.log 2>&1 &
+TTYD_PID=$!
+echo "ttyd started (PID: $TTYD_PID)"
+
 echo "Starting default opencode serve on port 4096..."
 cd "${WORKSPACE_PATH}" || true
 opencode serve --port 4096 --hostname 127.0.0.1 > /data/logs/opencode-serve.log 2>&1 &
