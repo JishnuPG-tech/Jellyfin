@@ -1,17 +1,20 @@
-"""Minimal everything-byte-proxy on :7860.
+"""Byte-proxy that adds ONLY /terminal/* routing on top of an opencode
+serve that already binds 7860.
 
-Three internal services:
-  - opencode serve on :4096 (Chat AI server).
-  - ttyd         on :7681 (embedded terminal at /terminal).
+Architecture:
+  - opencode serve listens on :7860 (HF exposed).
+  - This uvicorn process listens on port TTYN_PORT (internal, e.g. 7680).
+  - uvicorn forwards /terminal/* to ttyd on 7681, /proxy/* to itself
+    expects nothing — actually, this stance is wrong. Re-read.
 
-The proxy does ONLY:
-  - Forward HTTP body as-is.
-  - Forward HTTP headers (except `Host:`, which is rewritten to 127.0.0.1:4096
-    or 127.0.0.1:7681).
-  - Insert `Authorization: Basic opencode:password` for upstream = opencode.
-  - Forward WebSocket frames byte-for-byte.
+Final architecture:
+  We bind uvicorn on 7860 (HF port). uvicorn proxies ALL paths to
+  opencode serve on a private port (4096). /terminal/* goes to ttyd
+  on 7681. This is the ONLY realistic topology with one HF port.
 
-The proxy does NOT inspect, parse, rewrite or even read the response body.
+The proxy IS a dumb pipe: it does NOT touch the body, does NOT log,
+does NOT add JSON wrappers. The only mutation is adding the opencode
+HTTP-Basic auth header.
 """
 from __future__ import annotations
 
@@ -23,32 +26,33 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import FastAPI, Request, WebSocket
 
-OC_HOST = os.environ.get("OPENCODE_HOST", "127.0.0.1")
+OC_HOST = "127.0.0.1"
 OC_PORT = int(os.environ.get("OPENCODE_PORT", "4096"))
 TTYD_PORT = int(os.environ.get("TTYD_PORT", "7681"))
-OC_AUTH = "Basic " + base64.b64encode(
-    (os.environ.get("OPENCODE_SERVER_USERNAME", "opencode") + ":" + os.environ.get("OPENCODE_SERVER_PASSWORD", "password")).encode()
-).decode()
+OC_USERNAME = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+OC_PASSWORD = os.environ.get("OPENCODE_SERVER_PASSWORD", "password")
+OC_AUTH = "Basic " + base64.b64encode(f"{OC_USERNAME}:{OC_PASSWORD}".encode()).decode()
 
-app = FastAPI(title="opencode-serve")
+# Timeouts
+REQ_TIMEOUT = 600.0  # long enough for SSE
 
-
-def _target_port(path: str) -> int:
-    if path == "/terminal" or path.startswith("/terminal/") or path == "/terminal/" or path == "/terminal":
-        return TTYD_PORT
-    return OC_PORT
+app = FastAPI(title="opencode-serve", docs_url=None, redoc_url=None, openapi_url=None)
 
 
-async def _proxy(request: Request):
-    target_port = _target_port(request.url.path)
-    # httpx will percent-encode path; but we pass the literal path as URL.
+def _target_for(path: str) -> tuple[str, int, dict[str, str]]:
+    """Return (target_label, target_port, extra_headers)."""
+    if path == "/terminal" or path.startswith("/terminal/") or path.startswith("/terminal?"):
+        return "ttyd", TTYD_PORT, {}
+    return "opencode", OC_PORT, {"Authorization": OC_AUTH}
+
+
+async def _proxy_http(request: Request):
+    target_label, target_port, extra_headers = _target_for(request.url.path)
     upstream_url = f"http://{OC_HOST}:{target_port}{request.url.path}"
     fwd = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
-    if target_port == OC_PORT:
-        fwd["authorization"] = OC_AUTH
+    fwd.update(extra_headers)
     body = await request.body()
-
-    async with httpx.AsyncClient(timeout=600.0, follow_redirects=False) as cli:
+    async with httpx.AsyncClient(timeout=REQ_TIMEOUT, follow_redirects=False) as cli:
         try:
             upstream = await cli.request(
                 method=request.method,
@@ -59,7 +63,7 @@ async def _proxy(request: Request):
             )
         except (httpx.ConnectError, httpx.HTTPError) as exc:
             from fastapi.responses import Response
-            return Response(status_code=502, content=f"upstream error: {exc}")
+            return Response(status_code=502, content=f"{target_label} unreachable: {exc}")
 
         passthrough = {k: v for k, v in upstream.headers.items()
                        if k.lower() not in ("content-length", "content-encoding", "transfer-encoding", "connection")}
@@ -89,28 +93,26 @@ async def _proxy(request: Request):
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
     include_in_schema=False,
 )
-async def serve(request: Request, path: str):
-    return await _proxy(request)
+async def main_proxy(request: Request, path: str):
+    return await _proxy_http(request)
 
 
-@app.api_route("/", methods=["GET"], include_in_schema=False)
-async def serve_root(request: Request):
-    return await _proxy(request)
+@app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+async def root_proxy(request: Request):
+    return await _proxy_http(request)
 
 
 @app.websocket("/{path:path}")
-async def ws_serve(websocket: WebSocket, path: str):
+async def ws_proxy(websocket: WebSocket, path: str):
     await websocket.accept()
-    target_port = _target_port("/" + path)
+    target_label, target_port, extra_headers = _target_for("/" + path)
     target_url = f"ws://{OC_HOST}:{target_port}/{path}"
     if websocket.query_params:
         target_url += "?" + urlencode(websocket.query_params)
-    headers = {}
-    if target_port == OC_PORT:
-        headers["Authorization"] = OC_AUTH
+
     import websockets as ws_lib
     try:
-        async with ws_lib.connect(target_url, additional_headers=headers, max_size=32 * 1024 * 1024) as upstream:
+        async with ws_lib.connect(target_url, additional_headers=extra_headers, max_size=32 * 1024 * 1024) as upstream:
             await asyncio.gather(_c2s(websocket, upstream), _s2c(websocket, upstream))
     except Exception:
         try:
@@ -123,8 +125,7 @@ async def _c2s(c, up):
     try:
         while True:
             msg = await c.receive()
-            t = msg.get("type")
-            if t == "websocket.disconnect":
+            if msg.get("type") == "websocket.disconnect":
                 return
             if msg.get("text") is not None:
                 await up.send(msg["text"])
@@ -148,4 +149,4 @@ async def _s2c(c, up):
 @app.get("/healthz", include_in_schema=False)
 async def healthz():
     from fastapi.responses import JSONResponse
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "oc_port": OC_PORT, "ttyd_port": TTYD_PORT})
