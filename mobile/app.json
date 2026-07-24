@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "OpenCode Mobile",
+    "slug": "opencode-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "opencode",
+    "platforms": ["android"],
+    "android": {
+      "package": "com.opencode.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#1a1b26"
+      }
+    },
+    "plugins": [
+      "expo-asset",
+      "expo-font",
+      "expo-router",
+      "expo-secure-store"
+    ]
+  }
+}
