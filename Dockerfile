@@ -1,17 +1,8 @@
-## OpenCode-Serve · production-ready embedded terminal
-##
-## Architecture (one process per concern):
-##   - opencode serve on 127.0.0.1:4096 (internal, the AI server)
-##   - ttyd         on 0.0.0.0:7681  (internal, the embedded terminal)
-##   - uvicorn      on 0.0.0.0:7860  (HF exposed port, the proxy)
-##   - persistent   /bin/bash PTY inside the same container
-##
+## OpenCode-Serve · clean rebuild
+## Just opencode serve on :7860 plus ttyd on :7681 (internal). No proxy.
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV LANG=C.UTF-8
-ENV LC_ALL=C.UTF-8
-ENV PYTHONUNBUFFERED=1
 
 ENV XDG_DATA_HOME=/data/share
 ENV XDG_CONFIG_HOME=/data/config
@@ -25,11 +16,9 @@ ENV TTYD_PORT=7681
 ARG OPENCODE_VERSION=1.18.3
 ARG TTYD_VERSION=1.7.7
 
-# System packages — python3-pip installed here so pip is available.
-# ttyd is NOT in Debian's stock apt sources; we download the binary
-# from upstream instead.
+# System packages — git for /projects clone, python3 for cleaner
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git gnupg python3 python3-pip \
+      ca-certificates curl git gnupg python3 \
  && curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
       | tar -xz -C /usr/local/bin opencode \
  && chmod +x /usr/local/bin/opencode \
@@ -38,17 +27,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && chmod +x /usr/local/bin/ttyd \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+RUN mkdir -p /projects/default
 
-COPY requirements.txt /app/requirements.txt
-RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
-
-COPY backend /app/backend
 COPY cleaner.py /cleaner.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-RUN mkdir -p /data/workspaces /data/logs /projects/default
+WORKDIR /projects/default
 
 EXPOSE 7860
 
