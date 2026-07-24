@@ -31,6 +31,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from backend.app.opencode_proxy import AUTH_HEADER, OPENCODE_PORT, clear_host_header
 from backend.app.pty_service import get_pty_service
 from backend.app.webapp import WEBAPP_HTML
+from backend.app.terminal_page import TERMINAL_ONLY_HTML
 
 
 logging.basicConfig(
@@ -83,6 +84,14 @@ async def health():
 async def root():
     """Integrated webapp — shows the terminal iframe + a button to the chat SPA."""
     return WEBAPP_HTML
+
+
+@app.get("/terminal", response_class=HTMLResponse)
+async def terminal():
+    """Standalone full-page terminal — same xterm.js as the integrated webapp,
+    but without the chat tab. Convenient bookmark target.
+    """
+    return TERMINAL_ONLY_HTML
 
 
 # ─────────────────────────────────────────────────────────────────────
