@@ -1,10 +1,11 @@
 ## OpenCode-Serve · production-ready embedded terminal
 ##
-## Runs *one* process on the HF-exposed port :7860:
-##   - a thin Python gateway (uvicorn) that proxies everything by byte
-##   - upstream opencode serve on :4096 (internal)
-##   - upstream ttyd         on :7681 (internal)
-##   - persistent /bin/bash PTY inside the same container
+## Architecture (one process per concern):
+##   - opencode serve on 127.0.0.1:4096 (internal, the AI server)
+##   - ttyd         on 0.0.0.0:7681  (internal, the embedded terminal)
+##   - uvicorn      on 0.0.0.0:7860  (HF exposed port, the proxy)
+##   - persistent   /bin/bash PTY inside the same container
+##
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -22,15 +23,23 @@ ENV OPENCODE_PORT=4096
 ENV TTYD_PORT=7681
 
 ARG OPENCODE_VERSION=1.18.3
+ARG TTYD_VERSION=1.7.7
 
+# System packages — python3-pip installed here so pip is available.
+# ttyd is NOT in Debian's stock apt sources; we download the binary
+# from upstream instead.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-       ca-certificates curl git gnupg python3 python3-pip ttyd \
+      ca-certificates curl git gnupg python3 python3-pip \
  && curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
       | tar -xz -C /usr/local/bin opencode \
  && chmod +x /usr/local/bin/opencode \
+ && curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" \
+      -o /usr/local/bin/ttyd \
+ && chmod +x /usr/local/bin/ttyd \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
 COPY requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
 
