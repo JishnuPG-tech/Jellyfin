@@ -12,64 +12,84 @@ echo "=== OpenCode-Serve starting               ==="
 echo "Time: $(date)"
 echo "============================================"
 
-mkdir -p /data/share/opencode /data/config/opencode /data/cache/opencode /data/state/opencode \
-         /data/workspaces /data/logs \
- 2>/dev/null || true
+# Prevent git ownership errors
+git config --global --add safe.directory '*' 2>/dev/null || true
+
+# ─── Data directories ───
+echo "[INIT] Setting up /data directories..."
+mkdir -p /data/share/opencode 2>/dev/null || echo "[WARN] Could not create /data/share/opencode"
+mkdir -p /data/config/opencode 2>/dev/null || echo "[WARN] Could not create /data/config/opencode"
+mkdir -p /data/cache/opencode 2>/dev/null || echo "[WARN] Could not create /data/cache/opencode"
+mkdir -p /data/state/opencode 2>/dev/null || echo "[WARN] Could not create /data/state/opencode"
+mkdir -p /data/workspaces /data/logs 2>/dev/null || true
+
+# ─── OpenCode config ─────────────────────────────────────────────────
+# Remove stale model configs that use wrong format
+echo "[CONFIG] Setting up default configuration..."
+python3 -c "
+import json, os
+p = '/data/config/opencode/opencode.json'
+stale_models = ['big-pickle', 'mimo-v2.5-free', 'opencode/mimo-v2.5-free']
+try:
+    d = json.load(open(p)) if os.path.exists(p) else {}
+    if d.get('model') in stale_models:
+        print(f'[CONFIG] Removing stale model {d[\"model\"]!r}, will regenerate')
+        del d['model']
+        json.dump(d, open(p, 'w'), indent=2)
+except Exception as e:
+    print(f'[CONFIG] Error normalizing: {e}')
+" 2>/dev/null || true
+
+# Always write the server block so OpenCode binds on port 8080 (nginx proxies to it)
+# and the model is set correctly. The server is behind nginx so hostname is 127.0.0.1.
+python3 -c "
+import json, os
+p = '/data/config/opencode/opencode.json'
+try:
+    d = json.load(open(p)) if os.path.exists(p) else {}
+except Exception:
+    d = {}
+d['\$schema'] = 'https://opencode.ai/config.json'
+# Always overwrite port/hostname — old containers may have stored port 4096
+d['server'] = {'port': 8080, 'hostname': '127.0.0.1'}
+if not os.environ.get('ANTHROPIC_API_KEY') and not os.environ.get('OPENAI_API_KEY'):
+    d['model'] = 'opencode/big-pickle'
+elif not d.get('model'):
+    d['model'] = 'opencode/big-pickle'
+json.dump(d, open(p, 'w'), indent=2)
+print('[CONFIG] Wrote config with model:', d.get('model'))
+" 2>/dev/null || true
+echo "[CONFIG] Current configuration:"
+cat /data/config/opencode/opencode.json 2>/dev/null || echo "{}"
 
 # ─── Detect and remove malformed SQLite databases ───
 echo "[DB] Checking database integrity..."
-DB_PATHS="/data/share/opencode/opencode.db \
-          /projects/.opencode/share/opencode/opencode.db \
-          /root/.local/share/opencode/opencode.db \
-          /home/opencode/.local/share/opencode/opencode.db"
-
-for db_path in $DB_PATHS; do
-  if [ -f "$db_path" ]; then
-    result=$(python3 -c "
+DB_PATH="/data/share/opencode/opencode.db"
+if [ -f "$DB_PATH" ]; then
+    echo "[DB] Found database at $DB_PATH"
+    python3 -c "
 import sqlite3
 try:
-    conn = sqlite3.connect('$db_path', timeout=3)
+    conn = sqlite3.connect('$DB_PATH', timeout=5)
     row = conn.execute('PRAGMA integrity_check').fetchone()
     conn.close()
-    print(row[0] if row else 'error')
+    print('[DB] Integrity:', row[0] if row else 'error')
 except Exception as e:
-    print('error: ' + str(e))
-" 2>/dev/null || echo "error")
-    if [ "$result" != "ok" ]; then
-      echo "[DB] Malformed database at $db_path ($result) — removing."
-      rm -f "$db_path" "${db_path}-wal" "${db_path}-shm" 2>/dev/null || true
-    else
-      echo "[DB] OK: $db_path"
-    fi
-  fi
-done
+    print('[DB] Error:', e)
+" 2>/dev/null || echo "[DB] Could not read database"
+else
+    echo "[DB] No database found (fresh start)"
+fi
 
-# ─── Always write OpenCode config (port 8080, internal) ───
-# Do NOT guard with "if not exists" — persistent /data storage could still
-# have the old port 4096 config from before the nginx change, which would
-# make OpenCode bind on 4096 instead of 8080 and break the nginx proxy.
-mkdir -p /data/config/opencode
-python3 <<'PYEOF'
-import json
-d = {
-  "$schema": "https://opencode.ai/config.json",
-  "server": {"port": 8080, "hostname": "127.0.0.1"},
-  "model": "opencode/big-pickle"
-}
-json.dump(d, open("/data/config/opencode/opencode.json", "w"), indent=2)
-print("[CONFIG] opencode.json written (port 8080)")
-PYEOF
-
-# ─── nginx: reverse proxy ───────────────────────────────────────────
+# ─── nginx: minimal reverse proxy ───────────────────────────────────
+# Philosophy: match the working Opencode-Cli space as closely as possible.
+# That space runs OpenCode directly with no proxy. Here we only add nginx
+# to route /terminal to ttyd. Everything else goes straight to OpenCode.
+# No sub_filter, no CSP changes, no localStorage injection — those were
+# the root cause of "send button does nothing" (SPA failed to initialize).
 rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
-# Maps must live in the http{} context; conf.d files are included there.
 cat > /etc/nginx/conf.d/opencode-map.conf << 'MAPEOF'
-# Connection header:
-#   WebSocket (Upgrade: websocket) → "upgrade"
-#   Everything else (HTTP, SSE)    → "" (nginx default; do NOT send "close"
-#                                        as some backends treat it as a signal
-#                                        to shut down long-lived SSE connections)
 map $http_upgrade $connection_upgrade {
     websocket  upgrade;
     default    "";
@@ -80,9 +100,7 @@ cat > /etc/nginx/conf.d/opencode.conf << 'NGINXEOF'
 server {
     listen 7860;
 
-    # Disable nginx's own gzip — the backend controls its encoding.
-    # Prevent Accept-Encoding from asking the backend for compression,
-    # which would break SSE streaming (chunked + compressed = not streamable).
+    # Disable gzip — compressed SSE cannot be decompressed incrementally
     gzip off;
 
     # ── Real PTY terminal (ttyd on :7681) ────────────────────────────
@@ -94,142 +112,55 @@ server {
         proxy_set_header        Host            $host;
         proxy_set_header        Accept-Encoding "";
         proxy_read_timeout      86400;
-        # Note: sub_filter needs buffering; WebSocket ignores buffering setting anyway.
 
-        # Inject mobile-friendly viewport + CSS into ttyd's HTML
+        # Mobile-friendly: inject viewport and keyboard FAB into ttyd HTML
         sub_filter '<head>' '<head>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
 <style>
-html, body {
-  margin: 0; padding: 0;
-  width: 100%; height: 100%;
-  background: #1a1b26;
-  overflow: hidden;
-  -webkit-text-size-adjust: 100%;
-}
-#terminal-container, .xterm, .xterm-screen, .xterm-viewport {
-  width: 100% !important;
-  height: 100% !important;
-  max-width: 100% !important;
-}
+html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #1a1b26; overflow: hidden; -webkit-text-size-adjust: 100%; }
+#terminal-container, .xterm, .xterm-screen, .xterm-viewport { width: 100% !important; height: 100% !important; max-width: 100% !important; }
 body { position: fixed; }
-#mob-kb-btn {
-  display: none;
-  position: fixed; bottom: 18px; right: 18px; z-index: 9999;
-  width: 52px; height: 52px; border-radius: 50%;
-  background: #7aa2f7; border: none;
-  box-shadow: 0 3px 10px rgba(0,0,0,.45);
-  cursor: pointer; align-items: center; justify-content: center;
-  font-size: 26px; color: #1a1b26;
-}
+#mob-kb-btn { display: none; position: fixed; bottom: 18px; right: 18px; z-index: 9999; width: 52px; height: 52px; border-radius: 50%; background: #7aa2f7; border: none; box-shadow: 0 3px 10px rgba(0,0,0,.45); cursor: pointer; align-items: center; justify-content: center; font-size: 26px; color: #1a1b26; }
 @media (hover: none) and (pointer: coarse) { #mob-kb-btn { display: flex; } }
 </style>
-<script>
-document.addEventListener("DOMContentLoaded", function () {
-  var btn = document.createElement("button");
-  btn.id = "mob-kb-btn"; btn.title = "Toggle keyboard"; btn.textContent = "⌨";
-  btn.addEventListener("click", function () {
-    var ta = document.querySelector(".xterm-helper-textarea");
-    if (ta) { ta.focus(); ta.click(); }
-  });
-  document.body.appendChild(btn);
-});
-</script>';
+<script>document.addEventListener("DOMContentLoaded",function(){var b=document.createElement("button");b.id="mob-kb-btn";b.title="Toggle keyboard";b.textContent="\u2328";b.addEventListener("click",function(){var t=document.querySelector(".xterm-helper-textarea");if(t){t.focus();t.click();}});document.body.appendChild(b);});</script>';
         sub_filter_once    on;
-        # (no sub_filter_types needed — text/html is processed by default)
     }
 
-    # ── OpenCode /api/* endpoints: buffering OFF ─────────────────────
-    # Covers: /api/health, /api/pty/*, /api/vcs/status, /api/provider/*
-    location /api/ {
-        proxy_pass              http://127.0.0.1:8080;
-        proxy_http_version      1.1;
-        proxy_set_header        Host                $host;
-        proxy_set_header        Connection          "";
-        proxy_set_header        Accept-Encoding     "";
-        proxy_read_timeout      86400;
-        proxy_buffering         off;
-        proxy_cache             off;
-    }
-
-    # ── OpenCode /session/* endpoints: buffering OFF (SSE streams) ───
-    # CRITICAL: OpenCode's actual REST API (sessions, messages, events)
-    # lives at /session/*, NOT /api/session/*. The message endpoint
-    # POST /session/{id}/message streams SSE tokens back to the browser.
-    # With proxy_buffering on (the default), nginx holds the entire stream
-    # in its buffer until the AI finishes — the browser sees "instant stop".
-    # Must be buffering OFF so tokens stream token-by-token in real time.
-    location /session/ {
-        proxy_pass              http://127.0.0.1:8080;
-        proxy_http_version      1.1;
-        proxy_set_header        Host                $host;
-        proxy_set_header        Connection          "";
-        proxy_set_header        Accept-Encoding     "";
-        proxy_read_timeout      86400;
-        proxy_buffering         off;
-        proxy_cache             off;
-    }
-
-    # ── OpenCode /event (global SSE): buffering OFF ───────────────────
-    location /event {
-        proxy_pass              http://127.0.0.1:8080;
-        proxy_http_version      1.1;
-        proxy_set_header        Host                $host;
-        proxy_set_header        Connection          "";
-        proxy_set_header        Accept-Encoding     "";
-        proxy_read_timeout      86400;
-        proxy_buffering         off;
-        proxy_cache             off;
-    }
-
-    # ── OpenCode SPA (HTML + assets): buffering ON for sub_filter ─────
+    # ── OpenCode (all paths except /terminal) ─────────────────────────
+    # proxy_buffering MUST be off so SSE streams token-by-token.
+    # OpenCode's API lives at /session/*, /event, /api/*, /config,
+    # /permission, /question, /file, /find — all served by the same
+    # OpenCode process. A single catch-all location is simpler and safer
+    # than trying to enumerate every API path.
     location / {
         proxy_pass              http://127.0.0.1:8080;
         proxy_http_version      1.1;
         proxy_set_header        Upgrade             $http_upgrade;
         proxy_set_header        Connection          $connection_upgrade;
         proxy_set_header        Host                $host;
-        # Prevent gzip compression — compressed SSE cannot be decompressed
-        # incrementally by the browser.
         proxy_set_header        Accept-Encoding     "";
         proxy_read_timeout      86400;
+        proxy_buffering         off;
         proxy_cache             off;
-        # proxy_buffering is on by default — required for sub_filter below.
-
-        # ── Server-URL localStorage fix ───────────────────────────────
-        # Root cause of "New Session doesn't work" / "AI never responds":
-        # OpenCode's SPA reads its server URL from localStorage key
-        # "opencode.settings.dat:defaultServerUrl". If a previous visit stored
-        # a wrong URL (e.g. http://localhost:4096 from an older config), every
-        # API call fails silently in the browser — curl tests pass because they
-        # bypass localStorage entirely. This script runs BEFORE the SPA
-        # initialises and clears any stale URL that doesn't match the current
-        # public origin, so the SPA falls back to location.origin (correct).
-        #
-        # The upstream CSP hash covers only the theme-preload script, so we
-        # strip it and emit an equivalent policy that also allows our fix.
-        proxy_hide_header       Content-Security-Policy;
-        add_header Content-Security-Policy
-            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src * data:;"
-            always;
-
-        sub_filter '</head>'
-            '<script>!function(){try{var k="opencode.settings.dat:defaultServerUrl",s=localStorage.getItem(k);if(s&&s!==location.origin)localStorage.removeItem(k);}catch(e){}}();</script></head>';
-        sub_filter_once    on;
-        # (no sub_filter_types needed — text/html is processed by default)
     }
 }
 NGINXEOF
 
 echo "[NGINX] Testing config..."
 nginx -t 2>&1
-echo "[NGINX] Starting on :${PORT:-7860} ..."
+echo "[NGINX] Starting on :7860 ..."
 nginx
 echo "[NGINX] Started."
 
+# ─── Start DB self-healing daemon ────────────────────────────────────
+echo "[CLEANER] Starting self-healing daemon..."
+python3 /cleaner.py &
+
+# ─── Ensure project dir exists ───────────────────────────────────────
 mkdir -p /projects/default
 cd /projects/default
-[ -d .git ] || git init -q 2>/dev/null
+[ -d .git ] || git init -q 2>/dev/null || true
 
 # ─── ttyd: real PTY bash on :7681 ────────────────────────────────────
 echo "[TERMINAL] ttyd on :7681 (base-path /terminal) ..."
@@ -241,6 +172,14 @@ nohup ttyd -p 7681 -i 0.0.0.0 \
   -t cursorBlink=true \
   -t scrollback=2000 \
   bash -l > /data/logs/ttyd.log 2>&1 &
+
+# ─── Test OpenCode Zen API reachability ─────────────────────────────
+echo "[NET] Testing OpenCode Zen API..."
+ZEN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "https://opencode.ai/zen/v1/models" 2>/dev/null || echo "000")
+echo "[NET] OpenCode Zen API: $ZEN_STATUS"
+if [ "$ZEN_STATUS" != "200" ]; then
+    echo "[NET] WARNING: Zen API unreachable — free model responses may fail"
+fi
 
 # ─── OpenCode on :8080 (nginx proxies / → here) ──────────────────────
 echo "[OPENCODE] opencode serve on :8080 ..."
