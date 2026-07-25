@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /projects/default
 
 COPY backend/ /app/backend/
+COPY frontend/ /app/frontend/
 COPY cleaner.py /cleaner.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

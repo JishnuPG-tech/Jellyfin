@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenCode</title>
+<link rel="icon" href="/favicon-96x96-v3.png" sizes="96x96">
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html,body,#root{height:100%;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Inter","Segoe UI",sans-serif;background:#0a0a0a;color:#ececec;overflow:hidden;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}
+button{font:inherit;color:inherit;cursor:pointer;background:none;border:none;padding:0}
+input,textarea{font:inherit;color:inherit;background:none;border:none;outline:none}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:8px}
+::-webkit-scrollbar-thumb:hover{background:#3a3a3a}
+::-webkit-scrollbar-track{background:transparent}
+:root{--bg:#0a0a0a;--bg-1:#171717;--bg-2:#1f1f1f;--bg-3:#2a2a2a;--fg:#ececec;--fg-2:#a0a0a0;--fg-3:#6e6e6e;--accent:#10a37f;--danger:#ef4146;--warn:#f0b232;--border:#2a2a2a;--border-hi:#3a3a3a;--radius:8px;--shadow:0 4px 12px rgba(0,0,0,0.4)}
+.skeleton{background:linear-gradient(90deg,#1f1f1f 0%,#2a2a2a 50%,#1f1f1f 100%);background-size:200% 100%;animation:s 1.4s infinite;border-radius:6px}
+@keyframes s{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.fade-in{animation:fade .18s ease-out}
+@keyframes fade{from{opacity:0;transform:translateY(2px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+<div id="root"><div style="display:flex;align-items:center;justify-content:center;height:100%;color:#6e6e6e">loading\u2026</div></div>
+<script type="module" src="/assets/chat.js"></script>
+</body>
+</html>
