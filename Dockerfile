@@ -1,8 +1,6 @@
-## OpenCode-Serve · proxy mode
-## Gateway (uvicorn) on :7860, opencode upstream on :4096, ttyd on :7681.
-## /terminal/*  -> ttyd
-## /           -> redirect HTML (auto-load latest session)
-## /*          -> opencode serve (passthrough)
+## OpenCode-Serve · direct mode
+## opencode serve on :7860 (HF exposed). ttyd on :7681 (internal).
+## No proxy, no extra deps — chat UI and APIs are served directly by opencode.
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -13,15 +11,12 @@ ENV XDG_CACHE_HOME=/data/cache
 ENV XDG_STATE_HOME=/data/state
 
 ENV PORT=7860
-ENV OPENCODE_PORT=4096
-ENV TTYD_PORT=7681
 
 ARG OPENCODE_VERSION=1.18.3
 ARG TTYD_VERSION=1.7.7
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git gnupg python3 python3-pip \
- && pip3 install --break-system-packages fastapi uvicorn httpx websockets psutil \
+      ca-certificates curl git gnupg python3 \
  && curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
       | tar -xz -C /usr/local/bin opencode \
  && chmod +x /usr/local/bin/opencode \
@@ -31,13 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /projects/default
-
-COPY backend/ /app/backend/
 COPY cleaner.py /cleaner.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-WORKDIR /app
+WORKDIR /projects/default
 
 EXPOSE 7860
 

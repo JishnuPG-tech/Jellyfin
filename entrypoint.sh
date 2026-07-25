@@ -1,13 +1,11 @@
 #!/bin/sh
-# OpenCode-Serve entrypoint
-# Runs:
-#  1. ttyd on :7681 (internal) — embedded terminal
-#  2. opencode serve on :4096  — upstream (internal, no direct access)
-#  3. uvicorn gateway on :7860 — the only HF-exposed port
+# OpenCode-Serve entrypoint — direct mode (no proxy):
+#  * opencode serve on :7860  — Chat UI works directly on the HF port
+#  * ttyd on :7681 (internal) — embedded terminal inside the container
 set -u
 
 echo "============================================"
-echo "=== OpenCode-Serve starting (proxy mode) ==="
+echo "=== OpenCode-Serve starting (direct mode)  ==="
 echo "Time: $(date)"
 echo "============================================"
 
@@ -28,18 +26,11 @@ mkdir -p /projects/default
 cd /projects/default
 [ -d .git ] || git init -q 2>/dev/null
 
+# ─── ttyd on 0.0.0.0:7681 (internal, optional) ───
 echo "[TERMINAL] ttyd on 0.0.0.0:7681 ..."
 nohup ttyd -p 7681 -i 0.0.0.0 -W \
   bash -l > /data/logs/ttyd.log 2>&1 &
 
-echo "[UPSTREAM] opencode serve on :${OPENCODE_PORT:-4096} ..."
-nohup opencode serve --port "${OPENCODE_PORT:-4096}" --hostname 0.0.0.0 > /data/logs/opencode.log 2>&1 &
-
-echo "[GATEWAY] uvicorn on :${PORT:-7860} ..."
-export PYTHONPATH=/app
-exec python3 -m uvicorn backend.app.main:app \
-  --host 0.0.0.0 \
-  --port "${PORT:-7860}" \
-  --log-level warning \
-  --limit-concurrency 100 \
-  --timeout-keep-alive 600
+# ─── opencode serve on 7860 (HF exposed, foreground) ───
+echo "[UPSTREAM] opencode serve on :${PORT:-7860} ..."
+exec opencode serve --port "${PORT:-7860}" --hostname 0.0.0.0
