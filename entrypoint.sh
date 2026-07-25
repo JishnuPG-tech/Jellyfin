@@ -173,8 +173,9 @@ python3 /cleaner.py &
 # The AI and terminal always work on the local filesystem — sync is
 # purely a background backup layer and never blocks any operation.
 echo "[SYNC] Starting background sync daemon..."
-python3 /sync_engine.py watch >> /data/logs/sync.log 2>&1 &
-echo "[SYNC] Sync daemon started (PID $!). Logs: /data/logs/sync.log"
+# tee so sync errors appear in Space logs AND are saved to file
+python3 /sync_engine.py watch 2>&1 | tee -a /data/logs/sync.log &
+echo "[SYNC] Sync daemon started. Logs: /data/logs/sync.log"
 
 # ─── Ensure project dir exists ───────────────────────────────────────
 mkdir -p /projects/default

@@ -155,6 +155,32 @@ class SyncEngine:
             )
             return False
 
+    def _test_write(self) -> bool:
+        """Upload a tiny sentinel file to verify write access. Logs clearly on failure."""
+        try:
+            from huggingface_hub import CommitOperationAdd
+            import io
+            self._api.create_commit(
+                repo_id=HF_DATASET,
+                repo_type="dataset",
+                commit_message="sync: write-access test",
+                operations=[CommitOperationAdd(
+                    path_in_repo=".sync-ok",
+                    path_or_fileobj=io.BytesIO(b"ok"),
+                )],
+            )
+            log.info("✅ Write access confirmed — dataset sync is active")
+            return True
+        except Exception as exc:
+            log.error("=" * 60)
+            log.error("❌ SYNC WRITE FAILED — files will NOT be saved to dataset")
+            log.error(f"   Error: {exc}")
+            log.error("   Fix: go to https://huggingface.co/settings/tokens")
+            log.error("   Create a token with 'Write' scope (not Read-only).")
+            log.error("   Then update HF_TOKEN in Space Settings → Secrets.")
+            log.error("=" * 60)
+            return False
+
     def restore(self) -> None:
         """Download the entire dataset snapshot and restore local dirs."""
         if not self._api:
@@ -164,6 +190,9 @@ class SyncEngine:
         if not self._ensure_repo():
             log.warning("Skipping restore — dataset repo not accessible")
             return
+
+        # Verify write access immediately so errors are visible in Space logs
+        self._test_write()
 
         log.info(f"=== RESTORE: pulling {HF_DATASET} ===")
         try:
