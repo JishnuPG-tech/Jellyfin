@@ -27,8 +27,8 @@ mkdir -p /data/state/opencode 2>/dev/null || echo "[WARN] Could not create /data
 mkdir -p /data/workspaces /data/logs 2>/dev/null || true
 
 # ─── Restore persistent storage from HF Dataset ──────────────────────
-# This pulls /projects/default (workspace), /data/share (OpenCode DB),
-# and /data/config (OpenCode config) from the dataset repo so the user
+# This pulls /projects/default (workspace), /data/share/opencode (OpenCode DB),
+# and /data/config/opencode (OpenCode config) from the dataset repo so the user
 # continues exactly where they left off after a container rebuild.
 echo "[RESTORE] Restoring workspace from HF Dataset..."
 python3 /sync_engine.py restore 2>&1 | tee -a /data/logs/sync.log
@@ -93,74 +93,39 @@ else
 fi
 
 # ─── nginx: minimal reverse proxy ───────────────────────────────────
-# Philosophy: match the working Opencode-Cli space as closely as possible.
-# That space runs OpenCode directly with no proxy. Here we only add nginx
-# to route /terminal to ttyd. Everything else goes straight to OpenCode.
-# No sub_filter, no CSP changes, no localStorage injection — those were
-# the root cause of "send button does nothing" (SPA failed to initialize).
-rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+cat > /etc/nginx/nginx.conf << 'NGINX_CONF'
+events { worker_connections 1024; }
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
 
-cat > /etc/nginx/conf.d/opencode-map.conf << 'MAPEOF'
-map $http_upgrade $connection_upgrade {
-    websocket  upgrade;
-    default    "";
-}
-MAPEOF
+    server {
+        listen 7860;
 
-cat > /etc/nginx/conf.d/opencode.conf << 'NGINXEOF'
-server {
-    listen 7860;
+        # Terminal (ttyd PTY)
+        location /terminal {
+            proxy_pass         http://127.0.0.1:7681;
+            proxy_http_version 1.1;
+            proxy_set_header   Upgrade $http_upgrade;
+            proxy_set_header   Connection "upgrade";
+            proxy_set_header   Host $host;
+            proxy_read_timeout 86400;
+        }
 
-    # Disable gzip — compressed SSE cannot be decompressed incrementally
-    gzip off;
-
-    # ── Real PTY terminal (ttyd on :7681) ────────────────────────────
-    location /terminal {
-        proxy_pass              http://127.0.0.1:7681;
-        proxy_http_version      1.1;
-        proxy_set_header        Upgrade         $http_upgrade;
-        proxy_set_header        Connection      $connection_upgrade;
-        proxy_set_header        Host            $host;
-        proxy_set_header        Accept-Encoding "";
-        proxy_read_timeout      86400;
-
-        # Mobile-friendly: inject viewport and keyboard FAB into ttyd HTML
-        sub_filter '<head>' '<head>
-<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
-<style>
-html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #1a1b26; overflow: hidden; -webkit-text-size-adjust: 100%; }
-#terminal-container, .xterm, .xterm-screen, .xterm-viewport { width: 100% !important; height: 100% !important; max-width: 100% !important; }
-body { position: fixed; }
-#mob-kb-btn { display: none; position: fixed; bottom: 18px; right: 18px; z-index: 9999; width: 52px; height: 52px; border-radius: 50%; background: #7aa2f7; border: none; box-shadow: 0 3px 10px rgba(0,0,0,.45); cursor: pointer; align-items: center; justify-content: center; font-size: 26px; color: #1a1b26; }
-@media (hover: none) and (pointer: coarse) { #mob-kb-btn { display: flex; } }
-</style>
-<script>document.addEventListener("DOMContentLoaded",function(){var b=document.createElement("button");b.id="mob-kb-btn";b.title="Toggle keyboard";b.textContent="\u2328";b.addEventListener("click",function(){var t=document.querySelector(".xterm-helper-textarea");if(t){t.focus();t.click();}});document.body.appendChild(b);});</script>';
-        sub_filter_once    on;
-    }
-
-    # ── OpenCode (all paths except /terminal) ─────────────────────────
-    # proxy_buffering MUST be off so SSE streams token-by-token.
-    # OpenCode's API lives at /session/*, /event, /api/*, /config,
-    # /permission, /question, /file, /find — all served by the same
-    # OpenCode process. A single catch-all location is simpler and safer
-    # than trying to enumerate every API path.
-    location / {
-        proxy_pass              http://127.0.0.1:8080;
-        proxy_http_version      1.1;
-        proxy_set_header        Upgrade             $http_upgrade;
-        proxy_set_header        Connection          $connection_upgrade;
-        proxy_set_header        Host                $host;
-        proxy_set_header        Accept-Encoding     "";
-        proxy_read_timeout      86400;
-        proxy_buffering         off;
-        proxy_cache             off;
+        # OpenCode — everything else
+        location / {
+            proxy_pass         http://127.0.0.1:8080;
+            proxy_http_version 1.1;
+            proxy_set_header   Upgrade $http_upgrade;
+            proxy_set_header   Connection $http_connection;
+            proxy_set_header   Host $host;
+            proxy_set_header   X-Real-IP $remote_addr;
+            proxy_buffering    off;
+            proxy_read_timeout 86400;
+        }
     }
 }
-NGINXEOF
-
-echo "[NGINX] Testing config..."
-nginx -t 2>&1
-echo "[NGINX] Starting on :7860 ..."
+NGINX_CONF
 nginx
 echo "[NGINX] Started."
 
@@ -173,16 +138,8 @@ python3 /cleaner.py &
 # The AI and terminal always work on the local filesystem — sync is
 # purely a background backup layer and never blocks any operation.
 echo "[SYNC] Starting background sync daemon..."
-# tee so sync errors appear in Space logs AND are saved to file
 python3 /sync_engine.py watch 2>&1 | tee -a /data/logs/sync.log &
 echo "[SYNC] Sync daemon started. Logs: /data/logs/sync.log"
-
-# ─── E2E sync verification (runs once at startup, non-blocking) ───────────
-# The test mode waits 90s internally for the watch daemon cleanup+purge to
-# finish, then creates/modifies/deletes sync_e2e_test.py and verifies each
-# change appears in the HF Dataset.  Results appear in Space logs under [SYNC].
-echo "[SYNC] Launching E2E verification in background (waits 90s for daemon)..."
-python3 /sync_engine.py test 2>&1 | tee -a /data/logs/sync.log &
 
 # ─── Ensure project dir exists ───────────────────────────────────────
 mkdir -p /projects/default

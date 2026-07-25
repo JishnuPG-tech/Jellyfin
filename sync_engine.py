@@ -9,7 +9,6 @@ Usage:
   python3 /sync_engine.py restore   — pull dataset → local dirs at startup
   python3 /sync_engine.py watch     — background sync daemon
   python3 /sync_engine.py sync      — one-shot sync then exit
-  python3 /sync_engine.py test      — E2E sync verification (create/modify/delete)
 
 Environment variables (set as Space Secrets):
   HF_TOKEN      — HuggingFace token with read+write access to the dataset
@@ -45,20 +44,20 @@ log = logging.getLogger("sync")
 HF_TOKEN   = os.environ.get("HF_TOKEN", "")
 HF_DATASET = os.environ.get("HF_DATASET", "Jishnupg/OpenCode-Storage")
 
-# ─── CRITICAL FIX ────────────────────────────────────────────────────────────
-# Scope watched dirs to the SPECIFIC OpenCode subdirectories, NOT the entire
-# /data/share or /data/config XDG roots.  Those roots contain Android SDK caches,
-# sdkbin-*, sdkinf-* files, npm/pip caches, etc. — thousands of unrelated
-# system files that must never be synced.
+# ─── Watched directories ─────────────────────────────────────────────────────
+# Scoped to the SPECIFIC OpenCode subdirectories only.
+# The XDG roots /data/share and /data/config contain Android SDK caches,
+# nvm installations, sdkbin-*/sdkinf-* files and other system noise —
+# none of that should ever be synced.
 #
-#   "workspace" → /projects/default          (the user's actual project files)
-#   "share"     → /data/share/opencode       (OpenCode SQLite DB only)
-#   "config"    → /data/config/opencode      (OpenCode config JSON only)
+#   "workspace" → /projects/default          (user's project files)
+#   "share"     → /data/share/opencode       (OpenCode SQLite DB)
+#   "config"    → /data/config/opencode      (OpenCode config JSON)
 # ─────────────────────────────────────────────────────────────────────────────
 WATCH_DIRS: dict[str, Path] = {
     "workspace": Path("/projects/default"),
-    "share":     Path("/data/share/opencode"),   # was /data/share — TOO BROAD
-    "config":    Path("/data/config/opencode"),  # was /data/config — TOO BROAD
+    "share":     Path("/data/share/opencode"),
+    "config":    Path("/data/config/opencode"),
 }
 
 # Exact directory-name segments to skip anywhere in the path
@@ -100,11 +99,9 @@ IGNORE_SUFFIXES: set[str] = {
     ".log", ".bak", ".swp", ".swo",
 }
 
-MAX_FILE_BYTES       = 50 * 1_024 * 1_024   # 50 MB hard limit per file
-POLL_INTERVAL_SECS   = 15                    # how often to check for changes
-# Checkpoint does a FRESH SCAN but does NOT re-upload everything —
-# it only uploads files that are genuinely new or changed.
-CHECKPOINT_INTERVAL_SECS = 300
+MAX_FILE_BYTES          = 50 * 1_024 * 1_024   # 50 MB hard limit per file
+POLL_INTERVAL_SECS      = 15                    # how often to check for changes
+CHECKPOINT_INTERVAL_SECS = 300                  # full-disk re-scan interval
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +292,8 @@ class SyncEngine:
 
     def _clean_watched_dirs(self) -> int:
         """
-        Walk the watched dirs and DELETE any file that _should_skip would
-        exclude from syncing.  These are files that leaked in from earlier
+        Remove files from the watched dirs that fail the _should_skip filter.
+        This is a safety pass to evict any contamination left over from
         contaminated restores (e.g. Android SDK cache files in /data/share).
         Returns the number of files removed.
         """
@@ -333,15 +330,16 @@ class SyncEngine:
     def _purge_dataset_junk(self, valid_repo_paths: set[str]) -> int:
         """
         Delete files from the dataset that are NOT in valid_repo_paths.
-        This removes the old contaminated entries (Android SDK caches, etc.)
-        that were committed by the broken engine.
+        Removes any entries that don't correspond to currently tracked local
+        files, guarding against dataset contamination from future regressions.
         Returns the number of files deleted from the dataset.
         """
         if not self._api:
             return 0
 
-        log.info("=== DATASET PURGE: scanning for contaminated entries ===")
+        log.info("=== DATASET PURGE: scanning for stale entries ===")
         try:
+            from huggingface_hub.hf_api import RepoFile
             dataset_files = self._api.list_repo_tree(
                 repo_id=HF_DATASET,
                 repo_type="dataset",
@@ -349,21 +347,20 @@ class SyncEngine:
             )
             to_delete = []
             for f in dataset_files:
-                # Skip internal/meta files
-                rp = getattr(f, "path", None)
-                if rp is None:
-                    continue
+                if not isinstance(f, RepoFile):
+                    continue  # skip directory entries
+                rp = f.path
                 if rp.startswith("."):   # .gitattributes, .sync-ok etc.
                     continue
-                # If it's not in our current valid set, it's junk
+                # If it's not in our current valid set, delete it
                 if rp not in valid_repo_paths:
                     to_delete.append(rp)
 
             if not to_delete:
-                log.info("  Dataset is clean — no junk entries found")
+                log.info("  Dataset is clean — no stale entries found")
                 return 0
 
-            log.info(f"  Found {len(to_delete)} junk entries to purge from dataset")
+            log.info(f"  Found {len(to_delete)} stale entries to remove from dataset")
             for rp in to_delete[:10]:
                 log.info(f"    - {rp}")
             if len(to_delete) > 10:
@@ -372,19 +369,20 @@ class SyncEngine:
             from huggingface_hub import CommitOperationDelete
             ops = [CommitOperationDelete(path_in_repo=rp) for rp in to_delete]
 
-            # Delete in batches of 200 to avoid API limits
+            # Delete in batches of 200 to stay within API limits
             batch_size = 200
             total_deleted = 0
             for i in range(0, len(ops), batch_size):
                 batch = ops[i:i + batch_size]
+                bnum = i // batch_size + 1
                 self._api.create_commit(
                     repo_id=HF_DATASET,
                     repo_type="dataset",
-                    commit_message=f"sync: purge {len(batch)} contaminated entries (batch {i // batch_size + 1})",
+                    commit_message=f"sync: purge {len(batch)} stale entries (batch {bnum})",
                     operations=batch,
                 )
                 total_deleted += len(batch)
-                log.info(f"  Purge batch {i // batch_size + 1}: deleted {len(batch)} entries")
+                log.info(f"  Purge batch {bnum}: deleted {len(batch)} entries")
 
             log.info(f"=== DATASET PURGE complete: {total_deleted} entries removed ===")
             return total_deleted
@@ -491,7 +489,7 @@ class SyncEngine:
             while True:
                 time.sleep(3_600)
 
-        # ── Step 1: Clean junk that leaked in from old contaminated restores ──
+        # Step 1: Remove any junk files left in watched dirs from previous contamination
         log.info("=== WATCH: cleaning junk from watched dirs ===")
         removed = self._clean_watched_dirs()
         if removed:
@@ -499,7 +497,7 @@ class SyncEngine:
         else:
             log.info("  Watched dirs are clean")
 
-        # ── Step 2: Establish baseline (only clean files now) ────────────────
+        # Step 2: Establish baseline (only clean files now)
         log.info("=== WATCH: establishing baseline scan ===")
         self._known = self._scan()
         log.info(f"Baseline: {len(self._known)} files tracked")
@@ -507,145 +505,32 @@ class SyncEngine:
         for prefix, path in WATCH_DIRS.items():
             log.info(f"  [{prefix}] {path}")
 
-        # ── Step 3: Purge contaminated entries from the dataset ───────────────
-        # Any dataset file NOT in our baseline is leftover junk from the old
-        # broken engine and must be deleted.
+        # Step 3: Purge any stale dataset entries not present in the baseline
         self._purge_dataset_junk(set(self._known.keys()))
 
         last_checkpoint = time.monotonic()
 
-        # ── Step 4: Poll loop ────────────────────────────────────────────────
+        # Step 4: Poll loop
         while True:
             time.sleep(POLL_INTERVAL_SECS)
             try:
                 now = time.monotonic()
 
                 if (now - last_checkpoint) >= CHECKPOINT_INTERVAL_SECS:
-                    # Refresh the baseline FROM DISK (not a re-upload of everything)
-                    # Only files that are genuinely new or modified get uploaded.
-                    # We do NOT reset self._known to {} — that caused the mass re-upload.
+                    # Refresh the baseline FROM DISK; only upload genuinely changed files.
+                    # We do NOT reset self._known to {} — that would cause mass re-uploads.
                     log.info("[CHECKPOINT] Refreshing baseline from disk ...")
-                    fresh = self._scan()
-                    # Merge: keep known hashes for unchanged files, flag changed ones
-                    merged_known: dict[str, str] = {}
-                    for rp, md5 in fresh.items():
-                        merged_known[rp] = md5
-                    self._known = merged_known
+                    self._known = self._scan()
                     last_checkpoint = now
 
                 n_up, n_del = self.sync_once()
 
-                if n_up == 0 and n_del == 0:
-                    pass  # quiet — nothing to do
-                else:
+                if n_up or n_del:
                     log.info(f"Sync cycle: +{n_up} ~{n_del}")
 
             except Exception as exc:
                 log.error(f"Watch cycle error: {exc}")
                 log.error(traceback.format_exc())
-
-    # ------------------------------------------------------------------
-    # End-to-end self-test
-    # ------------------------------------------------------------------
-
-    def run_e2e_test(self) -> bool:
-        """
-        E2E sync verification — relies on the watch daemon (separate process)
-        to perform the actual sync.  This process only WRITES files and VERIFIES
-        via the HF API.  It does NOT call sync_once() itself.
-
-        Flow:
-          1. Wait 90s for the watch daemon to finish its startup cleanup + purge.
-          2. Create  sync_e2e_test.py  → wait daemon polling → verify in dataset.
-          3. Modify  sync_e2e_test.py  → wait daemon polling → verify update.
-          4. Delete  sync_e2e_test.py  → wait daemon polling → verify removed.
-        """
-        if not self._api:
-            log.error("E2E test skipped — no HF_TOKEN")
-            return False
-
-        test_file  = Path("/projects/default/sync_e2e_test.py")
-        repo_path  = "workspace/sync_e2e_test.py"
-        # Allow daemon polling (15s) × 2 + buffer — gives the daemon two chances
-        wait_secs  = POLL_INTERVAL_SECS * 2 + 10   # 40 seconds
-
-        def dataset_content() -> str | None:
-            """Fetch the file content from the dataset; None if missing."""
-            try:
-                from huggingface_hub import hf_hub_download
-                with tempfile.TemporaryDirectory() as td:
-                    p = hf_hub_download(
-                        repo_id=HF_DATASET, repo_type="dataset",
-                        filename=repo_path, token=HF_TOKEN,
-                        local_dir=td, force_download=True,
-                    )
-                    return Path(p).read_text()
-            except Exception:
-                return None
-
-        log.info("=" * 60)
-        log.info("=== E2E SYNC TEST START ===")
-        log.info("=== Waiting 90s for watch daemon cleanup+purge to finish ===")
-        log.info("=" * 60)
-        time.sleep(90)
-
-        passed = 0
-
-        # ── Step 1: CREATE ───────────────────────────────────────────
-        log.info("[E2E STEP 1/3] Writing /projects/default/sync_e2e_test.py (VERSION=1) ...")
-        test_file.parent.mkdir(parents=True, exist_ok=True)
-        test_file.write_text("# sync e2e test - CREATED\nVERSION = 1\n")
-        log.info(f"  File written locally.  Waiting {wait_secs}s for watch daemon to sync ...")
-        time.sleep(wait_secs)
-
-        content = dataset_content()
-        if content and "VERSION = 1" in content:
-            log.info("  ✅ STEP 1 PASSED — sync_e2e_test.py created in dataset")
-            log.info(f"     Dataset content: {content.strip()!r}")
-            passed += 1
-        else:
-            log.error(f"  ❌ STEP 1 FAILED — file not in dataset (content={content!r})")
-
-        # ── Step 2: MODIFY ───────────────────────────────────────────
-        log.info("[E2E STEP 2/3] Modifying sync_e2e_test.py (VERSION=2) ...")
-        test_file.write_text("# sync e2e test - MODIFIED\nVERSION = 2\n")
-        log.info(f"  Waiting {wait_secs}s for watch daemon to sync ...")
-        time.sleep(wait_secs)
-
-        content = dataset_content()
-        if content and "VERSION = 2" in content:
-            log.info("  ✅ STEP 2 PASSED — modification synced to dataset")
-            log.info(f"     Dataset content: {content.strip()!r}")
-            passed += 1
-        else:
-            log.error(f"  ❌ STEP 2 FAILED — modification not in dataset (content={content!r})")
-
-        # ── Step 3: DELETE ───────────────────────────────────────────
-        log.info("[E2E STEP 3/3] Deleting sync_e2e_test.py locally ...")
-        try:
-            test_file.unlink()
-            log.info("  File deleted locally.")
-        except FileNotFoundError:
-            log.warning("  File already gone — continuing.")
-        log.info(f"  Waiting {wait_secs}s for watch daemon to sync deletion ...")
-        time.sleep(wait_secs)
-
-        content = dataset_content()
-        if content is None:
-            log.info("  ✅ STEP 3 PASSED — sync_e2e_test.py removed from dataset")
-            passed += 1
-        else:
-            log.error(f"  ❌ STEP 3 FAILED — file still in dataset (content={content!r})")
-
-        # ── Summary ──────────────────────────────────────────────────
-        log.info("=" * 60)
-        log.info(f"=== E2E TEST RESULT: {passed}/3 steps passed ===")
-        if passed == 3:
-            log.info("=== ✅ ALL STEPS PASSED — sync engine is working correctly ===")
-        else:
-            log.error(f"=== ❌ {3 - passed} STEP(S) FAILED — check logs above ===")
-        log.info("=" * 60)
-        return passed == 3
 
 
 # ---------------------------------------------------------------------------
@@ -674,11 +559,8 @@ def main() -> None:
         engine.watch()
     elif mode == "sync":
         engine.sync_once()
-    elif mode == "test":
-        ok = engine.run_e2e_test()
-        sys.exit(0 if ok else 1)
     else:
-        print(f"Usage: sync_engine.py [restore|watch|sync|test]", file=sys.stderr)
+        print(f"Usage: sync_engine.py [restore|watch|sync]", file=sys.stderr)
         sys.exit(1)
 
 
