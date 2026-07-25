@@ -36,6 +36,7 @@ echo "[UPSTREAM] opencode serve on :${OPENCODE_PORT:-4096} ..."
 nohup opencode serve --port "${OPENCODE_PORT:-4096}" --hostname 0.0.0.0 > /data/logs/opencode.log 2>&1 &
 
 echo "[GATEWAY] uvicorn on :${PORT:-7860} ..."
+export PYTHONPATH=/app
 exec python3 -m uvicorn backend.app.main:app \
   --host 0.0.0.0 \
   --port "${PORT:-7860}" \
