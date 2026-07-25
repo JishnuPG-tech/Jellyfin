@@ -13,6 +13,35 @@ mkdir -p /data/share/opencode /data/config/opencode /data/cache/opencode /data/s
          /data/workspaces /data/logs \
  2>/dev/null || true
 
+# ─── Detect and remove malformed SQLite databases ───
+echo "[DB] Checking database integrity..."
+DB_PATHS="/data/share/opencode/opencode.db \
+          /projects/.opencode/share/opencode/opencode.db \
+          /root/.local/share/opencode/opencode.db \
+          /home/opencode/.local/share/opencode/opencode.db"
+
+for db_path in $DB_PATHS; do
+  if [ -f "$db_path" ]; then
+    # Use sqlite3 to run integrity_check; if it fails or returns non-ok, delete the DB
+    result=$(python3 -c "
+import sqlite3, sys
+try:
+    conn = sqlite3.connect('$db_path', timeout=3)
+    row = conn.execute('PRAGMA integrity_check').fetchone()
+    conn.close()
+    print(row[0] if row else 'error')
+except Exception as e:
+    print('error: ' + str(e))
+" 2>/dev/null || echo "error")
+    if [ "$result" != "ok" ]; then
+      echo "[DB] Malformed database detected at $db_path (result: $result) — removing."
+      rm -f "$db_path" "${db_path}-wal" "${db_path}-shm" 2>/dev/null || true
+    else
+      echo "[DB] Database OK: $db_path"
+    fi
+  fi
+done
+
 if [ ! -f /data/config/opencode/opencode.json ]; then
   mkdir -p /data/config/opencode
   python3 <<'PYEOF' 2>/dev/null || true
