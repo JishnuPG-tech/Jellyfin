@@ -2,6 +2,9 @@
 ## nginx on :7860 (HF exposed) proxies:
 ##   /terminal → ttyd on :7681 (real PTY bash)
 ##   /         → opencode on :8080 (chat UI + API)
+##
+## SSH access: sshd on :22 (internal) reached via reverse tunnel
+## to a Fly.io jump server. No inbound tunnel services used.
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -20,12 +23,14 @@ ARG TTYD_VERSION=1.7.7
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git gnupg python3 python3-pip nginx \
+      openssh-server openssh-client \
  && curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
       | tar -xz -C /usr/local/bin opencode \
  && chmod +x /usr/local/bin/opencode \
  && curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" \
       -o /usr/local/bin/ttyd \
  && chmod +x /usr/local/bin/ttyd \
+ && mkdir -p /var/run/sshd \
  && rm -rf /var/lib/apt/lists/*
 
 # Install huggingface_hub for the sync engine
