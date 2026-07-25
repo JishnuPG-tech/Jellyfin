@@ -182,14 +182,15 @@ CF_LOG=/data/logs/cloudflared.log
 cloudflared tunnel --url ssh://localhost:22 \
     --no-autoupdate \
     --logfile "${CF_LOG}" \
-    --loglevel warn \
+    --loglevel info \
     > /dev/null 2>&1 &
 
-# Wait up to 30 s for the tunnel URL to appear in the log
+# Wait up to 60 s for the tunnel URL to appear in the log
+# cloudflared logs the URL at INFO level — must use --loglevel info (not warn)
 TUNNEL_URL=""
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
     sleep 1
-    TUNNEL_URL=$(grep -o 'https://[^ "]*\.trycloudflare\.com' "${CF_LOG}" 2>/dev/null | head -1)
+    TUNNEL_URL=$(grep -o 'https://[^ |]*\.trycloudflare\.com' "${CF_LOG}" 2>/dev/null | tr -d ' ' | head -1)
     [ -n "${TUNNEL_URL}" ] && break
 done
 
