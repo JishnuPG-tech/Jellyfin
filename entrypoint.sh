@@ -16,12 +16,23 @@ echo "============================================"
 git config --global --add safe.directory '*' 2>/dev/null || true
 
 # ─── Data directories ───
+# /data is no longer a mounted volume — sync_engine restores its contents
+# from the HF Dataset repo below. We create the dirs here so every
+# subsequent step has a guaranteed path to write to.
 echo "[INIT] Setting up /data directories..."
 mkdir -p /data/share/opencode 2>/dev/null || echo "[WARN] Could not create /data/share/opencode"
 mkdir -p /data/config/opencode 2>/dev/null || echo "[WARN] Could not create /data/config/opencode"
 mkdir -p /data/cache/opencode 2>/dev/null || echo "[WARN] Could not create /data/cache/opencode"
 mkdir -p /data/state/opencode 2>/dev/null || echo "[WARN] Could not create /data/state/opencode"
 mkdir -p /data/workspaces /data/logs 2>/dev/null || true
+
+# ─── Restore persistent storage from HF Dataset ──────────────────────
+# This pulls /projects/default (workspace), /data/share (OpenCode DB),
+# and /data/config (OpenCode config) from the dataset repo so the user
+# continues exactly where they left off after a container rebuild.
+echo "[RESTORE] Restoring workspace from HF Dataset..."
+python3 /sync_engine.py restore 2>&1 | tee -a /data/logs/sync.log
+echo "[RESTORE] Done."
 
 # ─── OpenCode config ─────────────────────────────────────────────────
 # Remove stale model configs that use wrong format
@@ -156,6 +167,14 @@ echo "[NGINX] Started."
 # ─── Start DB self-healing daemon ────────────────────────────────────
 echo "[CLEANER] Starting self-healing daemon..."
 python3 /cleaner.py &
+
+# ─── Start background sync daemon ────────────────────────────────────
+# Runs every 15 s, commits only changed files to the HF Dataset.
+# The AI and terminal always work on the local filesystem — sync is
+# purely a background backup layer and never blocks any operation.
+echo "[SYNC] Starting background sync daemon..."
+python3 /sync_engine.py watch >> /data/logs/sync.log 2>&1 &
+echo "[SYNC] Sync daemon started (PID $!). Logs: /data/logs/sync.log"
 
 # ─── Ensure project dir exists ───────────────────────────────────────
 mkdir -p /projects/default
