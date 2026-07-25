@@ -489,15 +489,7 @@ class SyncEngine:
             while True:
                 time.sleep(3_600)
 
-        # Step 1: Remove any junk files left in watched dirs from previous contamination
-        log.info("=== WATCH: cleaning junk from watched dirs ===")
-        removed = self._clean_watched_dirs()
-        if removed:
-            log.info(f"  Cleaned {removed} junk files from local watched dirs")
-        else:
-            log.info("  Watched dirs are clean")
-
-        # Step 2: Establish baseline (only clean files now)
+        # Step 1: Establish baseline
         log.info("=== WATCH: establishing baseline scan ===")
         self._known = self._scan()
         log.info(f"Baseline: {len(self._known)} files tracked")
