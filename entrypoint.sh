@@ -4,6 +4,7 @@
 #  nginx  :7860  (HF exposed)
 #    /terminal  → ttyd  :7681  — real PTY bash, mobile-optimised
 #    /          → opencode :8080 — chat UI + REST API + SSE
+#  sshd   :22   (Cloudflare tunnel → Termius)
 #
 set -u
 
@@ -128,6 +129,85 @@ http {
 NGINX_CONF
 nginx
 echo "[NGINX] Started."
+
+# ─── SSH server ──────────────────────────────────────────────────────
+# Listens on port 22 (internal only — Cloudflare tunnel exposes it).
+# Password is set via SSH_PASSWORD Space Secret.
+# Falls back to a generated password logged to Space logs if not set.
+echo "[SSH] Configuring SSH server..."
+
+# Harden sshd config
+cat > /etc/ssh/sshd_config << 'SSHD_CONF'
+Port 22
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+ChallengeResponseAuthentication no
+UsePAM no
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp /usr/lib/openssh/sftp-server
+SSHD_CONF
+
+# Set SSH password — use SSH_PASSWORD secret if provided, else generate one
+if [ -n "${SSH_PASSWORD:-}" ]; then
+    echo "root:${SSH_PASSWORD}" | chpasswd
+    echo "[SSH] Password set from SSH_PASSWORD secret."
+else
+    GENERATED_PW=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)
+    echo "root:${GENERATED_PW}" | chpasswd
+    echo "[SSH] ============================================"
+    echo "[SSH] No SSH_PASSWORD secret set."
+    echo "[SSH] Generated password: ${GENERATED_PW}"
+    echo "[SSH] Set SSH_PASSWORD in Space Secrets to make it permanent."
+    echo "[SSH] ============================================"
+fi
+
+# Generate host keys if missing (fresh container)
+ssh-keygen -A 2>/dev/null || true
+
+# Start sshd
+/usr/sbin/sshd
+echo "[SSH] sshd started on port 22."
+
+# ─── Cloudflare Tunnel ───────────────────────────────────────────────
+# Creates a free public tunnel: abc-def-xyz.trycloudflare.com → localhost:22
+# The URL is stable as long as the Space stays alive (use UptimeRobot to
+# prevent sleeping). URL is saved to /data/logs/tunnel-url.txt.
+echo "[TUNNEL] Starting Cloudflare tunnel for SSH..."
+CF_LOG=/data/logs/cloudflared.log
+
+cloudflared tunnel --url ssh://localhost:22 \
+    --no-autoupdate \
+    --logfile "${CF_LOG}" \
+    --loglevel warn \
+    > /dev/null 2>&1 &
+
+# Wait up to 30 s for the tunnel URL to appear in the log
+TUNNEL_URL=""
+for i in $(seq 1 30); do
+    sleep 1
+    TUNNEL_URL=$(grep -o 'https://[^ "]*\.trycloudflare\.com' "${CF_LOG}" 2>/dev/null | head -1)
+    [ -n "${TUNNEL_URL}" ] && break
+done
+
+if [ -n "${TUNNEL_URL}" ]; then
+    # Strip https:// — Termius only needs the hostname
+    TUNNEL_HOST=$(echo "${TUNNEL_URL}" | sed 's|https://||')
+    echo "${TUNNEL_HOST}" > /data/logs/tunnel-url.txt
+    echo "[TUNNEL] ============================================"
+    echo "[TUNNEL] Cloudflare tunnel is UP"
+    echo "[TUNNEL] Termius hostname : ${TUNNEL_HOST}"
+    echo "[TUNNEL] Termius port     : 22"
+    echo "[TUNNEL] Termius user     : root"
+    echo "[TUNNEL] URL saved to     : /data/logs/tunnel-url.txt"
+    echo "[TUNNEL] ============================================"
+else
+    echo "[TUNNEL] WARNING: Could not get tunnel URL within 30s."
+    echo "[TUNNEL] Check /data/logs/cloudflared.log for details."
+fi
 
 # ─── Start DB self-healing daemon ────────────────────────────────────
 echo "[CLEANER] Starting self-healing daemon..."
