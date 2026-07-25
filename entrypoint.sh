@@ -29,7 +29,7 @@ cd /projects/default
 [ -d .git ] || git init -q 2>/dev/null
 
 echo "[TERMINAL] ttyd on 0.0.0.0:7681 ..."
-nohup ttyd --port 7681 --host 0.0.0.0 --writable --base-path /terminal \
+nohup ttyd --port 7681 --host 0.0.0.0 --writable \
   bash -l > /data/logs/ttyd.log 2>&1 &
 
 echo "[UPSTREAM] opencode serve on :${OPENCODE_PORT:-4096} ..."

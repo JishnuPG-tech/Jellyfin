@@ -143,7 +143,11 @@ async def healthz():
 async def main_route(request: Request, path: str):
     full = "/" + path
     if _is_terminal(full):
-        return await _forward(request, TTYD_PORT, path)
+        # Strip /terminal prefix when forwarding to ttyd
+        fwd_path = path[len("terminal"):]  # "terminal/foo" -> "/foo"
+        if not fwd_path or fwd_path[0] != "/":
+            fwd_path = "/" + fwd_path
+        return await _forward(request, TTYD_PORT, fwd_path)
     if _needs_redirect(full):
         return HTMLResponse(content=_REDIRECT_HTML, status_code=200)
     return await _forward(request, OC_PORT, path)
