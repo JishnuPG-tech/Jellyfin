@@ -4,7 +4,7 @@
 #  nginx  :7860  (HF exposed)
 #    /terminal  → ttyd  :7681  — real PTY bash, mobile-optimised
 #    /          → opencode :8080 — chat UI + REST API + SSE
-#  sshd   :22   (Cloudflare tunnel → Termius)
+#  sshd   :22   (Cloudflare Named Tunnel → Termius)
 #
 set -u
 
@@ -131,7 +131,7 @@ nginx
 echo "[NGINX] Started."
 
 # ─── SSH server ──────────────────────────────────────────────────────
-# Listens on port 22 (internal only — Cloudflare tunnel exposes it).
+# Listens on port 22 (internal only — Cloudflare Named Tunnel exposes it).
 # Password is set via SSH_PASSWORD Space Secret.
 # Falls back to a generated password logged to Space logs if not set.
 echo "[SSH] Configuring SSH server..."
@@ -172,42 +172,167 @@ ssh-keygen -A 2>/dev/null || true
 /usr/sbin/sshd
 echo "[SSH] sshd started on port 22."
 
-# ─── Cloudflare Tunnel ───────────────────────────────────────────────
-# Creates a free public tunnel: abc-def-xyz.trycloudflare.com → localhost:22
-# The URL is stable as long as the Space stays alive (use UptimeRobot to
-# prevent sleeping). URL is saved to /data/logs/tunnel-url.txt.
-echo "[TUNNEL] Starting Cloudflare tunnel for SSH..."
-CF_LOG=/data/logs/cloudflared.log
-
-cloudflared tunnel --url ssh://localhost:22 \
-    --no-autoupdate \
-    --logfile "${CF_LOG}" \
-    --loglevel info \
-    > /dev/null 2>&1 &
-
-# Wait up to 60 s for the tunnel URL to appear in the log
-# cloudflared logs the URL at INFO level — must use --loglevel info (not warn)
-TUNNEL_URL=""
-for i in $(seq 1 60); do
+# ─── Verify sshd is actually listening on port 22 ────────────────────
+# Uses ss(8) from iproute2. Fails hard if sshd did not bind — a tunnel
+# to a port nobody is listening on is worse than no tunnel at all.
+echo "[SSH] Verifying sshd is listening on port 22..."
+SSHD_LISTEN=""
+for _i in $(seq 1 10); do
+    SSHD_LISTEN=$(ss -tlnp 2>/dev/null | grep ' 0\.0\.0\.0:22 \|:22 ' || true)
+    [ -n "$SSHD_LISTEN" ] && break
     sleep 1
-    TUNNEL_URL=$(grep -o 'https://[^ |]*\.trycloudflare\.com' "${CF_LOG}" 2>/dev/null | tr -d ' ' | head -1)
-    [ -n "${TUNNEL_URL}" ] && break
 done
 
-if [ -n "${TUNNEL_URL}" ]; then
-    # Strip https:// — Termius only needs the hostname
-    TUNNEL_HOST=$(echo "${TUNNEL_URL}" | sed 's|https://||')
-    echo "${TUNNEL_HOST}" > /data/logs/tunnel-url.txt
-    echo "[TUNNEL] ============================================"
-    echo "[TUNNEL] Cloudflare tunnel is UP"
-    echo "[TUNNEL] Termius hostname : ${TUNNEL_HOST}"
-    echo "[TUNNEL] Termius port     : 22"
-    echo "[TUNNEL] Termius user     : root"
-    echo "[TUNNEL] URL saved to     : /data/logs/tunnel-url.txt"
+if [ -n "$SSHD_LISTEN" ]; then
+    echo "[SSH] Confirmed: sshd is listening on port 22."
+    echo "[SSH] $SSHD_LISTEN"
+else
+    echo "[SSH] ============================================"
+    echo "[SSH] FATAL: sshd is NOT listening on port 22."
+    echo "[SSH] Active TCP listeners:"
+    ss -tlnp 2>/dev/null || true
+    echo "[SSH] ============================================"
+    echo "[SSH] Cannot start Cloudflare tunnel — no SSH service to tunnel to."
+    # Do not exit — OpenCode and the terminal should still work.
+    # The operator needs to investigate why sshd failed to bind.
+fi
+
+# ─── Cloudflare Named Tunnel ──────────────────────────────────────────
+# Requires CF_TUNNEL_TOKEN set in Space Secrets.
+# The token is obtained from the Cloudflare Zero Trust dashboard:
+#   Zero Trust → Networks → Tunnels → select/create tunnel → Overview tab → copy token
+#
+# The named tunnel must be configured in Cloudflare Zero Trust to route
+# the public hostname to ssh://localhost:22 (service: SSH, URL: localhost:22).
+#
+# NOTE: The token is NEVER printed or logged.
+echo "[TUNNEL] ============================================"
+CF_LOG=/data/logs/cloudflared.log
+
+if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
+    echo "[TUNNEL] WARNING: CF_TUNNEL_TOKEN secret is not set."
+    echo "[TUNNEL] SSH access via Cloudflare Named Tunnel is DISABLED."
+    echo "[TUNNEL] To enable:"
+    echo "[TUNNEL]   1. Create a Named Tunnel in Cloudflare Zero Trust"
+    echo "[TUNNEL]      (Zero Trust → Networks → Tunnels → Add a tunnel)"
+    echo "[TUNNEL]   2. Configure the public hostname to route to ssh://localhost:22"
+    echo "[TUNNEL]   3. Copy the tunnel token from the Cloudflare dashboard"
+    echo "[TUNNEL]   4. Add CF_TUNNEL_TOKEN to Space Secrets"
+    echo "[TUNNEL] OpenCode and terminal will start normally without it."
     echo "[TUNNEL] ============================================"
 else
-    echo "[TUNNEL] WARNING: Could not get tunnel URL within 30s."
-    echo "[TUNNEL] Check /data/logs/cloudflared.log for details."
+    echo "[TUNNEL] Named tunnel starting..."
+    # Use 'run --token' — the only correct form for Named Tunnels.
+    # Do NOT use 'tunnel --url' (Quick Tunnel) — it creates ephemeral
+    # trycloudflare.com addresses that SSH clients cannot reliably use.
+    cloudflared tunnel run \
+        --token "${CF_TUNNEL_TOKEN}" \
+        --no-autoupdate \
+        --logfile "${CF_LOG}" \
+        --loglevel info \
+        > /dev/null 2>&1 &
+    CF_PID=$!
+
+    # ── Wait up to 40 s for the tunnel to register ───────────────────
+    TUNNEL_CONNECTED=0
+    for _i in $(seq 1 40); do
+        sleep 1
+        # cloudflared Named Tunnel logs "Registered tunnel connection" on success
+        if grep -qi \
+            "Registered tunnel connection\|registered tunnel connection\|Connection registered" \
+            "${CF_LOG}" 2>/dev/null; then
+            TUNNEL_CONNECTED=1
+            break
+        fi
+        # Detect fatal auth errors early — no point waiting the full 40 s
+        if grep -qi \
+            "Invalid.*token\|token.*invalid\|failed to authenticate\|authentication failed\|ERR_FAILED_TO_AUTHENTICATE\|Invalid tunnel credentials\|failed to validate token" \
+            "${CF_LOG}" 2>/dev/null; then
+            echo "[TUNNEL] ERROR: Cloudflare authentication failed — aborting wait."
+            break
+        fi
+    done
+
+    if [ "$TUNNEL_CONNECTED" = "1" ]; then
+        # ── Extract metadata from JSON log lines ──────────────────────
+        # cloudflared Named Tunnel writes structured JSON; field values
+        # are extracted with portable sed without exposing the token.
+        CONNECTOR_ID=$(grep -o '"connectorID":"[^"]*"' "${CF_LOG}" 2>/dev/null \
+            | head -1 | sed 's/"connectorID":"//;s/"//')
+        TUNNEL_NAME=$(grep -o '"tunnelName":"[^"]*"' "${CF_LOG}" 2>/dev/null \
+            | head -1 | sed 's/"tunnelName":"//;s/"//')
+        TUNNEL_ID=$(grep -o '"tunnelID":"[^"]*"' "${CF_LOG}" 2>/dev/null \
+            | head -1 | sed 's/"tunnelID":"//;s/"//')
+        CONN_LOCATION=$(grep -o '"location":"[^"]*"' "${CF_LOG}" 2>/dev/null \
+            | head -1 | sed 's/"location":"//;s/"//')
+        CONN_PROTOCOL=$(grep -o '"protocol":"[^"]*"' "${CF_LOG}" 2>/dev/null \
+            | head -1 | sed 's/"protocol":"//;s/"//')
+
+        echo "[TUNNEL] Named tunnel connected"
+        echo "[TUNNEL] ============================================"
+        [ -n "$CONNECTOR_ID"   ] && echo "[TUNNEL] Connector ID  : ${CONNECTOR_ID}"
+        [ -n "$TUNNEL_NAME"    ] && echo "[TUNNEL] Tunnel name   : ${TUNNEL_NAME}"
+        [ -n "$TUNNEL_ID"      ] && echo "[TUNNEL] Tunnel ID     : ${TUNNEL_ID}"
+        [ -n "$CONN_LOCATION"  ] && echo "[TUNNEL] Edge location : ${CONN_LOCATION}"
+        [ -n "$CONN_PROTOCOL"  ] && echo "[TUNNEL] Protocol      : ${CONN_PROTOCOL}"
+        echo "[TUNNEL] SSH port      : 22"
+        echo "[TUNNEL] SSH user      : root"
+        echo "[TUNNEL] Connect via   : the public hostname configured in"
+        echo "[TUNNEL]                 Cloudflare Zero Trust for this tunnel."
+        echo "[TUNNEL] Logs          : ${CF_LOG}"
+        echo "[TUNNEL] ============================================"
+    else
+        # ── Diagnose the failure ──────────────────────────────────────
+        echo "[TUNNEL] ============================================"
+        echo "[TUNNEL] WARNING: Named tunnel did NOT confirm connection within 40 s."
+        echo "[TUNNEL] Connection status: FAILED"
+        echo "[TUNNEL] ----"
+
+        # Show recent log lines — strip any line containing the token pattern
+        # (tokens are long base64 strings; we never echo the CF_TUNNEL_TOKEN var).
+        echo "[TUNNEL] Recent cloudflared output:"
+        tail -25 "${CF_LOG}" 2>/dev/null \
+            | grep -v -i "token\|credential\|secret\|password" \
+            || echo "[TUNNEL] (log not yet written)"
+        echo "[TUNNEL] ----"
+
+        # Specific diagnoses
+        if grep -qi \
+            "Invalid.*token\|token.*invalid\|failed to validate token\|Invalid tunnel credentials\|ERR_FAILED_TO_AUTHENTICATE\|authentication failed\|failed to authenticate" \
+            "${CF_LOG}" 2>/dev/null; then
+            echo "[TUNNEL] DIAGNOSIS : Invalid or expired tunnel token."
+            echo "[TUNNEL] ACTION    : Regenerate the token in Cloudflare Zero Trust:"
+            echo "[TUNNEL]             Zero Trust → Networks → Tunnels → select tunnel"
+            echo "[TUNNEL]             → Overview tab → copy new token"
+            echo "[TUNNEL]             Update CF_TUNNEL_TOKEN in Space Secrets."
+
+        elif grep -qi "reconnect\|retrying connection\|retry connection" \
+            "${CF_LOG}" 2>/dev/null; then
+            echo "[TUNNEL] DIAGNOSIS : Tunnel is in a reconnect loop."
+            echo "[TUNNEL] ACTION    : Check Cloudflare service status and Space outbound"
+            echo "[TUNNEL]             network connectivity."
+
+        elif grep -qi \
+            "dial tcp\|connection refused\|no such host\|network unreachable\|i/o timeout\|TLS handshake" \
+            "${CF_LOG}" 2>/dev/null; then
+            echo "[TUNNEL] DIAGNOSIS : Network error — cannot reach the Cloudflare edge."
+            echo "[TUNNEL] ACTION    : Verify outbound HTTPS/QUIC is not blocked from the Space."
+
+        elif grep -qi "already running\|tunnel already" \
+            "${CF_LOG}" 2>/dev/null; then
+            echo "[TUNNEL] DIAGNOSIS : A duplicate tunnel connector may already be running."
+            echo "[TUNNEL] ACTION    : Check your Cloudflare Zero Trust Tunnels list for"
+            echo "[TUNNEL]             stale connectors and remove them."
+
+        else
+            echo "[TUNNEL] DIAGNOSIS : Unknown — inspect full log for details."
+            echo "[TUNNEL] Log path  : ${CF_LOG}"
+        fi
+
+        echo "[TUNNEL] ============================================"
+        echo "[TUNNEL] OpenCode and terminal continue normally."
+        echo "[TUNNEL] SSH access via Cloudflare will be unavailable until resolved."
+    fi
 fi
 
 # ─── Start DB self-healing daemon ────────────────────────────────────
