@@ -63,14 +63,24 @@ PYEOF
 # ─── nginx: reverse proxy ───────────────────────────────────────────
 rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
-# map must live in the http{} context; conf.d files are included there.
+# Maps must live in the http{} context; conf.d files are included there.
 cat > /etc/nginx/conf.d/opencode-map.conf << 'MAPEOF'
-# Correctly set Connection header:
-#   WebSocket requests  → "upgrade"
-#   Regular HTTP / SSE  → "close"  (not "upgrade" — that breaks SSE streaming)
+# Connection header:
+#   WebSocket (Upgrade: websocket) → "upgrade"
+#   Everything else (HTTP, SSE)    → "" (nginx default; do NOT send "close"
+#                                        as some backends treat it as a signal
+#                                        to shut down long-lived SSE connections)
 map $http_upgrade $connection_upgrade {
-    default  upgrade;
-    ''       close;
+    websocket  upgrade;
+    default    "";
+}
+
+# Proxy buffering:
+#   SSE requests (Accept: text/event-stream) → off  (stream tokens immediately)
+#   Everything else (HTML, JSON, assets)     → on   (needed for sub_filter HTML injection)
+map $http_accept $oc_proxy_buffering {
+    "~*text/event-stream"  "off";
+    default                "on";
 }
 MAPEOF
 
@@ -78,7 +88,9 @@ cat > /etc/nginx/conf.d/opencode.conf << 'NGINXEOF'
 server {
     listen 7860;
 
-    # Disable gzip globally — gzip breaks SSE (chunked streaming) responses
+    # Disable nginx's own gzip — the backend controls its encoding.
+    # Prevent Accept-Encoding from asking the backend for compression,
+    # which would break SSE streaming (chunked + compressed = not streamable).
     gzip off;
 
     # ── Real PTY terminal (ttyd on :7681) ────────────────────────────
@@ -90,7 +102,7 @@ server {
         proxy_set_header        Host            $host;
         proxy_set_header        Accept-Encoding "";
         proxy_read_timeout      86400;
-        proxy_buffering         off;
+        # Note: sub_filter needs buffering; WebSocket ignores buffering setting anyway.
 
         # Inject mobile-friendly viewport + CSS into ttyd's HTML
         sub_filter '<head>' '<head>
@@ -142,13 +154,37 @@ document.addEventListener("DOMContentLoaded", function () {
         proxy_set_header        Upgrade             $http_upgrade;
         proxy_set_header        Connection          $connection_upgrade;
         proxy_set_header        Host                $host;
+        # Prevent the backend from gzip-compressing responses — compressed SSE
+        # cannot be decompressed incrementally by the browser.
+        proxy_set_header        Accept-Encoding     "";
         proxy_read_timeout      86400;
-
-        # Critical for SSE: disable all buffering so token-by-token
-        # streaming reaches the browser immediately
-        proxy_buffering         off;
         proxy_cache             off;
-        proxy_set_header        X-Accel-Buffering   no;
+
+        # SSE requests get proxy_buffering=off (immediate streaming).
+        # HTML/JSON requests get proxy_buffering=on (required for sub_filter below).
+        proxy_buffering         $oc_proxy_buffering;
+
+        # ── Server-URL localStorage fix ───────────────────────────────
+        # Root cause of "New Session doesn't work" / "AI never responds":
+        # OpenCode's SPA reads its server URL from localStorage key
+        # "opencode.settings.dat:defaultServerUrl". If a previous visit stored
+        # a wrong URL (e.g. http://localhost:4096 from an older config), every
+        # API call fails silently in the browser — curl tests pass because they
+        # bypass localStorage. This script runs BEFORE the SPA initialises and
+        # clears any stale URL that does not match the current public origin.
+        #
+        # The upstream CSP hash covers only the theme-preload script, so we
+        # must strip it and emit a permissive replacement that still blocks
+        # dangerous sources while allowing our injected inline fix.
+        proxy_hide_header       Content-Security-Policy;
+        add_header Content-Security-Policy
+            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src * data:;"
+            always;
+
+        sub_filter '</head>'
+            '<script>!function(){try{var k="opencode.settings.dat:defaultServerUrl",s=localStorage.getItem(k);if(s&&s!==location.origin)localStorage.removeItem(k);}catch(e){}}();</script></head>';
+        sub_filter_once    on;
+        sub_filter_types   text/html;
     }
 }
 NGINXEOF
