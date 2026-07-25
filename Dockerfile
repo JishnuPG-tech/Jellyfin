@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # Install huggingface_hub for the sync engine
-RUN pip3 install --quiet --no-cache-dir "huggingface_hub>=0.23"
+RUN pip3 install --quiet --no-cache-dir --break-system-packages "huggingface_hub>=0.23"
 
 # Pre-create /data dirs so XDG paths always exist even without a volume mount.
 # sync_engine.py will restore their contents from the HF Dataset at startup.
