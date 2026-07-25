@@ -20,17 +20,12 @@ ARG TTYD_VERSION=1.7.7
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git gnupg python3 python3-pip nginx \
-      openssh-server iproute2 \
  && curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
       | tar -xz -C /usr/local/bin opencode \
  && chmod +x /usr/local/bin/opencode \
  && curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" \
       -o /usr/local/bin/ttyd \
  && chmod +x /usr/local/bin/ttyd \
- && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" \
-      -o /usr/local/bin/cloudflared \
- && chmod +x /usr/local/bin/cloudflared \
- && mkdir -p /var/run/sshd \
  && rm -rf /var/lib/apt/lists/*
 
 # Install huggingface_hub for the sync engine
