@@ -139,11 +139,39 @@ document.addEventListener("DOMContentLoaded", function () {
         # (no sub_filter_types needed — text/html is processed by default)
     }
 
-    # ── OpenCode API + SSE: buffering OFF so events stream immediately ─
-    # nginx 1.22 does not allow variables in proxy_buffering, so SSE and
-    # HTML must be split across two location blocks.
-    # This block catches all /api/* requests (JSON responses + SSE streams).
+    # ── OpenCode /api/* endpoints: buffering OFF ─────────────────────
+    # Covers: /api/health, /api/pty/*, /api/vcs/status, /api/provider/*
     location /api/ {
+        proxy_pass              http://127.0.0.1:8080;
+        proxy_http_version      1.1;
+        proxy_set_header        Host                $host;
+        proxy_set_header        Connection          "";
+        proxy_set_header        Accept-Encoding     "";
+        proxy_read_timeout      86400;
+        proxy_buffering         off;
+        proxy_cache             off;
+    }
+
+    # ── OpenCode /session/* endpoints: buffering OFF (SSE streams) ───
+    # CRITICAL: OpenCode's actual REST API (sessions, messages, events)
+    # lives at /session/*, NOT /api/session/*. The message endpoint
+    # POST /session/{id}/message streams SSE tokens back to the browser.
+    # With proxy_buffering on (the default), nginx holds the entire stream
+    # in its buffer until the AI finishes — the browser sees "instant stop".
+    # Must be buffering OFF so tokens stream token-by-token in real time.
+    location /session/ {
+        proxy_pass              http://127.0.0.1:8080;
+        proxy_http_version      1.1;
+        proxy_set_header        Host                $host;
+        proxy_set_header        Connection          "";
+        proxy_set_header        Accept-Encoding     "";
+        proxy_read_timeout      86400;
+        proxy_buffering         off;
+        proxy_cache             off;
+    }
+
+    # ── OpenCode /event (global SSE): buffering OFF ───────────────────
+    location /event {
         proxy_pass              http://127.0.0.1:8080;
         proxy_http_version      1.1;
         proxy_set_header        Host                $host;
