@@ -74,14 +74,6 @@ map $http_upgrade $connection_upgrade {
     websocket  upgrade;
     default    "";
 }
-
-# Proxy buffering:
-#   SSE requests (Accept: text/event-stream) → off  (stream tokens immediately)
-#   Everything else (HTML, JSON, assets)     → on   (needed for sub_filter HTML injection)
-map $http_accept $oc_proxy_buffering {
-    "~*text/event-stream"  "off";
-    default                "on";
-}
 MAPEOF
 
 cat > /etc/nginx/conf.d/opencode.conf << 'NGINXEOF'
@@ -144,25 +136,37 @@ document.addEventListener("DOMContentLoaded", function () {
 });
 </script>';
         sub_filter_once    on;
-        sub_filter_types   text/html;
+        # (no sub_filter_types needed — text/html is processed by default)
     }
 
-    # ── OpenCode chat UI + REST API + SSE streaming ───────────────────
+    # ── OpenCode API + SSE: buffering OFF so events stream immediately ─
+    # nginx 1.22 does not allow variables in proxy_buffering, so SSE and
+    # HTML must be split across two location blocks.
+    # This block catches all /api/* requests (JSON responses + SSE streams).
+    location /api/ {
+        proxy_pass              http://127.0.0.1:8080;
+        proxy_http_version      1.1;
+        proxy_set_header        Host                $host;
+        proxy_set_header        Connection          "";
+        proxy_set_header        Accept-Encoding     "";
+        proxy_read_timeout      86400;
+        proxy_buffering         off;
+        proxy_cache             off;
+    }
+
+    # ── OpenCode SPA (HTML + assets): buffering ON for sub_filter ─────
     location / {
         proxy_pass              http://127.0.0.1:8080;
         proxy_http_version      1.1;
         proxy_set_header        Upgrade             $http_upgrade;
         proxy_set_header        Connection          $connection_upgrade;
         proxy_set_header        Host                $host;
-        # Prevent the backend from gzip-compressing responses — compressed SSE
-        # cannot be decompressed incrementally by the browser.
+        # Prevent gzip compression — compressed SSE cannot be decompressed
+        # incrementally by the browser.
         proxy_set_header        Accept-Encoding     "";
         proxy_read_timeout      86400;
         proxy_cache             off;
-
-        # SSE requests get proxy_buffering=off (immediate streaming).
-        # HTML/JSON requests get proxy_buffering=on (required for sub_filter below).
-        proxy_buffering         $oc_proxy_buffering;
+        # proxy_buffering is on by default — required for sub_filter below.
 
         # ── Server-URL localStorage fix ───────────────────────────────
         # Root cause of "New Session doesn't work" / "AI never responds":
@@ -170,12 +174,12 @@ document.addEventListener("DOMContentLoaded", function () {
         # "opencode.settings.dat:defaultServerUrl". If a previous visit stored
         # a wrong URL (e.g. http://localhost:4096 from an older config), every
         # API call fails silently in the browser — curl tests pass because they
-        # bypass localStorage. This script runs BEFORE the SPA initialises and
-        # clears any stale URL that does not match the current public origin.
+        # bypass localStorage entirely. This script runs BEFORE the SPA
+        # initialises and clears any stale URL that doesn't match the current
+        # public origin, so the SPA falls back to location.origin (correct).
         #
         # The upstream CSP hash covers only the theme-preload script, so we
-        # must strip it and emit a permissive replacement that still blocks
-        # dangerous sources while allowing our injected inline fix.
+        # strip it and emit an equivalent policy that also allows our fix.
         proxy_hide_header       Content-Security-Policy;
         add_header Content-Security-Policy
             "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src * data:;"
@@ -184,7 +188,7 @@ document.addEventListener("DOMContentLoaded", function () {
         sub_filter '</head>'
             '<script>!function(){try{var k="opencode.settings.dat:defaultServerUrl",s=localStorage.getItem(k);if(s&&s!==location.origin)localStorage.removeItem(k);}catch(e){}}();</script></head>';
         sub_filter_once    on;
-        sub_filter_types   text/html;
+        # (no sub_filter_types needed — text/html is processed by default)
     }
 }
 NGINXEOF
