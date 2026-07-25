@@ -5,7 +5,8 @@
 #    /terminal  → ttyd  :7681  — real PTY bash, mobile-optimised
 #    /          → opencode :8080 — chat UI + REST API + SSE
 #  sshd     :22   (internal only)
-#    ↑ reached via reverse SSH tunnel → Fly.io jump server → Termius
+#    ↑ exposed via reverse SSH tunnel through serveo.net
+#      Termius → opencode-hf.serveo.net:22 → here
 #
 set -u
 
@@ -123,10 +124,6 @@ nginx
 echo "[NGINX] Started."
 
 # ─── SSH server ──────────────────────────────────────────────────────
-# sshd listens on port 22 internally.
-# Port 22 is NOT exposed by HF — it is reached via the reverse SSH
-# tunnel that this container opens to the Fly.io jump server.
-# Termius → Fly.io:2222 → (tunnel) → here:22
 echo "[SSH] Configuring sshd..."
 
 cat > /etc/ssh/sshd_config << 'SSHD_CONF'
@@ -143,7 +140,6 @@ AcceptEnv LANG LC_*
 Subsystem sftp /usr/lib/openssh/sftp-server
 SSHD_CONF
 
-# Set SSH password for Termius login
 if [ -n "${SSH_PASSWORD:-}" ]; then
     echo "root:${SSH_PASSWORD}" | chpasswd
     echo "[SSH] Password set from SSH_PASSWORD secret."
@@ -151,98 +147,115 @@ else
     GENERATED_PW=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)
     echo "root:${GENERATED_PW}" | chpasswd
     echo "[SSH] ============================================"
-    echo "[SSH] No SSH_PASSWORD secret set."
-    echo "[SSH] Generated password: ${GENERATED_PW}"
+    echo "[SSH] No SSH_PASSWORD secret. Generated: ${GENERATED_PW}"
     echo "[SSH] Set SSH_PASSWORD in Space Secrets to make it permanent."
     echo "[SSH] ============================================"
 fi
 
 ssh-keygen -A 2>/dev/null || true
 /usr/sbin/sshd
-echo "[SSH] sshd running on port 22 (internal)."
+echo "[SSH] sshd running on port 22."
 
-# ─── Reverse SSH tunnel → Fly.io jump server ─────────────────────────
-# Required Space Secrets:
-#   JUMP_HOST       — Fly.io hostname, e.g. opencode-jump.fly.dev
-#   JUMP_SSH_KEY    — private ed25519 key (matching the public key stored
-#                     in JUMP_AUTHORIZED_KEY on the Fly.io side)
+# ─── Reverse SSH tunnel via serveo.net ───────────────────────────────
+# serveo.net is a free relay — no account, no binary, no tokens.
+# We open an outbound SSH connection (HF allows this) and serveo
+# exposes the tunnel at a public hostname:port.
 #
-# What this creates:
-#   Fly.io port 2222 → this container's localhost:22
-#   Termius connects to <JUMP_HOST>:2222 with SSH_PASSWORD
+# Two attempts:
+#   1. Named subdomain: opencode-hf.serveo.net:22  (fixed, easy to remember)
+#   2. Random port:     serveo.net:NNNNN           (fallback)
 #
-# HF does NOT flag outbound SSH — only inbound tunnel services are blocked.
-echo "[TUNNEL] ============================================"
+SERVEO_LOG=/data/logs/serveo.log
+TUNNEL_HOST=""
+TUNNEL_PORT=""
 
-if [ -z "${JUMP_HOST:-}" ] || [ -z "${JUMP_SSH_KEY:-}" ]; then
-    echo "[TUNNEL] Reverse SSH tunnel DISABLED."
-    [ -z "${JUMP_HOST:-}"    ] && echo "[TUNNEL] Missing secret: JUMP_HOST"
-    [ -z "${JUMP_SSH_KEY:-}" ] && echo "[TUNNEL] Missing secret: JUMP_SSH_KEY"
-    echo "[TUNNEL] See setup instructions — tunnel will not start."
-    echo "[TUNNEL] Terminal at /terminal still works without it."
+echo "[TUNNEL] Starting SSH tunnel via serveo.net..."
+
+# Attempt 1 — named subdomain (opencode-hf.serveo.net:22)
+ssh -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=6 \
+    -o LogLevel=ERROR \
+    -R opencode-hf:22:localhost:22 \
+    serveo.net > "${SERVEO_LOG}" 2>&1 &
+SERVEO_PID=$!
+
+sleep 8
+
+# Check if named subdomain was accepted
+if kill -0 "${SERVEO_PID}" 2>/dev/null; then
+    # Process still running — tunnel likely up
+    TUNNEL_HOST="opencode-hf.serveo.net"
+    TUNNEL_PORT="22"
 else
-    # Write private key to disk (never logged)
-    JUMP_KEY_FILE=/root/.ssh/jump_key
-    printf '%s\n' "${JUMP_SSH_KEY}" > "${JUMP_KEY_FILE}"
-    chmod 600 "${JUMP_KEY_FILE}"
+    # Named subdomain taken or serveo refused — try random port
+    echo "[TUNNEL] Named subdomain unavailable, trying random port..."
+    ssh -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o ServerAliveInterval=30 \
+        -o ServerAliveCountMax=6 \
+        -o LogLevel=INFO \
+        -R 0:localhost:22 \
+        serveo.net > "${SERVEO_LOG}" 2>&1 &
+    SERVEO_PID=$!
+    sleep 8
 
-    echo "[TUNNEL] Connecting to jump server: ${JUMP_HOST}"
+    # Parse assigned port from log
+    TUNNEL_PORT=$(grep -oE 'Allocated port [0-9]+' "${SERVEO_LOG}" 2>/dev/null \
+        | grep -oE '[0-9]+' | head -1)
+    if [ -n "${TUNNEL_PORT}" ]; then
+        TUNNEL_HOST="serveo.net"
+    fi
+fi
 
-    # Open reverse tunnel in background with auto-restart loop
-    # -N        : no remote command
-    # -R 2222:  : bind port 2222 on jump server → localhost:22 here
-    # -o ...    : keep-alive + no host-key prompt
+# Report result
+echo "[TUNNEL] ============================================"
+if [ -n "${TUNNEL_HOST}" ]; then
+    echo "[TUNNEL] SSH tunnel is UP via serveo.net"
+    echo "[TUNNEL] ----"
+    echo "[TUNNEL] Termius host     : ${TUNNEL_HOST}"
+    echo "[TUNNEL] Termius port     : ${TUNNEL_PORT}"
+    echo "[TUNNEL] Termius username : root"
+    echo "[TUNNEL] Termius password : your SSH_PASSWORD secret"
+    echo "[TUNNEL] ----"
+    echo "[TUNNEL] Tunnel log : ${SERVEO_LOG}"
+
+    # Auto-restart loop in background if tunnel drops
     (
         while true; do
-            echo "[TUNNEL] Opening reverse tunnel to ${JUMP_HOST}:22 ..."
-            ssh -N \
-                -i "${JUMP_KEY_FILE}" \
-                -R 2222:localhost:22 \
-                -o StrictHostKeyChecking=no \
-                -o UserKnownHostsFile=/dev/null \
-                -o ServerAliveInterval=30 \
-                -o ServerAliveCountMax=6 \
-                -o ExitOnForwardFailure=yes \
-                -o LogLevel=ERROR \
-                root@"${JUMP_HOST}" 2>>/data/logs/tunnel.log
-            echo "[TUNNEL] Connection dropped — reconnecting in 10 s..." \
-                >> /data/logs/tunnel.log
-            sleep 10
+            sleep 15
+            if ! kill -0 "${SERVEO_PID}" 2>/dev/null; then
+                echo "[TUNNEL] Tunnel dropped — reconnecting..." >> "${SERVEO_LOG}"
+                if [ "${TUNNEL_HOST}" = "opencode-hf.serveo.net" ]; then
+                    ssh -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null \
+                        -o ServerAliveInterval=30 \
+                        -o ServerAliveCountMax=6 \
+                        -o LogLevel=ERROR \
+                        -R opencode-hf:22:localhost:22 \
+                        serveo.net >> "${SERVEO_LOG}" 2>&1 &
+                    SERVEO_PID=$!
+                else
+                    ssh -o StrictHostKeyChecking=no \
+                        -o UserKnownHostsFile=/dev/null \
+                        -o ServerAliveInterval=30 \
+                        -o ServerAliveCountMax=6 \
+                        -o LogLevel=ERROR \
+                        -R 0:localhost:22 \
+                        serveo.net >> "${SERVEO_LOG}" 2>&1 &
+                    SERVEO_PID=$!
+                fi
+            fi
         done
     ) &
-    TUNNEL_PID=$!
-
-    # Wait up to 20 s for the tunnel to come up
-    TUNNEL_UP=0
-    for _i in $(seq 1 20); do
-        sleep 1
-        # A successful tunnel leaves an ssh process running
-        if kill -0 "${TUNNEL_PID}" 2>/dev/null && \
-           [ "$(jobs -r | wc -l)" -gt 0 ]; then
-            TUNNEL_UP=1
-            break
-        fi
-    done
-
-    if [ "${TUNNEL_UP}" = "1" ]; then
-        echo "[TUNNEL] Reverse tunnel established."
-        echo "[TUNNEL] ============================================"
-        echo "[TUNNEL] Termius settings:"
-        echo "[TUNNEL]   Host     : ${JUMP_HOST}"
-        echo "[TUNNEL]   Port     : 2222"
-        echo "[TUNNEL]   Username : root"
-        echo "[TUNNEL]   Password : your SSH_PASSWORD secret"
-        echo "[TUNNEL] ============================================"
-    else
-        echo "[TUNNEL] WARNING: Could not confirm tunnel in 20 s."
-        echo "[TUNNEL] Check /data/logs/tunnel.log for details."
-        echo "[TUNNEL] The loop will keep retrying in the background."
-        echo "[TUNNEL] ============================================"
-    fi
-
-    # Clean up key after use
-    rm -f "${JUMP_KEY_FILE}"
+else
+    echo "[TUNNEL] WARNING: Could not establish tunnel via serveo.net."
+    echo "[TUNNEL] serveo.net may be temporarily down."
+    echo "[TUNNEL] Check ${SERVEO_LOG} for details."
+    echo "[TUNNEL] Terminal at /terminal still works without it."
 fi
+echo "[TUNNEL] ============================================"
 
 # ─── Start DB self-healing daemon ────────────────────────────────────
 echo "[CLEANER] Starting self-healing daemon..."
