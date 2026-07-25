@@ -137,10 +137,32 @@ class SyncEngine:
     # Restore (startup)
     # ------------------------------------------------------------------
 
+    def _ensure_repo(self) -> bool:
+        """Create the dataset repo if it does not exist yet. Returns True on success."""
+        try:
+            self._api.create_repo(
+                repo_id=HF_DATASET,
+                repo_type="dataset",
+                private=True,
+                exist_ok=True,
+            )
+            return True
+        except Exception as exc:
+            log.error(
+                f"Could not create/access dataset repo {HF_DATASET}: {exc}\n"
+                "  → Create it manually at https://huggingface.co/new-dataset "
+                "(name: OpenCode-Storage, private) then restart the Space."
+            )
+            return False
+
     def restore(self) -> None:
         """Download the entire dataset snapshot and restore local dirs."""
         if not self._api:
             log.info("Restore skipped (sync disabled)")
+            return
+
+        if not self._ensure_repo():
+            log.warning("Skipping restore — dataset repo not accessible")
             return
 
         log.info(f"=== RESTORE: pulling {HF_DATASET} ===")
