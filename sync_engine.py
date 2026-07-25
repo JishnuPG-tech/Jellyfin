@@ -2,8 +2,8 @@
 """
 OpenCode Sync Engine
 ====================
-Persists /projects/default (workspace), /data/share (OpenCode DB),
-and /data/config (OpenCode config) to a private HF Dataset repo.
+Persists /projects/default (workspace), /data/share/opencode (OpenCode DB),
+and /data/config/opencode (OpenCode config) to a private HF Dataset repo.
 
 Usage:
   python3 /sync_engine.py restore   — pull dataset → local dirs at startup
@@ -20,6 +20,7 @@ import os
 import time
 import hashlib
 import logging
+import traceback
 import shutil
 import tempfile
 from pathlib import Path
@@ -29,7 +30,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="[%(asctime)s] [SYNC] %(message)s",
+    format="[%(asctime)s] [SYNC] %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
     stream=sys.stdout,
     force=True,
@@ -43,19 +44,61 @@ log = logging.getLogger("sync")
 HF_TOKEN   = os.environ.get("HF_TOKEN", "")
 HF_DATASET = os.environ.get("HF_DATASET", "Jishnupg/OpenCode-Storage")
 
-# Local dirs → dataset path prefixes
+# ─── CRITICAL FIX ────────────────────────────────────────────────────────────
+# Scope watched dirs to the SPECIFIC OpenCode subdirectories, NOT the entire
+# /data/share or /data/config XDG roots. Those roots contain Android SDK caches,
+# sdkbin-*, sdkinf-* files, npm/pip caches, etc. — thousands of unrelated
+# system files that must never be synced.
+#
+#   "workspace" → /projects/default          (the user's actual project files)
+#   "share"     → /data/share/opencode       (OpenCode SQLite DB only)
+#   "config"    → /data/config/opencode      (OpenCode config JSON only)
+# ─────────────────────────────────────────────────────────────────────────────
 WATCH_DIRS: dict[str, Path] = {
     "workspace": Path("/projects/default"),
-    "share":     Path("/data/share"),
-    "config":    Path("/data/config"),
+    "share":     Path("/data/share/opencode"),   # was /data/share — TOO BROAD
+    "config":    Path("/data/config/opencode"),  # was /data/config — TOO BROAD
 }
 
-# Files/dirs to never sync
+# Exact directory-name segments to skip anywhere in the path
 IGNORE_NAMES: set[str] = {
-    ".git", "node_modules", "__pycache__", ".cache",
-    ".npm", ".yarn", ".pnpm", "dist", "build",
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".cache",
+    ".npm",
+    ".yarn",
+    ".pnpm",
+    ".pip",
+    "dist",
+    "build",
+    # Android / SDK
+    ".android",
+    ".gradle",
+    ".kotlin",
+    "sdktools",
+    # Temp / logs / misc
+    "tmp",
+    "temp",
+    "logs",
+    ".local",     # catches ~/.local caches outside our watched subdirs
 }
-IGNORE_SUFFIXES: set[str] = {".tmp", ".sock", ".pid", ".lock", ".pyc"}
+
+# Name *prefixes* to skip (catches sdkbin-*, sdkinf-*, tmp-*, etc.)
+IGNORE_PREFIXES: tuple[str, ...] = (
+    "sdkbin-",
+    "sdkinf-",
+    "tmp-",
+    "temp-",
+    ".~",
+)
+
+# File suffixes to skip
+IGNORE_SUFFIXES: set[str] = {
+    ".tmp", ".sock", ".pid", ".lock", ".pyc",
+    ".log", ".bak", ".swp", ".swo",
+}
+
 MAX_FILE_BYTES = 50 * 1_024 * 1_024   # 50 MB hard limit per file
 
 POLL_INTERVAL_SECS       = 15    # how often to check for changes
@@ -68,17 +111,31 @@ CHECKPOINT_INTERVAL_SECS = 300   # forced full sync every 5 min
 
 def _should_skip(path: Path) -> bool:
     """Return True if this file should not be synced."""
+    # Check every path component
     for part in path.parts:
         if part in IGNORE_NAMES:
+            log.debug(f"Skip (ignored name '{part}'): {path}")
             return True
+        # Prefix check (sdkbin-*, sdkinf-*, etc.)
+        for pfx in IGNORE_PREFIXES:
+            if part.startswith(pfx):
+                log.debug(f"Skip (ignored prefix '{pfx}'): {path}")
+                return True
+
+    # Suffix check
     if path.suffix in IGNORE_SUFFIXES:
+        log.debug(f"Skip (ignored suffix '{path.suffix}'): {path}")
         return True
+
+    # Size check
     try:
-        if path.stat().st_size > MAX_FILE_BYTES:
-            log.warning(f"Skipping large file ({path.stat().st_size // 1024} KB): {path}")
+        size = path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            log.warning(f"Skip (too large {size // 1024} KB): {path}")
             return True
     except OSError:
         return True
+
     return False
 
 
@@ -130,11 +187,14 @@ class SyncEngine:
             from huggingface_hub import HfApi
             self._api = HfApi(token=HF_TOKEN)
             log.info(f"Sync engine ready → {HF_DATASET}")
+            log.info(f"Watching directories:")
+            for prefix, path in WATCH_DIRS.items():
+                log.info(f"  [{prefix}] {path}")
         except ImportError:
             log.error("huggingface_hub not installed — sync disabled")
 
     # ------------------------------------------------------------------
-    # Restore (startup)
+    # Repo setup
     # ------------------------------------------------------------------
 
     def _ensure_repo(self) -> bool:
@@ -153,6 +213,7 @@ class SyncEngine:
                 "  → Create it manually at https://huggingface.co/new-dataset "
                 "(name: OpenCode-Storage, private) then restart the Space."
             )
+            log.error(traceback.format_exc())
             return False
 
     def _test_write(self) -> bool:
@@ -175,11 +236,16 @@ class SyncEngine:
             log.error("=" * 60)
             log.error("❌ SYNC WRITE FAILED — files will NOT be saved to dataset")
             log.error(f"   Error: {exc}")
+            log.error(traceback.format_exc())
             log.error("   Fix: go to https://huggingface.co/settings/tokens")
             log.error("   Create a token with 'Write' scope (not Read-only).")
             log.error("   Then update HF_TOKEN in Space Settings → Secrets.")
             log.error("=" * 60)
             return False
+
+    # ------------------------------------------------------------------
+    # Restore (startup)
+    # ------------------------------------------------------------------
 
     def restore(self) -> None:
         """Download the entire dataset snapshot and restore local dirs."""
@@ -211,6 +277,7 @@ class SyncEngine:
         except Exception as exc:
             # Empty repo or network error — not fatal, start fresh
             log.warning(f"Restore skipped or partial: {exc}")
+            log.warning(traceback.format_exc())
 
     def _copy_snapshot(self, repo_root: Path) -> int:
         """Copy files from a local snapshot dir to their actual locations."""
@@ -228,6 +295,7 @@ class SyncEngine:
                 dest_file.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     shutil.copy2(src_file, dest_file)
+                    log.info(f"  Restored: {prefix}/{rel} → {dest_file}")
                     count += 1
                 except Exception as exc:
                     log.warning(f"  Could not restore {dest_file}: {exc}")
@@ -242,17 +310,24 @@ class SyncEngine:
         result: dict[str, str] = {}
         for prefix, base in WATCH_DIRS.items():
             if not base.exists():
+                log.debug(f"Watched dir does not exist yet: {base}")
                 continue
             try:
+                file_count = 0
+                skip_count = 0
                 for path in base.rglob("*"):
                     if not path.is_file():
                         continue
                     if _should_skip(path):
+                        skip_count += 1
                         continue
                     rp = _repo_path(prefix, path, base)
                     result[rp] = _md5(path)
+                    file_count += 1
+                log.debug(f"Scan [{prefix}] {base}: {file_count} tracked, {skip_count} skipped")
             except Exception as exc:
                 log.warning(f"Scan error in {base}: {exc}")
+                log.warning(traceback.format_exc())
         return result
 
     # ------------------------------------------------------------------
@@ -290,45 +365,45 @@ class SyncEngine:
             for rp in to_upload:
                 local = _local_path(rp)
                 if local and local.exists():
+                    log.info(f"  UPLOAD ← {local}  →  {HF_DATASET}/{rp}")
                     ops.append(
                         CommitOperationAdd(
                             path_in_repo=rp,
                             path_or_fileobj=str(local),
                         )
                     )
+                else:
+                    log.warning(f"  UPLOAD skipped (file vanished): {rp}")
+
             for rp in to_delete:
+                log.info(f"  DELETE from dataset: {rp}")
                 ops.append(CommitOperationDelete(path_in_repo=rp))
 
             if not ops:
                 self._known = current
                 return 0, 0
 
-            n_up = len(to_upload)
-            n_del = len(to_delete)
+            n_up = sum(1 for op in ops if not isinstance(op, __import__("huggingface_hub").CommitOperationDelete))
+            n_del = sum(1 for op in ops if isinstance(op, __import__("huggingface_hub").CommitOperationDelete))
             msg = f"sync: +{n_up} ~{n_del}"
 
-            self._api.create_commit(
+            log.info(f"Creating commit '{msg}' on {HF_DATASET} ({len(ops)} operations) ...")
+            commit_info = self._api.create_commit(
                 repo_id=HF_DATASET,
                 repo_type="dataset",
                 commit_message=msg,
                 operations=ops,
             )
+            log.info(f"✅ Commit created: {commit_info.commit_url if hasattr(commit_info, 'commit_url') else 'ok'}")
+            log.info(f"↑ Pushed: +{n_up} uploads, -{n_del} deletes → {HF_DATASET}")
 
-            log.info(f"↑ committed: +{n_up} uploads, -{n_del} deletes → {HF_DATASET}")
-            if to_upload[:5]:
-                for rp in to_upload[:5]:
-                    log.info(f"   + {rp}")
-                if n_up > 5:
-                    log.info(f"   ... and {n_up - 5} more")
-            if to_delete:
-                for rp in to_delete[:3]:
-                    log.info(f"   - {rp}")
-
+            # Update known state after successful commit
             self._known = current
-            return n_up, n_del
+            return len(to_upload), len(to_delete)
 
         except Exception as exc:
-            log.error(f"Commit failed (will retry next cycle): {exc}")
+            log.error(f"❌ Commit FAILED (will retry next cycle): {exc}")
+            log.error(traceback.format_exc())
             # Don't update _known so we retry next cycle
             return 0, 0
 
@@ -347,6 +422,9 @@ class SyncEngine:
         log.info("=== WATCH: establishing baseline scan ===")
         self._known = self._scan()
         log.info(f"Baseline: {len(self._known)} files tracked")
+        log.info(f"Polling every {POLL_INTERVAL_SECS}s for changes in:")
+        for prefix, path in WATCH_DIRS.items():
+            log.info(f"  [{prefix}] {path}")
 
         last_checkpoint = time.monotonic()
 
@@ -359,7 +437,7 @@ class SyncEngine:
                 if forced:
                     # Force a full rescan to catch anything missed
                     self._known = {}
-                    log.info("[CHECKPOINT] Forced full sync")
+                    log.info("[CHECKPOINT] Forced full sync — clearing known state")
 
                 n_up, n_del = self.sync_once()
 
@@ -370,6 +448,7 @@ class SyncEngine:
 
             except Exception as exc:
                 log.error(f"Watch cycle error: {exc}")
+                log.error(traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +458,7 @@ class SyncEngine:
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "watch"
 
-    # Ensure all local dirs exist (they may not if /data was previously a volume mount)
+    # Ensure all local dirs exist
     for d in [
         "/data/share/opencode",
         "/data/config/opencode",
