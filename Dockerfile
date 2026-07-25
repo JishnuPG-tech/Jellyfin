@@ -1,6 +1,7 @@
-## OpenCode-Serve · direct mode
-## opencode serve on :7860 (HF exposed). ttyd on :7681 (internal).
-## No proxy, no extra deps — chat UI and APIs are served directly by opencode.
+## OpenCode-Serve · direct mode + terminal
+## nginx on :7860 (HF exposed) proxies:
+##   /terminal → ttyd on :7681 (real PTY bash)
+##   /         → opencode on :8080 (chat UI + API)
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -16,7 +17,7 @@ ARG OPENCODE_VERSION=1.18.3
 ARG TTYD_VERSION=1.7.7
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git gnupg python3 \
+      ca-certificates curl git gnupg python3 nginx \
  && curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
       | tar -xz -C /usr/local/bin opencode \
  && chmod +x /usr/local/bin/opencode \
@@ -28,7 +29,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN mkdir -p /projects/default
 COPY cleaner.py /cleaner.py
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+ && rm -f /etc/nginx/sites-enabled/default
 
 WORKDIR /projects/default
 
