@@ -177,6 +177,13 @@ echo "[SYNC] Starting background sync daemon..."
 python3 /sync_engine.py watch 2>&1 | tee -a /data/logs/sync.log &
 echo "[SYNC] Sync daemon started. Logs: /data/logs/sync.log"
 
+# ─── E2E sync verification (runs once at startup, non-blocking) ───────────
+# Creates sync_e2e_test.py in /projects/default, waits for sync, verifies it
+# appears in the HF Dataset, then modifies and deletes it.  Results appear in
+# Space logs under [SYNC] E2E lines.
+echo "[SYNC] Launching E2E verification in background..."
+(sleep 5 && python3 /sync_engine.py test 2>&1 | tee -a /data/logs/sync.log) &
+
 # ─── Ensure project dir exists ───────────────────────────────────────
 mkdir -p /projects/default
 cd /projects/default

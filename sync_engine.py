@@ -9,6 +9,7 @@ Usage:
   python3 /sync_engine.py restore   — pull dataset → local dirs at startup
   python3 /sync_engine.py watch     — background sync daemon
   python3 /sync_engine.py sync      — one-shot sync then exit
+  python3 /sync_engine.py test      — E2E sync verification (create/modify/delete)
 
 Environment variables (set as Space Secrets):
   HF_TOKEN      — HuggingFace token with read+write access to the dataset
@@ -111,23 +112,19 @@ CHECKPOINT_INTERVAL_SECS = 300   # forced full sync every 5 min
 
 def _should_skip(path: Path) -> bool:
     """Return True if this file should not be synced."""
-    # Check every path component
     for part in path.parts:
         if part in IGNORE_NAMES:
             log.debug(f"Skip (ignored name '{part}'): {path}")
             return True
-        # Prefix check (sdkbin-*, sdkinf-*, etc.)
         for pfx in IGNORE_PREFIXES:
             if part.startswith(pfx):
                 log.debug(f"Skip (ignored prefix '{pfx}'): {path}")
                 return True
 
-    # Suffix check
     if path.suffix in IGNORE_SUFFIXES:
         log.debug(f"Skip (ignored suffix '{path.suffix}'): {path}")
         return True
 
-    # Size check
     try:
         size = path.stat().st_size
         if size > MAX_FILE_BYTES:
@@ -187,7 +184,7 @@ class SyncEngine:
             from huggingface_hub import HfApi
             self._api = HfApi(token=HF_TOKEN)
             log.info(f"Sync engine ready → {HF_DATASET}")
-            log.info(f"Watching directories:")
+            log.info("Watching directories:")
             for prefix, path in WATCH_DIRS.items():
                 log.info(f"  [{prefix}] {path}")
         except ImportError:
@@ -198,7 +195,6 @@ class SyncEngine:
     # ------------------------------------------------------------------
 
     def _ensure_repo(self) -> bool:
-        """Create the dataset repo if it does not exist yet. Returns True on success."""
         try:
             self._api.create_repo(
                 repo_id=HF_DATASET,
@@ -208,16 +204,11 @@ class SyncEngine:
             )
             return True
         except Exception as exc:
-            log.error(
-                f"Could not create/access dataset repo {HF_DATASET}: {exc}\n"
-                "  → Create it manually at https://huggingface.co/new-dataset "
-                "(name: OpenCode-Storage, private) then restart the Space."
-            )
+            log.error(f"Could not create/access dataset repo {HF_DATASET}: {exc}")
             log.error(traceback.format_exc())
             return False
 
     def _test_write(self) -> bool:
-        """Upload a tiny sentinel file to verify write access. Logs clearly on failure."""
         try:
             from huggingface_hub import CommitOperationAdd
             import io
@@ -248,7 +239,6 @@ class SyncEngine:
     # ------------------------------------------------------------------
 
     def restore(self) -> None:
-        """Download the entire dataset snapshot and restore local dirs."""
         if not self._api:
             log.info("Restore skipped (sync disabled)")
             return
@@ -257,7 +247,6 @@ class SyncEngine:
             log.warning("Skipping restore — dataset repo not accessible")
             return
 
-        # Verify write access immediately so errors are visible in Space logs
         self._test_write()
 
         log.info(f"=== RESTORE: pulling {HF_DATASET} ===")
@@ -275,12 +264,10 @@ class SyncEngine:
                 count = self._copy_snapshot(Path(local_repo))
             log.info(f"=== RESTORE complete: {count} files ===")
         except Exception as exc:
-            # Empty repo or network error — not fatal, start fresh
             log.warning(f"Restore skipped or partial: {exc}")
             log.warning(traceback.format_exc())
 
     def _copy_snapshot(self, repo_root: Path) -> int:
-        """Copy files from a local snapshot dir to their actual locations."""
         count = 0
         for prefix, dest_base in WATCH_DIRS.items():
             src_base = repo_root / prefix
@@ -306,7 +293,6 @@ class SyncEngine:
     # ------------------------------------------------------------------
 
     def _scan(self) -> dict[str, str]:
-        """Scan all watched dirs; return {repo_path: md5}."""
         result: dict[str, str] = {}
         for prefix, base in WATCH_DIRS.items():
             if not base.exists():
@@ -335,13 +321,11 @@ class SyncEngine:
     # ------------------------------------------------------------------
 
     def sync_once(self) -> tuple[int, int]:
-        """Detect changes and push them to the dataset in one commit."""
         if not self._api:
             return 0, 0
 
         current = self._scan()
 
-        # Determine what changed
         to_upload: list[str] = []
         to_delete: list[str] = []
 
@@ -357,7 +341,6 @@ class SyncEngine:
             self._known = current
             return 0, 0
 
-        # Build commit operations
         try:
             from huggingface_hub import CommitOperationAdd, CommitOperationDelete
 
@@ -365,7 +348,7 @@ class SyncEngine:
             for rp in to_upload:
                 local = _local_path(rp)
                 if local and local.exists():
-                    log.info(f"  UPLOAD ← {local}  →  {HF_DATASET}/{rp}")
+                    log.info(f"  UPLOAD ← local:{local}  →  dataset:{HF_DATASET}/{rp}")
                     ops.append(
                         CommitOperationAdd(
                             path_in_repo=rp,
@@ -383,28 +366,28 @@ class SyncEngine:
                 self._known = current
                 return 0, 0
 
-            n_up = sum(1 for op in ops if not isinstance(op, __import__("huggingface_hub").CommitOperationDelete))
-            n_del = sum(1 for op in ops if isinstance(op, __import__("huggingface_hub").CommitOperationDelete))
+            from huggingface_hub import CommitOperationDelete as _Del
+            n_up  = sum(1 for op in ops if not isinstance(op, _Del))
+            n_del = sum(1 for op in ops if isinstance(op, _Del))
             msg = f"sync: +{n_up} ~{n_del}"
 
-            log.info(f"Creating commit '{msg}' on {HF_DATASET} ({len(ops)} operations) ...")
+            log.info(f"Creating commit '{msg}' on {HF_DATASET} ({len(ops)} ops) ...")
             commit_info = self._api.create_commit(
                 repo_id=HF_DATASET,
                 repo_type="dataset",
                 commit_message=msg,
                 operations=ops,
             )
-            log.info(f"✅ Commit created: {commit_info.commit_url if hasattr(commit_info, 'commit_url') else 'ok'}")
+            url = getattr(commit_info, "commit_url", None) or "committed"
+            log.info(f"✅ Commit created: {url}")
             log.info(f"↑ Pushed: +{n_up} uploads, -{n_del} deletes → {HF_DATASET}")
 
-            # Update known state after successful commit
             self._known = current
             return len(to_upload), len(to_delete)
 
         except Exception as exc:
             log.error(f"❌ Commit FAILED (will retry next cycle): {exc}")
             log.error(traceback.format_exc())
-            # Don't update _known so we retry next cycle
             return 0, 0
 
     # ------------------------------------------------------------------
@@ -412,17 +395,15 @@ class SyncEngine:
     # ------------------------------------------------------------------
 
     def watch(self) -> None:
-        """Poll for changes indefinitely."""
         if not self._api:
             log.info("Watch loop running in no-op mode (HF_TOKEN not set)")
             while True:
                 time.sleep(3_600)
 
-        # Establish baseline without uploading (what's already on disk = already synced)
         log.info("=== WATCH: establishing baseline scan ===")
         self._known = self._scan()
         log.info(f"Baseline: {len(self._known)} files tracked")
-        log.info(f"Polling every {POLL_INTERVAL_SECS}s for changes in:")
+        log.info(f"Polling every {POLL_INTERVAL_SECS}s. Watched dirs:")
         for prefix, path in WATCH_DIRS.items():
             log.info(f"  [{prefix}] {path}")
 
@@ -435,7 +416,6 @@ class SyncEngine:
                 forced = (now - last_checkpoint) >= CHECKPOINT_INTERVAL_SECS
 
                 if forced:
-                    # Force a full rescan to catch anything missed
                     self._known = {}
                     log.info("[CHECKPOINT] Forced full sync — clearing known state")
 
@@ -450,6 +430,136 @@ class SyncEngine:
                 log.error(f"Watch cycle error: {exc}")
                 log.error(traceback.format_exc())
 
+    # ------------------------------------------------------------------
+    # End-to-end self-test
+    # ------------------------------------------------------------------
+
+    def run_e2e_test(self) -> bool:
+        """
+        Self-contained E2E sync verification.
+        Runs inside the container — has direct access to /projects/default.
+        Steps:
+          1. Create  sync_e2e_test.py  → wait → verify appears in dataset
+          2. Modify  sync_e2e_test.py  → wait → verify update in dataset
+          3. Delete  sync_e2e_test.py  → wait → verify removed from dataset
+        Returns True if all three steps pass.
+        """
+        if not self._api:
+            log.error("E2E test skipped — no HF_TOKEN")
+            return False
+
+        test_file = Path("/projects/default/sync_e2e_test.py")
+        repo_path  = "workspace/sync_e2e_test.py"
+        wait_secs  = POLL_INTERVAL_SECS + 10   # a bit more than poll interval
+
+        log.info("=" * 60)
+        log.info("=== E2E SYNC TEST START ===")
+        log.info("=" * 60)
+
+        def dataset_content() -> str | None:
+            """Fetch the file content from the dataset. Returns None if missing."""
+            try:
+                from huggingface_hub import hf_hub_download
+                import tempfile, os
+                with tempfile.TemporaryDirectory() as td:
+                    p = hf_hub_download(
+                        repo_id=HF_DATASET,
+                        repo_type="dataset",
+                        filename=repo_path,
+                        token=HF_TOKEN,
+                        local_dir=td,
+                        force_download=True,
+                    )
+                    return Path(p).read_text()
+            except Exception:
+                return None
+
+        def trigger_sync():
+            """Run one immediate sync cycle."""
+            current = self._scan()
+            to_upload = [rp for rp, md5 in current.items() if self._known.get(rp) != md5]
+            to_delete  = [rp for rp in self._known if rp not in current]
+            # Temporarily reset known to force upload
+            saved = self._known.copy()
+            self._known = {}
+            n_up, n_del = self.sync_once()
+            return n_up, n_del
+
+        passed = 0
+
+        # ── Step 1: CREATE ───────────────────────────────────────────
+        log.info("[E2E STEP 1/3] Creating /projects/default/sync_e2e_test.py ...")
+        test_file.write_text("# sync e2e test - CREATED\nVERSION = 1\n")
+        log.info(f"  File written: {test_file}")
+
+        log.info(f"  Running immediate sync ...")
+        self._known = {}   # clear so the new file is definitely detected
+        n_up, n_del = self.sync_once()
+        log.info(f"  Sync result: +{n_up} ~{n_del}")
+
+        log.info(f"  Waiting {wait_secs}s then verifying dataset ...")
+        time.sleep(wait_secs)
+
+        content = dataset_content()
+        if content and "VERSION = 1" in content:
+            log.info(f"  ✅ STEP 1 PASSED — sync_e2e_test.py created in dataset")
+            log.info(f"     Dataset content: {content.strip()!r}")
+            passed += 1
+        else:
+            log.error(f"  ❌ STEP 1 FAILED — file not found in dataset (content={content!r})")
+
+        # ── Step 2: MODIFY ───────────────────────────────────────────
+        log.info("[E2E STEP 2/3] Modifying sync_e2e_test.py ...")
+        test_file.write_text("# sync e2e test - MODIFIED\nVERSION = 2\n")
+        log.info(f"  File modified: {test_file}")
+
+        log.info("  Running immediate sync ...")
+        n_up, n_del = self.sync_once()
+        log.info(f"  Sync result: +{n_up} ~{n_del}")
+
+        log.info(f"  Waiting {wait_secs}s then verifying dataset ...")
+        time.sleep(wait_secs)
+
+        content = dataset_content()
+        if content and "VERSION = 2" in content:
+            log.info(f"  ✅ STEP 2 PASSED — modification synced to dataset")
+            log.info(f"     Dataset content: {content.strip()!r}")
+            passed += 1
+        else:
+            log.error(f"  ❌ STEP 2 FAILED — modification not seen in dataset (content={content!r})")
+
+        # ── Step 3: DELETE ───────────────────────────────────────────
+        log.info("[E2E STEP 3/3] Deleting sync_e2e_test.py ...")
+        try:
+            test_file.unlink()
+            log.info(f"  File deleted locally: {test_file}")
+        except FileNotFoundError:
+            log.warning("  File already gone — continuing")
+
+        log.info("  Running immediate sync ...")
+        n_up, n_del = self.sync_once()
+        log.info(f"  Sync result: +{n_up} ~{n_del}")
+
+        log.info(f"  Waiting {wait_secs}s then verifying dataset ...")
+        time.sleep(wait_secs)
+
+        content = dataset_content()
+        if content is None:
+            log.info(f"  ✅ STEP 3 PASSED — sync_e2e_test.py deleted from dataset")
+            passed += 1
+        else:
+            log.error(f"  ❌ STEP 3 FAILED — file still exists in dataset (content={content!r})")
+
+        # ── Summary ──────────────────────────────────────────────────
+        log.info("=" * 60)
+        log.info(f"=== E2E TEST RESULT: {passed}/3 steps passed ===")
+        if passed == 3:
+            log.info("=== ✅ ALL STEPS PASSED — sync engine is working correctly ===")
+        else:
+            log.error(f"=== ❌ {3 - passed} STEP(S) FAILED — check logs above ===")
+        log.info("=" * 60)
+        return passed == 3
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -458,7 +568,6 @@ class SyncEngine:
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "watch"
 
-    # Ensure all local dirs exist
     for d in [
         "/data/share/opencode",
         "/data/config/opencode",
@@ -478,8 +587,11 @@ def main() -> None:
         engine.watch()
     elif mode == "sync":
         engine.sync_once()
+    elif mode == "test":
+        ok = engine.run_e2e_test()
+        sys.exit(0 if ok else 1)
     else:
-        print(f"Usage: sync_engine.py [restore|watch|sync]", file=sys.stderr)
+        print(f"Usage: sync_engine.py [restore|watch|sync|test]", file=sys.stderr)
         sys.exit(1)
 
 
