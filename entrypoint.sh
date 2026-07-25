@@ -1,11 +1,13 @@
 #!/bin/sh
-# OpenCode-Serve entrypoint — two services, no proxy:
-#  * opencode serve on :7860 (HF exposed)  — Chat UI works directly
-#  * ttyd on :7681 (internal)  — embedded bash on the same container
+# OpenCode-Serve entrypoint
+# Runs:
+#  1. ttyd on :7681 (internal) — embedded terminal
+#  2. opencode serve on :4096  — upstream (internal, no direct access)
+#  3. uvicorn gateway on :7860 — the only HF-exposed port
 set -u
 
 echo "============================================"
-echo "=== OpenCode-Serve starting                ==="
+echo "=== OpenCode-Serve starting (proxy mode) ==="
 echo "Time: $(date)"
 echo "============================================"
 
@@ -13,7 +15,6 @@ mkdir -p /data/share/opencode /data/config/opencode /data/cache/opencode /data/s
          /data/workspaces /data/logs \
  2>/dev/null || true
 
-# Default config (only when missing)
 if [ ! -f /data/config/opencode/opencode.json ]; then
   mkdir -p /data/config/opencode
   python3 <<'PYEOF' 2>/dev/null || true
@@ -27,11 +28,17 @@ mkdir -p /projects/default
 cd /projects/default
 [ -d .git ] || git init -q 2>/dev/null
 
-# ─── ttyd on 0.0.0.0:7681 (internal, exposed via nginx-style proxy if needed) ───
 echo "[TERMINAL] ttyd on 0.0.0.0:7681 ..."
 nohup ttyd --port 7681 --host 0.0.0.0 --writable --base-path /terminal \
   bash -l > /data/logs/ttyd.log 2>&1 &
 
-# ─── opencode serve on 7860 (HF exposed, FG) ───
-echo "[UPSTREAM] opencode serve on :${PORT:-7860} ..."
-exec opencode serve --port "${PORT:-7860}" --hostname 0.0.0.0
+echo "[UPSTREAM] opencode serve on :${OPENCODE_PORT:-4096} ..."
+nohup opencode serve --port "${OPENCODE_PORT:-4096}" --hostname 0.0.0.0 > /data/logs/opencode.log 2>&1 &
+
+echo "[GATEWAY] uvicorn on :${PORT:-7860} ..."
+exec python3 -m uvicorn backend.app.main:app \
+  --host 0.0.0.0 \
+  --port "${PORT:-7860}" \
+  --log-level warning \
+  --limit-concurrency 100 \
+  --timeout-keep-alive 600

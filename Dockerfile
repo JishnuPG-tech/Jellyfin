@@ -1,5 +1,8 @@
-## OpenCode-Serve · clean rebuild
-## Just opencode serve on :7860 plus ttyd on :7681 (internal). No proxy.
+## OpenCode-Serve · proxy mode
+## Gateway (uvicorn) on :7860, opencode upstream on :4096, ttyd on :7681.
+## /terminal/*  -> ttyd
+## /           -> redirect HTML (auto-load latest session)
+## /*          -> opencode serve (passthrough)
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -16,9 +19,9 @@ ENV TTYD_PORT=7681
 ARG OPENCODE_VERSION=1.18.3
 ARG TTYD_VERSION=1.7.7
 
-# System packages — git for /projects clone, python3 for cleaner
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git gnupg python3 \
+      ca-certificates curl git gnupg python3 python3-pip \
+ && pip3 install --break-system-packages fastapi uvicorn httpx websockets psutil \
  && curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
       | tar -xz -C /usr/local/bin opencode \
  && chmod +x /usr/local/bin/opencode \
@@ -29,11 +32,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN mkdir -p /projects/default
 
+COPY backend/ /app/backend/
 COPY cleaner.py /cleaner.py
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-WORKDIR /projects/default
+WORKDIR /app
 
 EXPOSE 7860
 
