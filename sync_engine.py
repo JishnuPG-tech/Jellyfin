@@ -550,26 +550,27 @@ class SyncEngine:
 
     def run_e2e_test(self) -> bool:
         """
-        Self-contained E2E sync verification.
-        Must run INSIDE the container (has direct access to /projects/default).
-        Steps:
-          1. Create  sync_e2e_test.py  → sync → verify in dataset
-          2. Modify  sync_e2e_test.py  → sync → verify update in dataset
-          3. Delete  sync_e2e_test.py  → sync → verify removed from dataset
+        E2E sync verification — relies on the watch daemon (separate process)
+        to perform the actual sync.  This process only WRITES files and VERIFIES
+        via the HF API.  It does NOT call sync_once() itself.
+
+        Flow:
+          1. Wait 90s for the watch daemon to finish its startup cleanup + purge.
+          2. Create  sync_e2e_test.py  → wait daemon polling → verify in dataset.
+          3. Modify  sync_e2e_test.py  → wait daemon polling → verify update.
+          4. Delete  sync_e2e_test.py  → wait daemon polling → verify removed.
         """
         if not self._api:
             log.error("E2E test skipped — no HF_TOKEN")
             return False
 
-        test_file = Path("/projects/default/sync_e2e_test.py")
+        test_file  = Path("/projects/default/sync_e2e_test.py")
         repo_path  = "workspace/sync_e2e_test.py"
-        wait_secs  = POLL_INTERVAL_SECS + 10
-
-        log.info("=" * 60)
-        log.info("=== E2E SYNC TEST START ===")
-        log.info("=" * 60)
+        # Allow daemon polling (15s) × 2 + buffer — gives the daemon two chances
+        wait_secs  = POLL_INTERVAL_SECS * 2 + 10   # 40 seconds
 
         def dataset_content() -> str | None:
+            """Fetch the file content from the dataset; None if missing."""
             try:
                 from huggingface_hub import hf_hub_download
                 with tempfile.TemporaryDirectory() as td:
@@ -582,66 +583,67 @@ class SyncEngine:
             except Exception:
                 return None
 
+        log.info("=" * 60)
+        log.info("=== E2E SYNC TEST START ===")
+        log.info("=== Waiting 90s for watch daemon cleanup+purge to finish ===")
+        log.info("=" * 60)
+        time.sleep(90)
+
         passed = 0
 
         # ── Step 1: CREATE ───────────────────────────────────────────
-        log.info("[E2E STEP 1/3] Creating /projects/default/sync_e2e_test.py ...")
+        log.info("[E2E STEP 1/3] Writing /projects/default/sync_e2e_test.py (VERSION=1) ...")
+        test_file.parent.mkdir(parents=True, exist_ok=True)
         test_file.write_text("# sync e2e test - CREATED\nVERSION = 1\n")
-        self._known = {}   # clear so the file is definitely seen as new
-        n_up, n_del = self.sync_once()
-        log.info(f"  Sync result: +{n_up} ~{n_del}")
-        log.info(f"  Waiting {wait_secs}s then verifying ...")
+        log.info(f"  File written locally.  Waiting {wait_secs}s for watch daemon to sync ...")
         time.sleep(wait_secs)
 
         content = dataset_content()
         if content and "VERSION = 1" in content:
-            log.info(f"  ✅ STEP 1 PASSED — sync_e2e_test.py created in dataset")
-            log.info(f"     Content: {content.strip()!r}")
+            log.info("  ✅ STEP 1 PASSED — sync_e2e_test.py created in dataset")
+            log.info(f"     Dataset content: {content.strip()!r}")
             passed += 1
         else:
-            log.error(f"  ❌ STEP 1 FAILED (content={content!r})")
+            log.error(f"  ❌ STEP 1 FAILED — file not in dataset (content={content!r})")
 
         # ── Step 2: MODIFY ───────────────────────────────────────────
-        log.info("[E2E STEP 2/3] Modifying sync_e2e_test.py ...")
+        log.info("[E2E STEP 2/3] Modifying sync_e2e_test.py (VERSION=2) ...")
         test_file.write_text("# sync e2e test - MODIFIED\nVERSION = 2\n")
-        n_up, n_del = self.sync_once()
-        log.info(f"  Sync result: +{n_up} ~{n_del}")
-        log.info(f"  Waiting {wait_secs}s then verifying ...")
+        log.info(f"  Waiting {wait_secs}s for watch daemon to sync ...")
         time.sleep(wait_secs)
 
         content = dataset_content()
         if content and "VERSION = 2" in content:
-            log.info(f"  ✅ STEP 2 PASSED — modification synced to dataset")
-            log.info(f"     Content: {content.strip()!r}")
+            log.info("  ✅ STEP 2 PASSED — modification synced to dataset")
+            log.info(f"     Dataset content: {content.strip()!r}")
             passed += 1
         else:
-            log.error(f"  ❌ STEP 2 FAILED (content={content!r})")
+            log.error(f"  ❌ STEP 2 FAILED — modification not in dataset (content={content!r})")
 
         # ── Step 3: DELETE ───────────────────────────────────────────
-        log.info("[E2E STEP 3/3] Deleting sync_e2e_test.py ...")
+        log.info("[E2E STEP 3/3] Deleting sync_e2e_test.py locally ...")
         try:
             test_file.unlink()
+            log.info("  File deleted locally.")
         except FileNotFoundError:
-            pass
-        n_up, n_del = self.sync_once()
-        log.info(f"  Sync result: +{n_up} ~{n_del}")
-        log.info(f"  Waiting {wait_secs}s then verifying ...")
+            log.warning("  File already gone — continuing.")
+        log.info(f"  Waiting {wait_secs}s for watch daemon to sync deletion ...")
         time.sleep(wait_secs)
 
         content = dataset_content()
         if content is None:
-            log.info("  ✅ STEP 3 PASSED — sync_e2e_test.py deleted from dataset")
+            log.info("  ✅ STEP 3 PASSED — sync_e2e_test.py removed from dataset")
             passed += 1
         else:
             log.error(f"  ❌ STEP 3 FAILED — file still in dataset (content={content!r})")
 
         # ── Summary ──────────────────────────────────────────────────
         log.info("=" * 60)
-        log.info(f"=== E2E TEST: {passed}/3 steps passed ===")
+        log.info(f"=== E2E TEST RESULT: {passed}/3 steps passed ===")
         if passed == 3:
             log.info("=== ✅ ALL STEPS PASSED — sync engine is working correctly ===")
         else:
-            log.error(f"=== ❌ {3 - passed} STEP(S) FAILED — see logs above ===")
+            log.error(f"=== ❌ {3 - passed} STEP(S) FAILED — check logs above ===")
         log.info("=" * 60)
         return passed == 3
 
