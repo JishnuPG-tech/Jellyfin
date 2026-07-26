@@ -66,11 +66,112 @@ json.dump(d, open(p, 'w'), indent=2)
 print('[CONFIG] Wrote base config with model:', d.get('model'))
 " || true
 
-# ─── Load persistent memory (CLAUDE.md → opencode.json instructions) ─────────
-# memory_updater.py reads CLAUDE.md (and future files like PROJECT.md, MEMORY.md)
-# from /projects/default and writes them as the OpenCode `instructions` field —
-# a system-level prompt injected into every new conversation automatically.
-echo "[MEMORY] Loading persistent memory from workspace..."
+# ─── Bootstrap persistent memory directory ───────────────────────────────────
+# Creates /projects/default/memory/{GLOBAL,PROJECT,CONVENTIONS,TODO}.md with
+# starter templates if they don't exist yet.  Existing files are never touched.
+echo "[MEMORY] Bootstrapping memory directory..."
+mkdir -p /projects/default/memory/sessions
+python3 - << 'INIT_MEMORY'
+from pathlib import Path
+
+MEMORY_DIR   = Path("/projects/default/memory")
+SESSIONS_DIR = MEMORY_DIR / "sessions"
+MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+templates = {
+    "GLOBAL.md": """\
+# Global Memory
+
+## User Preferences
+<!-- Add coding style preferences, editor settings, workflow habits -->
+
+## Preferred Technologies
+<!-- Add preferred languages, frameworks, libraries, tools -->
+
+## Formatting Rules
+<!-- Add code formatting preferences, line length, indentation style -->
+
+## Reusable Patterns
+<!-- Add patterns, snippets, or approaches to reuse across projects -->
+
+## Communication Style
+<!-- How the user likes responses: concise / detailed, with examples / without, etc. -->
+""",
+    "PROJECT.md": """\
+# Project Memory
+
+## Project Overview
+<!-- Briefly describe what this project does and its main goals -->
+
+## Architecture
+<!-- Describe the high-level architecture, key components, and how they interact -->
+
+## Tech Stack
+<!-- List languages, frameworks, databases, external services -->
+
+## APIs & Interfaces
+<!-- Document important APIs, endpoints, schemas, or interfaces -->
+
+## Design Decisions
+<!-- Record important architectural or design choices and why they were made -->
+
+## Completed Features
+<!-- List features that have been implemented -->
+
+## Known Issues
+<!-- Record known bugs, limitations, or technical debt -->
+""",
+    "CONVENTIONS.md": """\
+# Coding Conventions
+
+## Naming
+<!-- Variable, function, class, file naming rules -->
+
+## Code Style
+<!-- Formatting, linting, documentation standards -->
+
+## Patterns & Anti-patterns
+<!-- Project-specific patterns to follow or avoid -->
+
+## Testing
+<!-- Testing approach, coverage expectations, test naming -->
+
+## Git & Workflow
+<!-- Branch naming, commit message format, PR process -->
+""",
+    "TODO.md": """\
+# Pending Tasks
+
+## High Priority
+<!-- Critical tasks that need immediate attention -->
+
+## In Progress
+<!-- Tasks currently being worked on -->
+
+## Backlog
+<!-- Future features, improvements, ideas -->
+
+## Completed (recent)
+<!-- Recently completed tasks — remove when no longer relevant -->
+""",
+}
+
+for name, content in templates.items():
+    fp = MEMORY_DIR / name
+    if not fp.exists():
+        fp.write_text(content, encoding="utf-8")
+        print(f"[MEMORY] Created template: memory/{name}")
+    else:
+        print(f"[MEMORY] Existing:  memory/{name} ({fp.stat().st_size} bytes)")
+INIT_MEMORY
+
+# ─── Load persistent memory → opencode.json instructions ──────────────────────
+# memory_updater.py assembles all memory sources (GLOBAL.md, PROJECT.md,
+# CONVENTIONS.md, TODO.md, recent session summaries, workspace auto-scan)
+# into the `instructions` field of opencode.json.  OpenCode injects this
+# as a system-level prompt for every new conversation automatically.
+echo "[MEMORY] Assembling memory context → opencode.json..."
 python3 /memory_updater.py once
 
 echo "[CONFIG] Current configuration:"
@@ -299,16 +400,24 @@ echo "[SYNC] Starting background sync daemon..."
 python3 /sync_engine.py watch 2>&1 | tee -a /data/logs/sync.log &
 echo "[SYNC] Sync daemon started. Logs: /data/logs/sync.log"
 
-# ─── Start memory live-watcher ────────────────────────────────────────
-# Polls CLAUDE.md (and any files listed in MEMORY_FILES in memory_updater.py)
-# every 15 seconds.  When a file changes, opencode.json is updated so that
-# the NEXT new session picks up the fresh content automatically.
-#
-# To add future memory files (PROJECT.md, MEMORY.md, TEAM.md, RULES.md,
-# AGENTS.md …) uncomment the relevant lines inside memory_updater.py.
+# ─── Start memory live-watcher ───────────────────────────────────────────────
+# Watches memory/GLOBAL.md, memory/PROJECT.md, memory/CONVENTIONS.md,
+# memory/TODO.md, memory/sessions/, and workspace files (README, package.json…)
+# every 15 seconds.  When any source changes, re-assembles the full memory
+# context and updates opencode.json so the NEXT new session picks it up.
 echo "[MEMORY] Starting memory live-watcher..."
 python3 /memory_updater.py watch 2>&1 | tee -a /data/logs/memory.log &
 echo "[MEMORY] Live-watcher started. Logs: /data/logs/memory.log"
+
+# ─── Start session summariser daemon ─────────────────────────────────────────
+# Polls OpenCode's SQLite DB every 30 seconds.  When a conversation has been
+# idle for 5+ minutes and has at least 2 user messages, it writes a compact
+# markdown summary to /projects/default/memory/sessions/YYYY-MM-DD_HH-MM_ID.md.
+# The memory watcher picks up new summaries within 15 seconds and injects them
+# into the system prompt for the next conversation.
+echo "[SESSION] Starting session summariser daemon..."
+python3 /session_watcher.py 2>&1 | tee -a /data/logs/sessions.log &
+echo "[SESSION] Session summariser started. Logs: /data/logs/sessions.log"
 
 # ─── Ensure project dir exists ───────────────────────────────────────
 mkdir -p /projects/default

@@ -54,8 +54,9 @@ RUN mkdir -p \
 COPY cleaner.py        /cleaner.py
 COPY sync_engine.py    /sync_engine.py
 COPY memory_updater.py /memory_updater.py
+COPY session_watcher.py /session_watcher.py
 COPY entrypoint.sh     /entrypoint.sh
-RUN chmod +x /entrypoint.sh /sync_engine.py /memory_updater.py \
+RUN chmod +x /entrypoint.sh /sync_engine.py /memory_updater.py /session_watcher.py \
  && rm -f /etc/nginx/sites-enabled/default
 
 WORKDIR /projects/default
