@@ -283,9 +283,11 @@ export TERM="${TERM:-xterm-256color}"
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 alias ll='ls -la --color=auto'
 alias ls='ls --color=auto'
+alias memctl='python3 /memctl.py'
 echo ""
 echo "  OpenCode workspace: /projects/default"
 echo "  Type 'opencode' to launch the TUI, or work normally."
+echo "  Memory tools: memctl status | show | edit | clear | rebuild"
 echo ""
 cd /projects/default 2>/dev/null || true
 BASHRC

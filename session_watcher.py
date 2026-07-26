@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
 """
-OpenCode Session Watcher
-========================
-Monitors OpenCode's SQLite database for completed conversations and
-automatically writes structured summaries to /projects/default/memory/sessions/.
+OpenCode Session Watcher  (v2)
+================================
+Two responsibilities:
+  1. Summarise completed conversations from OpenCode's SQLite DB (fallback —
+     the AI is the primary summariser via its system-prompt instructions).
+  2. Archive old session summaries before memory/sessions/ grows unboundedly.
 
-The memory_updater.py watcher picks up new summaries within 15 seconds and
-injects them into the system prompt for the next conversation.
-
-This watcher works WITHOUT an LLM — it performs rule-based extraction:
-  • User messages (what the user asked/tasked)
-  • Files mentioned in the conversation
-  • Patterns suggesting architectural or design decisions
-  • Tool calls (file edits, commands run)
-
-The AI itself can also write session summaries directly (it is instructed to
-do so in the system prompt). This daemon is a complementary automatic fallback
-that ensures sessions are captured even when the AI doesn't write one itself.
+DB polling is kept as a robust fallback.  If OpenCode changes its storage
+mechanism in a future release, the archival and AI-driven paths still work.
 
 Usage:
   python3 /session_watcher.py   — run as daemon (blocks forever)
 
-Environment variables:
-  SESSION_IDLE_SECS   — minutes of inactivity before session is considered
-                        complete (default: 300 = 5 minutes)
-  SESSION_MIN_MSGS    — minimum user messages to generate a summary (default: 2)
+Environment:
+  SESSION_IDLE_SECS   — inactivity before session is "complete" (default 300)
+  SESSION_MIN_MSGS    — minimum user messages to summarise (default 2)
+  SESSION_ARCHIVE_N   — archive when sessions/ has more than N summaries (default 25)
+  SESSION_KEEP_N      — keep this many recent summaries unarchived (default 10)
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -36,19 +31,26 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 DB_PATHS = [
     "/data/share/opencode/opencode.db",
     "/root/.local/share/opencode/opencode.db",
 ]
-SESSIONS_DIR  = Path("/projects/default/memory/sessions")
-POLL_SECS     = 30          # how often to poll the DB
-IDLE_SECS     = int(os.environ.get("SESSION_IDLE_SECS", "300"))   # 5 min
-MIN_USER_MSGS = int(os.environ.get("SESSION_MIN_MSGS", "2"))
+SESSIONS_DIR    = Path("/projects/default/memory/sessions")
+POLL_SECS       = 30
+IDLE_SECS       = int(os.environ.get("SESSION_IDLE_SECS",    "300"))
+MIN_USER_MSGS   = int(os.environ.get("SESSION_MIN_MSGS",     "2"))
+ARCHIVE_THRESH  = int(os.environ.get("SESSION_ARCHIVE_N",    "25"))
+ARCHIVE_KEEP    = int(os.environ.get("SESSION_KEEP_N",       "10"))
 
-# Track which sessions have already been summarised this run
+# Sessions already handled this daemon run
 _summarised: set[str] = set()
+
+# Maintenance cadence: run archival every N poll cycles (~10 min at 30s poll)
+_ARCHIVE_EVERY_N_CYCLES = 20
+_cycle = 0
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -58,9 +60,9 @@ def _log(msg: str) -> None:
     print(f"[{ts}] [SESSION] {msg}", flush=True)
 
 
-# ── DB introspection ──────────────────────────────────────────────────────────
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
-def _find_db() -> str | None:
+def _find_db() -> Optional[str]:
     for p in DB_PATHS:
         if Path(p).exists():
             return p
@@ -69,33 +71,26 @@ def _find_db() -> str | None:
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     try:
-        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-        return [r[1] for r in rows]
+        return [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
     except Exception:
         return []
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
     try:
-        rows = conn.execute(
+        return {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
-        return {r[0] for r in rows}
+        ).fetchall()}
     except Exception:
         return set()
 
 
 # ── Text extraction ───────────────────────────────────────────────────────────
 
-def _extract_text(raw: str | None) -> str:
-    """
-    Extract plain text from an OpenCode message content field.
-    Content is stored as a JSON array of content-part objects, or plain text.
-    """
+def _extract_text(raw: Optional[str]) -> str:
+    """Extract plain text from an OpenCode message content field (JSON or plain)."""
     if not raw:
         return ""
-
-    # Try JSON array (OpenCode's native format)
     try:
         parts = json.loads(raw)
         if isinstance(parts, list):
@@ -106,9 +101,8 @@ def _extract_text(raw: str | None) -> str:
                     if t == "text":
                         texts.append(part.get("text", ""))
                     elif t == "tool_use":
-                        # Include tool names and key inputs for context
                         name = part.get("name", "")
-                        inp = part.get("input", {})
+                        inp  = part.get("input", {})
                         if isinstance(inp, dict):
                             if "command" in inp:
                                 texts.append(f"[ran: {inp['command']}]")
@@ -123,32 +117,16 @@ def _extract_text(raw: str | None) -> str:
             return parts
     except (json.JSONDecodeError, TypeError):
         pass
-
-    # Fallback: treat as plain text
     return str(raw).strip()
 
 
-# ── File path extraction ──────────────────────────────────────────────────────
-# Matches /absolute/paths and relative/paths.ext
 _PATH_RE = re.compile(
-    r"""(?:^|[\s`"'(])(/(?:[\w.\-]+/)*[\w.\-]+\.\w+)"""
-    r"""|(?:^|[\s`"'])([A-Za-z][\w.\-]*/[\w.\-/]+\.\w+)""",
+    r"(?:^|[\s`\"'(])(/(?:[\w.\-]+/)*[\w.\-]+\.\w+)"
+    r"|(?:^|[\s`\"'])([A-Za-z][\w.\-]*/[\w.\-/]+\.\w+)",
     re.MULTILINE,
 )
 
-
-def _extract_files(text: str) -> list[str]:
-    """Extract file paths mentioned in a conversation."""
-    found: set[str] = set()
-    for m in _PATH_RE.finditer(text):
-        p = m.group(1) or m.group(2)
-        if p and len(p) < 200:
-            found.add(p)
-    return sorted(found)
-
-
-# ── Decision extraction ───────────────────────────────────────────────────────
-_DECISION_PATTERNS = re.compile(
+_DECISION_RE = re.compile(
     r"(?:we (?:decided|agreed|chose|will use|are going to)|"
     r"the (?:architecture|design|approach|plan|solution) (?:is|will be|uses?)|"
     r"(?:use|using|switched? to|migrated? to|replaced? with)\s+\w+|"
@@ -158,133 +136,204 @@ _DECISION_PATTERNS = re.compile(
 )
 
 
+def _extract_files(text: str) -> list[str]:
+    found: set[str] = set()
+    for m in _PATH_RE.finditer(text):
+        p = m.group(1) or m.group(2)
+        if p and len(p) < 200:
+            found.add(p)
+    return sorted(found)
+
+
 def _extract_decisions(text: str) -> list[str]:
-    """Heuristically extract lines that look like architectural decisions."""
     decisions: list[str] = []
     for line in text.splitlines():
         line = line.strip()
-        if len(line) < 20 or len(line) > 300:
-            continue
-        if _DECISION_PATTERNS.search(line):
+        if 20 <= len(line) <= 300 and _DECISION_RE.search(line):
             decisions.append(line)
-    return decisions[:8]  # cap at 8 per session
+    return decisions[:8]
 
 
 # ── Summary writer ────────────────────────────────────────────────────────────
 
-def _write_summary(session_id: str, title: str | None, created_ms: int,
-                   user_messages: list[str], assistant_messages: list[str],
-                   workspace: str | None) -> bool:
-    """
-    Generate and write a session summary markdown file.
-    Returns True on success.
-    """
+def _write_summary(
+    session_id: str,
+    title: Optional[str],
+    created_ts: int,
+    user_messages: list[str],
+    assistant_messages: list[str],
+    workspace: Optional[str],
+) -> bool:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Derive timestamp from session creation time (milliseconds or seconds)
     try:
-        ts_secs = created_ms / 1000 if created_ms > 9_999_999_999 else created_ms
+        ts_secs = created_ts / 1000 if created_ts > 9_999_999_999 else created_ts
         dt = datetime.fromtimestamp(ts_secs, tz=timezone.utc)
     except Exception:
         dt = datetime.now(tz=timezone.utc)
 
-    date_str = dt.strftime("%Y-%m-%d")
-    time_str = dt.strftime("%H-%M")
-    short_id = session_id[:8] if len(session_id) >= 8 else session_id
+    short_id = session_id[:8]
+    filename = f"{dt.strftime('%Y-%m-%d_%H-%M')}_{short_id}.md"
+    out_path = SESSIONS_DIR / filename
 
-    filename = f"{date_str}_{time_str}_{short_id}.md"
-    out_path  = SESSIONS_DIR / filename
-
-    # Skip if a file for this session already exists
     if out_path.exists():
         return False
 
-    # ── Build summary ────────────────────────────────────────────────────────
-    all_user_text = "\n".join(user_messages)
-    all_text      = "\n".join(user_messages + assistant_messages)
+    all_text = "\n".join(user_messages + assistant_messages)
 
-    # Topics: first line of each user message (question or task)
     topics: list[str] = []
     for msg in user_messages[:8]:
-        first_line = msg.split("\n")[0].strip()
-        if first_line and len(first_line) > 5:
-            topics.append(first_line[:200])
+        first = msg.split("\n")[0].strip()
+        if len(first) > 5:
+            topics.append(first[:200])
 
-    # Files mentioned
-    files = _extract_files(all_text)[:15]
-
-    # Decisions
+    files     = _extract_files(all_text)[:15]
     decisions = _extract_decisions(all_text)
 
-    # Build the markdown
     lines: list[str] = [
         f"# Session {dt.strftime('%Y-%m-%d %H:%M')} UTC",
-        f"**Session ID:** `{short_id}`",
+        f"**ID:** `{short_id}`",
     ]
     if title:
         lines.append(f"**Title:** {title}")
     if workspace:
         lines.append(f"**Workspace:** `{workspace}`")
-    lines.append(f"**Messages:** {len(user_messages)} user, {len(assistant_messages)} assistant")
+    lines.append(f"**Turns:** {len(user_messages)} user / {len(assistant_messages)} assistant")
     lines.append("")
 
     if topics:
-        lines.append("## Topics / Tasks")
-        for t in topics:
-            lines.append(f"- {t}")
-        lines.append("")
-
+        lines += ["## Topics / Tasks", *[f"- {t}" for t in topics], ""]
     if decisions:
-        lines.append("## Key Decisions & Observations")
-        for d in decisions:
-            lines.append(f"- {d}")
-        lines.append("")
-
+        lines += ["## Key Decisions", *[f"- {d}" for d in decisions], ""]
     if files:
-        lines.append("## Files Referenced")
-        for f in files:
-            lines.append(f"- `{f}`")
-        lines.append("")
+        lines += ["## Files Referenced", *[f"- `{f}`" for f in files], ""]
 
-    # Compact excerpt of the conversation flow (first 2 + last 2 user msgs)
-    if len(user_messages) > 4:
-        excerpt_msgs = user_messages[:2] + ["..."] + user_messages[-2:]
-    else:
-        excerpt_msgs = user_messages
-
+    # Compact conversation flow
+    sample = (user_messages[:2] + (["*(earlier messages omitted)*"] if len(user_messages) > 4 else []) + user_messages[-2:]) if len(user_messages) > 4 else user_messages
     lines.append("## Conversation Flow")
-    for i, msg in enumerate(excerpt_msgs):
-        if msg == "...":
-            lines.append("- *(earlier messages omitted)*")
+    for msg in sample:
+        if msg.startswith("*"):
+            lines.append(f"- {msg}")
         else:
-            preview = msg[:300].replace("\n", " ").strip()
-            lines.append(f"- **User:** {preview}")
-    lines.append("")
-    lines.append("---")
-    lines.append("*Auto-generated by session_watcher. The AI may also have written its own summary above.*")
-
-    content = "\n".join(lines)
+            lines.append(f"- **User:** {msg[:300].replace(chr(10), ' ')}")
+    lines += ["", "---",
+              "*Auto-generated by session_watcher (DB fallback). "
+              "The AI may also have written its own summary above.*"]
 
     try:
-        out_path.write_text(content, encoding="utf-8")
-        _log(f"✅ Summary written: memory/sessions/{filename}")
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        _log(f"✅ Summary: memory/sessions/{filename}")
         return True
     except Exception as exc:
-        _log(f"Could not write summary {filename}: {exc}")
+        _log(f"Could not write {filename}: {exc}")
         return False
 
 
-# ── Session processing ────────────────────────────────────────────────────────
+# ── Session archival ──────────────────────────────────────────────────────────
+
+def _extract_archive_snippet(content: str, stem: str) -> str:
+    """
+    Condense one session summary to a compact archive entry.
+    Keeps the title line + Topics/Tasks + Decisions sections (≤20 lines).
+    """
+    lines = content.splitlines()
+    keep: list[str] = []
+    in_section = False
+    capture_sections = {"## Topics / Tasks", "## Key Decisions", "## Decisions Made", "## Accomplished"}
+
+    for line in lines:
+        if line.startswith("# "):          # session title
+            keep.append(line)
+        elif line in capture_sections:
+            in_section = True
+            keep.append(line)
+        elif line.startswith("## ") and in_section:
+            in_section = False             # stop at next section
+        elif in_section and line.startswith("- "):
+            keep.append(line)
+
+    if len(keep) > 20:
+        keep = keep[:20]
+        keep.append("  *(truncated)*")
+
+    return "\n".join(keep) if keep else f"*(session {stem})*"
+
+
+def _archive_old_sessions() -> None:
+    """
+    When memory/sessions/ has more than ARCHIVE_THRESH summary files,
+    merge the oldest batch into monthly ARCHIVE_YYYY-MM.md files and
+    delete the originals.  Archive files are excluded from injection
+    (they don't match the "newest N" selection in memory_updater.py).
+    """
+    if not SESSIONS_DIR.exists():
+        return
+
+    all_files = sorted(SESSIONS_DIR.glob("*.md"), key=lambda f: f.name)
+    # Separate real summaries from existing archives
+    summaries = [f for f in all_files if not f.name.startswith("ARCHIVE_")]
+
+    if len(summaries) <= ARCHIVE_THRESH:
+        return
+
+    # Archive everything older than the most recent ARCHIVE_KEEP files
+    to_archive = summaries[:-ARCHIVE_KEEP] if len(summaries) > ARCHIVE_KEEP else []
+    if not to_archive:
+        return
+
+    _log(f"Archiving {len(to_archive)} old session summaries (total={len(summaries)}, "
+         f"threshold={ARCHIVE_THRESH}, keep={ARCHIVE_KEEP})...")
+
+    # Group by year-month (filename prefix YYYY-MM)
+    by_month: dict[str, list[Path]] = {}
+    for fp in to_archive:
+        month = fp.name[:7]   # "YYYY-MM"
+        by_month.setdefault(month, []).append(fp)
+
+    archived = 0
+    for month, fps in sorted(by_month.items()):
+        archive_path = SESSIONS_DIR / f"ARCHIVE_{month}.md"
+
+        # Load existing archive content
+        existing = ""
+        if archive_path.exists():
+            try:
+                existing = archive_path.read_text(encoding="utf-8").rstrip()
+            except Exception:
+                pass
+
+        new_entries: list[str] = []
+        for fp in sorted(fps, key=lambda f: f.name):
+            try:
+                content = fp.read_text(encoding="utf-8").strip()
+                snippet = _extract_archive_snippet(content, fp.stem)
+                new_entries.append(snippet)
+                new_entries.append("---")
+            except Exception:
+                continue
+
+        if not new_entries:
+            continue
+
+        header = f"\n\n# Archived Sessions — {month}\n"
+        combined = (existing + header + "\n".join(new_entries)).strip()
+
+        try:
+            archive_path.write_text(combined + "\n", encoding="utf-8")
+            for fp in fps:
+                fp.unlink()
+                archived += 1
+            _log(f"  → ARCHIVE_{month}.md  ({len(fps)} sessions merged)")
+        except Exception as exc:
+            _log(f"  Archive write failed for {month}: {exc}")
+
+    _log(f"Archival complete: {archived} files merged into monthly archives")
+
+
+# ── DB processing ─────────────────────────────────────────────────────────────
 
 def _process_db(db_path: str) -> None:
-    """
-    Scan the DB for sessions that:
-      1. Have not been summarised yet
-      2. Have been idle for at least IDLE_SECS
-      3. Have at least MIN_USER_MSGS user messages
-
-    For each qualifying session, generate and write a summary.
-    """
+    """Scan DB for completed sessions and write summaries for qualifying ones."""
     try:
         conn = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -293,50 +342,36 @@ def _process_db(db_path: str) -> None:
         return
 
     try:
-        available_tables = _tables(conn)
-
-        if "session" not in available_tables:
-            conn.close()
+        available = _tables(conn)
+        if "session" not in available:
             return
 
         session_cols = _table_columns(conn, "session")
 
-        # Detect timestamp column name
-        ts_col = None
-        for candidate in ("updated_at", "created_at", "last_active", "modified_at"):
-            if candidate in session_cols:
-                ts_col = candidate
-                break
-
+        # Detect timestamp, title, directory columns
+        ts_col      = next((c for c in ("updated_at", "created_at", "last_active") if c in session_cols), None)
         created_col = "created_at" if "created_at" in session_cols else ts_col
-        title_col   = "title" if "title" in session_cols else None
+        title_col   = "title"     if "title"     in session_cols else None
         dir_col     = "directory" if "directory" in session_cols else None
 
         if not ts_col:
-            conn.close()
             return
 
         # Find message table
-        msg_table = None
-        for candidate in ("message", "messages", "chat_message"):
-            if candidate in available_tables:
-                msg_table = candidate
-                break
+        msg_table = next((t for t in ("message", "messages", "chat_message") if t in available), None)
 
-        now_ms = time.time() * 1000  # use ms; DB may store ms or s
-        cutoff = now_ms - (IDLE_SECS * 1000)
+        # Try both ms and s timestamps
+        now_ms = time.time() * 1000
+        cutoff_ms = now_ms - (IDLE_SECS * 1000)
+        cutoff_s  = time.time() - IDLE_SECS
 
-        # Fetch all sessions that haven't been updated recently
         sessions = conn.execute(
-            f"SELECT * FROM session WHERE {ts_col} < ? ORDER BY {ts_col} DESC LIMIT 100",
-            (cutoff,),
+            f"SELECT * FROM session WHERE {ts_col} < ? ORDER BY {ts_col} DESC LIMIT 200",
+            (cutoff_ms,),
         ).fetchall()
-
-        # Also check if the DB stores timestamps in seconds (not ms)
         if not sessions:
-            cutoff_s = time.time() - IDLE_SECS
             sessions = conn.execute(
-                f"SELECT * FROM session WHERE {ts_col} < ? ORDER BY {ts_col} DESC LIMIT 100",
+                f"SELECT * FROM session WHERE {ts_col} < ? ORDER BY {ts_col} DESC LIMIT 200",
                 (cutoff_s,),
             ).fetchall()
 
@@ -345,67 +380,53 @@ def _process_db(db_path: str) -> None:
             if sid in _summarised:
                 continue
 
-            # Check if AI already wrote a summary for this session
-            short_id = sid[:8] if len(sid) >= 8 else sid
-            existing = list(SESSIONS_DIR.glob(f"*_{short_id}.md")) if SESSIONS_DIR.exists() else []
-            if existing:
+            short_id = sid[:8]
+            # Skip if AI already wrote a summary for this session
+            if list(SESSIONS_DIR.glob(f"*_{short_id}.md")):
                 _summarised.add(sid)
                 continue
 
-            # Extract messages if the table exists
-            user_msgs: list[str]       = []
-            assistant_msgs: list[str]  = []
+            user_msgs: list[str]      = []
+            assistant_msgs: list[str] = []
 
             if msg_table:
-                msg_cols = _table_columns(conn, msg_table)
-                session_fk = None
-                for candidate in ("session_id", "sessionId", "conversation_id"):
-                    if candidate in msg_cols:
-                        session_fk = candidate
-                        break
-
-                role_col    = "role"    if "role"    in msg_cols else None
-                content_col = "content" if "content" in msg_cols else None
-                parts_col   = "parts"   if "parts"   in msg_cols else content_col
+                msg_cols   = _table_columns(conn, msg_table)
+                session_fk = next((c for c in ("session_id", "sessionId", "conversation_id") if c in msg_cols), None)
+                role_col   = "role"    if "role"    in msg_cols else None
+                content_col= "content" if "content" in msg_cols else None
 
                 if session_fk and content_col:
-                    messages = conn.execute(
+                    for msg in conn.execute(
                         f"SELECT * FROM {msg_table} WHERE {session_fk} = ? ORDER BY rowid",
                         (sid,),
-                    ).fetchall()
-
-                    for msg in messages:
-                        raw = msg[content_col] if content_col in msg.keys() else ""
-                        text = _extract_text(raw)
+                    ).fetchall():
+                        text = _extract_text(msg[content_col])
                         if not text:
                             continue
-                        role = msg[role_col].lower() if role_col and msg[role_col] else "unknown"
+                        role = (msg[role_col] or "").lower() if role_col else ""
                         if role in ("user", "human"):
                             user_msgs.append(text)
                         elif role in ("assistant", "ai", "model"):
                             assistant_msgs.append(text)
 
-            # Skip short sessions
             if len(user_msgs) < MIN_USER_MSGS:
                 _summarised.add(sid)
                 continue
 
-            title     = session[title_col]  if title_col  else None
-            workspace = session[dir_col]    if dir_col    else None
-            created   = session[created_col] if created_col else 0
-
-            try:
-                created = int(created) if created else 0
-            except (ValueError, TypeError):
-                created = 0
+            created = 0
+            if created_col:
+                try:
+                    created = int(session[created_col] or 0)
+                except (ValueError, TypeError):
+                    pass
 
             _write_summary(
                 session_id=sid,
-                title=title,
-                created_ms=created,
+                title=session[title_col] if title_col else None,
+                created_ts=created,
                 user_messages=user_msgs,
                 assistant_messages=assistant_msgs,
-                workspace=workspace,
+                workspace=session[dir_col] if dir_col else None,
             )
             _summarised.add(sid)
 
@@ -422,15 +443,27 @@ def _process_db(db_path: str) -> None:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    _log(f"Session watcher started (idle_secs={IDLE_SECS}, min_msgs={MIN_USER_MSGS})")
-    _log(f"Writing summaries to: {SESSIONS_DIR}")
+    global _cycle
+    _log(f"Session watcher started  "
+         f"(idle={IDLE_SECS}s, min_msgs={MIN_USER_MSGS}, "
+         f"archive_at={ARCHIVE_THRESH}, keep={ARCHIVE_KEEP})")
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Run archival once on startup to catch any pre-existing overflow
+    _archive_old_sessions()
 
     while True:
         try:
+            _cycle += 1
+
             db = _find_db()
             if db:
                 _process_db(db)
+
+            # Periodic maintenance
+            if _cycle % _ARCHIVE_EVERY_N_CYCLES == 0:
+                _archive_old_sessions()
+
         except Exception as exc:
             _log(f"Main loop error: {exc}")
         time.sleep(POLL_SECS)
