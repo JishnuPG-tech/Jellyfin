@@ -5,8 +5,9 @@
 #    /terminal  → ttyd  :7681  — real PTY bash, mobile-optimised
 #    /          → opencode :8080 — chat UI + REST API + SSE
 #  sshd     :22   (internal only)
-#    ↑ exposed via reverse SSH tunnel through serveo.net
-#      Termius → opencode-hf.serveo.net:22 → here
+#    ↑ exposed via bore transparent TCP tunnel
+#      Termius → bore.pub:PORT → raw TCP → sshd:22
+#      (no SSH interception = full PTY, arrow keys, Ctrl+C, vim)
 #
 set -u
 
@@ -197,106 +198,81 @@ ssh-keygen -A 2>/dev/null || true
 /usr/sbin/sshd
 echo "[SSH] sshd running on port 22."
 
-# ─── Reverse SSH tunnel via serveo.net ───────────────────────────────
-# serveo.net is a free relay — no account, no binary, no tokens.
-# We open an outbound SSH connection (HF allows this) and serveo
-# exposes the tunnel at a public hostname:port.
+# ─── Transparent TCP tunnel via bore ─────────────────────────────────
+# bore forwards raw TCP bytes without touching the SSH protocol.
+# Termius → bore.pub:PORT → raw TCP → sshd:22
+# The SSH handshake happens directly between Termius and sshd — no
+# middleman, so PTY allocation, arrow keys, Ctrl+C, vim all work.
 #
-# Two attempts:
-#   1. Named subdomain: opencode-hf.serveo.net:22  (fixed, easy to remember)
-#   2. Random port:     serveo.net:NNNNN           (fallback)
-#
-SERVEO_LOG=/data/logs/serveo.log
+BORE_LOG=/data/logs/bore.log
 TUNNEL_HOST=""
 TUNNEL_PORT=""
+BORE_PID=""
 
-echo "[TUNNEL] Starting SSH tunnel via serveo.net..."
+echo "[TUNNEL] Starting transparent TCP tunnel via bore..."
+> "${BORE_LOG}"
 
-# Attempt 1 — named subdomain (opencode-hf.serveo.net:22)
-ssh -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null \
-    -o ServerAliveInterval=30 \
-    -o ServerAliveCountMax=6 \
-    -o LogLevel=ERROR \
-    -R opencode-hf:22:localhost:22 \
-    serveo.net > "${SERVEO_LOG}" 2>&1 &
-SERVEO_PID=$!
+bore local 22 --to bore.pub > "${BORE_LOG}" 2>&1 &
+BORE_PID=$!
 
-sleep 8
+# Wait up to 20s for bore to print the assigned port
+for _i in $(seq 1 20); do
+    sleep 1
+    TUNNEL_PORT=$(grep -oE 'bore\.pub:[0-9]+' "${BORE_LOG}" 2>/dev/null \
+        | grep -oE '[0-9]+$' | head -1)
+    [ -n "${TUNNEL_PORT}" ] && break
+done
 
-# Check if named subdomain was accepted
-if kill -0 "${SERVEO_PID}" 2>/dev/null; then
-    # Process still running — tunnel likely up
-    TUNNEL_HOST="opencode-hf.serveo.net"
-    TUNNEL_PORT="22"
-else
-    # Named subdomain taken or serveo refused — try random port
-    echo "[TUNNEL] Named subdomain unavailable, trying random port..."
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ServerAliveInterval=30 \
-        -o ServerAliveCountMax=6 \
-        -o LogLevel=INFO \
-        -R 0:localhost:22 \
-        serveo.net > "${SERVEO_LOG}" 2>&1 &
-    SERVEO_PID=$!
-    sleep 8
-
-    # Parse assigned port from log
-    TUNNEL_PORT=$(grep -oE 'Allocated port [0-9]+' "${SERVEO_LOG}" 2>/dev/null \
-        | grep -oE '[0-9]+' | head -1)
-    if [ -n "${TUNNEL_PORT}" ]; then
-        TUNNEL_HOST="serveo.net"
-    fi
+if [ -n "${TUNNEL_PORT}" ] && kill -0 "${BORE_PID}" 2>/dev/null; then
+    TUNNEL_HOST="bore.pub"
 fi
 
-# Report result
 echo "[TUNNEL] ============================================"
 if [ -n "${TUNNEL_HOST}" ]; then
-    echo "[TUNNEL] SSH tunnel is UP via serveo.net"
+    echo "[TUNNEL] Tunnel type  : bore (transparent TCP — no SSH interception)"
+    echo "[TUNNEL] Status       : UP"
     echo "[TUNNEL] ----"
-    echo "[TUNNEL] Termius host     : ${TUNNEL_HOST}"
-    echo "[TUNNEL] Termius port     : ${TUNNEL_PORT}"
-    echo "[TUNNEL] Termius username : root"
-    echo "[TUNNEL] Termius password : your SSH_PASSWORD secret"
+    echo "[TUNNEL] Termius host : ${TUNNEL_HOST}"
+    echo "[TUNNEL] Termius port : ${TUNNEL_PORT}"
+    echo "[TUNNEL] Termius user : root"
+    echo "[TUNNEL] Termius pass : (your SSH_PASSWORD secret)"
     echo "[TUNNEL] ----"
-    echo "[TUNNEL] Tunnel log : ${SERVEO_LOG}"
+    echo "[TUNNEL] PTY support  : FULL (arrow keys, Ctrl+C, vim, tab completion)"
+    echo "[TUNNEL] Tunnel log   : ${BORE_LOG}"
+    echo "[TUNNEL] ============================================"
+    echo "bore.pub:${TUNNEL_PORT}" > /data/logs/tunnel-url.txt
 
-    # Auto-restart loop in background if tunnel drops
+    # Auto-restart: if bore dies, reconnect and log the new port
     (
+        _bore_pid="${BORE_PID}"
         while true; do
-            sleep 15
-            if ! kill -0 "${SERVEO_PID}" 2>/dev/null; then
-                echo "[TUNNEL] Tunnel dropped — reconnecting..." >> "${SERVEO_LOG}"
-                if [ "${TUNNEL_HOST}" = "opencode-hf.serveo.net" ]; then
-                    ssh -o StrictHostKeyChecking=no \
-                        -o UserKnownHostsFile=/dev/null \
-                        -o ServerAliveInterval=30 \
-                        -o ServerAliveCountMax=6 \
-                        -o LogLevel=ERROR \
-                        -R opencode-hf:22:localhost:22 \
-                        serveo.net >> "${SERVEO_LOG}" 2>&1 &
-                    SERVEO_PID=$!
-                else
-                    ssh -o StrictHostKeyChecking=no \
-                        -o UserKnownHostsFile=/dev/null \
-                        -o ServerAliveInterval=30 \
-                        -o ServerAliveCountMax=6 \
-                        -o LogLevel=ERROR \
-                        -R 0:localhost:22 \
-                        serveo.net >> "${SERVEO_LOG}" 2>&1 &
-                    SERVEO_PID=$!
+            sleep 10
+            if ! kill -0 "${_bore_pid}" 2>/dev/null; then
+                _ts="$(date -u '+%H:%M:%S')"
+                echo "[TUNNEL][${_ts}] bore dropped — reconnecting..." >> "${BORE_LOG}"
+                bore local 22 --to bore.pub >> "${BORE_LOG}" 2>&1 &
+                _bore_pid=$!
+                # Wait for new port
+                for _w in $(seq 1 15); do
+                    sleep 1
+                    _new_port=$(grep -oE 'bore\.pub:[0-9]+' "${BORE_LOG}" 2>/dev/null \
+                        | grep -oE '[0-9]+$' | tail -1)
+                    [ -n "${_new_port}" ] && break
+                done
+                if [ -n "${_new_port}" ]; then
+                    echo "[TUNNEL][$(date -u '+%H:%M:%S')] Reconnected: bore.pub:${_new_port}" >> "${BORE_LOG}"
+                    echo "bore.pub:${_new_port}" > /data/logs/tunnel-url.txt
                 fi
             fi
         done
     ) &
 else
-    echo "[TUNNEL] WARNING: Could not establish tunnel via serveo.net."
-    echo "[TUNNEL] serveo.net may be temporarily down."
-    echo "[TUNNEL] Check ${SERVEO_LOG} for details."
-    echo "[TUNNEL] Terminal at /terminal still works without it."
+    echo "[TUNNEL] FAILED — bore could not connect to bore.pub"
+    echo "[TUNNEL] Bore output:"
+    cat "${BORE_LOG}" 2>/dev/null | sed 's/^/[TUNNEL]   /'
+    echo "[TUNNEL] Terminal at /terminal still works."
+    echo "[TUNNEL] ============================================"
 fi
-echo "[TUNNEL] ============================================"
 
 # ─── Start DB self-healing daemon ────────────────────────────────────
 echo "[CLEANER] Starting self-healing daemon..."

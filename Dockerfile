@@ -3,8 +3,8 @@
 ##   /terminal → ttyd on :7681 (real PTY bash)
 ##   /         → opencode on :8080 (chat UI + API)
 ##
-## SSH access: sshd on :22 (internal) reached via reverse tunnel
-## to a Fly.io jump server. No inbound tunnel services used.
+## SSH access: sshd on :22 (internal) reached via bore transparent TCP tunnel.
+## bore.pub:PORT → raw TCP → sshd:22  (no SSH interception → full PTY support)
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -20,16 +20,20 @@ ENV PORT=7860
 
 ARG OPENCODE_VERSION=1.18.3
 ARG TTYD_VERSION=1.7.7
+ARG BORE_VERSION=0.6.0
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git gnupg python3 python3-pip nginx \
-      openssh-server openssh-client \
+      openssh-server \
  && curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" \
       | tar -xz -C /usr/local/bin opencode \
  && chmod +x /usr/local/bin/opencode \
  && curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" \
       -o /usr/local/bin/ttyd \
  && chmod +x /usr/local/bin/ttyd \
+ && curl -fsSL "https://github.com/ekzhang/bore/releases/download/v${BORE_VERSION}/bore-v${BORE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /usr/local/bin bore \
+ && chmod +x /usr/local/bin/bore \
  && mkdir -p /var/run/sshd \
  && rm -rf /var/lib/apt/lists/*
 
