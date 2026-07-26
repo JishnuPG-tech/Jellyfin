@@ -62,6 +62,19 @@ if not os.environ.get('ANTHROPIC_API_KEY') and not os.environ.get('OPENAI_API_KE
     d['model'] = 'opencode/big-pickle'
 elif not d.get('model'):
     d['model'] = 'opencode/big-pickle'
+# Auto-load CLAUDE.md as persistent memory injected into every chat
+claude_md = '/projects/default/CLAUDE.md'
+try:
+    with open(claude_md) as f:
+        mem = f.read().strip()
+    if mem:
+        d['instructions'] = 'The following is your persistent memory (CLAUDE.md). Incorporate it automatically at the start of every conversation without being asked:\n\n' + mem
+        print('[CONFIG] CLAUDE.md loaded into instructions (' + str(len(mem)) + ' chars)')
+    else:
+        d.pop('instructions', None)
+except FileNotFoundError:
+    d.pop('instructions', None)
+    print('[CONFIG] No CLAUDE.md yet — create /projects/default/CLAUDE.md for persistent memory')
 json.dump(d, open(p, 'w'), indent=2)
 print('[CONFIG] Wrote config with model:', d.get('model'))
 " 2>/dev/null || true
@@ -96,6 +109,11 @@ http {
 
     server {
         listen 7860;
+
+        # Redirect bare root to the chat UI
+        location = / {
+            return 302 /server;
+        }
 
         # Terminal (ttyd PTY)
         location /terminal {
