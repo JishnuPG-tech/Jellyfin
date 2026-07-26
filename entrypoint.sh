@@ -133,12 +133,32 @@ PasswordAuthentication yes
 PubkeyAuthentication yes
 AuthorizedKeysFile /root/.ssh/authorized_keys
 ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 UsePAM no
 X11Forwarding no
 PrintMotd no
-AcceptEnv LANG LC_*
+PermitTTY yes
+AllowTcpForwarding yes
+AcceptEnv LANG LC_* TERM
 Subsystem sftp /usr/lib/openssh/sftp-server
 SSHD_CONF
+
+# Ensure root uses bash as login shell
+chsh -s /bin/bash root 2>/dev/null || true
+
+# Minimal .bashrc so interactive sessions get a working prompt
+cat > /root/.bashrc << 'BASHRC'
+export PS1='\u@opencode:\w\$ '
+export TERM=${TERM:-xterm-256color}
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+alias ll='ls -la'
+cd /projects/default 2>/dev/null || true
+BASHRC
+
+# Minimal .bash_profile that sources .bashrc
+cat > /root/.bash_profile << 'BASH_PROFILE'
+[ -f /root/.bashrc ] && source /root/.bashrc
+BASH_PROFILE
 
 if [ -n "${SSH_PASSWORD:-}" ]; then
     echo "root:${SSH_PASSWORD}" | chpasswd
