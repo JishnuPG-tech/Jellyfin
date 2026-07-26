@@ -126,6 +126,16 @@ echo "[NGINX] Started."
 # ─── SSH server ──────────────────────────────────────────────────────
 echo "[SSH] Configuring sshd..."
 
+# SSH banner — shown immediately on connect, before any shell
+cat > /etc/ssh/banner << 'BANNER'
+
+  ╔══════════════════════════════════════╗
+  ║      OpenCode SSH — connected        ║
+  ║  Type commands normally. Have fun!   ║
+  ╚══════════════════════════════════════╝
+
+BANNER
+
 cat > /etc/ssh/sshd_config << 'SSHD_CONF'
 Port 22
 PermitRootLogin yes
@@ -139,26 +149,37 @@ X11Forwarding no
 PrintMotd no
 PermitTTY yes
 AllowTcpForwarding yes
-AcceptEnv LANG LC_* TERM
+Banner /etc/ssh/banner
+AcceptEnv LANG LC_* TERM COLORTERM
 Subsystem sftp /usr/lib/openssh/sftp-server
 SSHD_CONF
 
-# Ensure root uses bash as login shell
-chsh -s /bin/bash root 2>/dev/null || true
+# Pin root's shell to bash directly in /etc/passwd (most reliable)
+sed -i 's|^root:x:0:0:root:/root:.*|root:x:0:0:root:/root:/bin/bash|' /etc/passwd
+echo "[SSH] root shell: $(grep ^root /etc/passwd | cut -d: -f7)"
 
-# Minimal .bashrc so interactive sessions get a working prompt
+# Write .bashrc — sourced for interactive non-login shells
 cat > /root/.bashrc << 'BASHRC'
-export PS1='\u@opencode:\w\$ '
-export TERM=${TERM:-xterm-256color}
+export PS1='\[\e[32m\]\u@opencode\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]\$ '
+export TERM="${TERM:-xterm-256color}"
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-alias ll='ls -la'
+alias ll='ls -la --color=auto'
+alias ls='ls --color=auto'
+echo ""
+echo "  OpenCode workspace: /projects/default"
+echo "  Type 'opencode' to launch the TUI, or work normally."
+echo ""
 cd /projects/default 2>/dev/null || true
 BASHRC
 
-# Minimal .bash_profile that sources .bashrc
+# Write .bash_profile — sourced for login shells (SSH always uses this)
 cat > /root/.bash_profile << 'BASH_PROFILE'
+# SSH login shell entry point
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 [ -f /root/.bashrc ] && source /root/.bashrc
 BASH_PROFILE
+
+chmod 644 /root/.bashrc /root/.bash_profile /etc/ssh/banner
 
 if [ -n "${SSH_PASSWORD:-}" ]; then
     echo "root:${SSH_PASSWORD}" | chpasswd
