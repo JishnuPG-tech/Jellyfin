@@ -151,11 +151,15 @@ export function getSessionTodos(id: string): Promise<Todo[]> {
 // ── Messages ──
 
 export function getMessages(sessionId: string): Promise<Message[]> {
-  return request(`/session/${sessionId}/message`);
+  return request<unknown>(`/session/${sessionId}/message`).then((raw) =>
+    normalizeMessageList(raw)
+  );
 }
 
 export function getMessage(sessionId: string, messageId: string): Promise<Message> {
-  return request(`/session/${sessionId}/message/${messageId}`);
+  return request<unknown>(`/session/${sessionId}/message/${messageId}`).then(
+    (raw) => normalizeMessage(raw) as Message
+  );
 }
 
 export function deleteMessage(sessionId: string, messageId: string): Promise<void> {
@@ -386,8 +390,8 @@ export async function subscribeEvents(
   const base = getServerUrl();
   const authHeaders = getAuthHeader();
   const url = sessionId
-    ? `${base}/session/${sessionId}/event`
-    : `${base}/event`;
+    ? `${base}/api/session/${sessionId}/event`
+    : `${base}/api/event`;
 
   const res = await fetch(url, {
     headers: { Accept: "text/event-stream", ...authHeaders },
@@ -410,25 +414,78 @@ export function parseSSELines(
   const remaining = lines.pop() || "";
 
   let eventType = "";
-  let eventData = "";
+  const dataLines: string[] = [];
 
-  for (const line of lines) {
-    if (line.startsWith("event: ")) {
-      eventType = line.slice(7).trim();
-    } else if (line.startsWith("data: ")) {
-      eventData = line.slice(6);
-    } else if (line === "") {
-      if (eventType && eventData) {
-        try {
-          events.push(JSON.parse(eventData) as ServerEvent);
-        } catch {
-          // skip malformed
-        }
-      }
+  const dispatch = () => {
+    if (dataLines.length === 0) {
       eventType = "";
-      eventData = "";
+      return;
     }
+    const data = dataLines.join("\n");
+    dataLines.length = 0;
+    const type = eventType;
+    eventType = "";
+    // OpenCode emits `data: {...}` without an `event:` line. Accept both:
+    // standard SSE (event + data) and OpenCode (data only, type on payload).
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === "object") {
+        if (!parsed.type && type) parsed.type = type;
+        events.push(parsed as ServerEvent);
+      }
+    } catch {
+      // skip malformed
+    }
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line === "") {
+      dispatch();
+      continue;
+    }
+    if (line.startsWith(":")) continue; // SSE comment / keep-alive
+    if (line.startsWith("event:")) {
+      eventType = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      // A single leading space after the colon is part of the SSE framing.
+      const v = line.slice(5);
+      dataLines.push(v.startsWith(" ") ? v.slice(1) : v);
+    }
+    // ignore other fields (id:, retry:)
   }
 
   return { events, remaining };
+}
+
+// ── Message normalization ──
+//
+// OpenCode returns messages shaped as { info: { id, role, ... }, parts: [...] }.
+// The rest of the app expects a flat Message { id, role, parts, ... }.
+// Normalize once at the API boundary and inside SSE event handling.
+
+type RawMessage = {
+  info?: Record<string, unknown> & { id?: string; role?: string };
+  parts?: unknown[];
+  id?: string;
+  role?: string;
+};
+
+export function normalizeMessage(raw: unknown): Message {
+  const r = (raw ?? {}) as RawMessage;
+  if (r && r.info && typeof r.info === "object") {
+    return {
+      ...(r.info as object),
+      parts: (r.parts as MessagePart[]) ?? [],
+    } as Message;
+  }
+  return {
+    ...(r as object),
+    parts: ((r.parts as MessagePart[]) ?? []) as MessagePart[],
+  } as Message;
+}
+
+export function normalizeMessageList(raw: unknown): Message[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((m) => normalizeMessage(m));
 }

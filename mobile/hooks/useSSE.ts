@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { subscribeEvents, parseSSELines } from "../lib/api";
+import { subscribeEvents, parseSSELines, normalizeMessage } from "../lib/api";
 import type { ServerEvent, Message, MessagePart } from "../constants/types";
 
 export interface SSEState {
@@ -109,7 +109,7 @@ export function getLatestAssistantMessage(events: ServerEvent[]): Message | null
   for (let i = events.length - 1; i >= 0; i--) {
     const ev = events[i];
     if (ev.type === "message.created" || ev.type === "message.updated") {
-      const msg = ev.properties as Message;
+      const msg = normalizeMessage(ev.properties);
       if (msg.role === "assistant") return msg;
     }
   }
@@ -122,14 +122,16 @@ export function getMessagesFromEvents(events: ServerEvent[]): Message[] {
 
   for (const ev of events) {
     if (ev.type === "message.created") {
-      const msg = ev.properties as Message;
-      map.set(msg.id, msg);
+      const msg = normalizeMessage(ev.properties);
+      if (msg.id) map.set(msg.id, msg);
     } else if (ev.type === "message.updated") {
-      const partial = ev.properties as Partial<Message> & { id: string };
+      const partial = normalizeMessage(ev.properties);
+      if (!partial.id) continue;
       const existing = map.get(partial.id);
-      if (existing) {
-        map.set(partial.id, { ...existing, ...partial });
-      }
+      map.set(
+        partial.id,
+        existing ? { ...existing, ...partial, parts: partial.parts?.length ? partial.parts : existing.parts } : partial
+      );
     } else if (ev.type === "message.part.updated") {
       const { messageID, part } = ev.properties as {
         messageID: string;
@@ -138,10 +140,18 @@ export function getMessagesFromEvents(events: ServerEvent[]): Message[] {
       };
       const existing = map.get(messageID);
       if (existing) {
-        const partIdx = existing.parts.findIndex(
-          (p) => JSON.stringify(p) === JSON.stringify(part)
-        );
-        const newParts = [...existing.parts];
+        const existingParts = existing.parts ?? [];
+        // Prefer stable identity (part.id / callID) over deep equality — the
+        // latter never matched a streaming, growing part and duplicated it.
+        const partId = (part as { id?: string; callID?: string }).id
+          ?? (part as { callID?: string }).callID;
+        const partIdx = partId
+          ? existingParts.findIndex(
+              (p) => ((p as { id?: string; callID?: string }).id
+                ?? (p as { callID?: string }).callID) === partId
+            )
+          : -1;
+        const newParts = [...existingParts];
         if (partIdx >= 0) {
           newParts[partIdx] = part;
         } else {
