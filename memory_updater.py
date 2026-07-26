@@ -45,10 +45,11 @@ from pathlib import Path
 from typing import Optional
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-WORKSPACE    = Path("/projects/default")
-MEMORY_DIR   = WORKSPACE / "memory"
-SESSIONS_DIR = MEMORY_DIR / "sessions"
-CONFIG_PATH  = Path("/data/config/opencode/opencode.json")
+WORKSPACE      = Path("/projects/default")
+MEMORY_DIR     = WORKSPACE / "memory"
+SESSIONS_DIR   = MEMORY_DIR / "sessions"
+CONFIG_PATH    = Path("/data/config/opencode/opencode.json")
+ASSEMBLED_PATH = MEMORY_DIR / "ASSEMBLED.md"   # instructions written here; path injected into config
 
 # ── Character budgets ─────────────────────────────────────────────────────────
 TOTAL_BUDGET        = 10_000   # hard cap for the whole instructions field
@@ -569,24 +570,114 @@ def _assemble_instructions() -> str:
 
 # ── Config writer ─────────────────────────────────────────────────────────────
 
-def _update_config(instructions: str) -> bool:
-    try:
-        d: dict = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
-    except Exception:
-        d = {}
-
-    old = d.get("instructions", "")
-    if instructions:
-        d["instructions"] = instructions
+def _validate_config(d: dict) -> tuple[bool, str]:
+    """
+    Lightweight schema check that mirrors OpenCode's Zod validation rules.
+    OpenCode 1.18.3+: instructions must be array[string] | undefined.
+    A memory update must NEVER produce an invalid config.
+    """
+    instr = d.get("instructions")
+    if instr is None:
+        pass  # optional → OK
+    elif not isinstance(instr, list):
+        return False, (
+            f"instructions must be array or absent, got {type(instr).__name__!r} "
+            f"(value={str(instr)[:80]!r})"
+        )
     else:
-        d.pop("instructions", None)
+        for i, item in enumerate(instr):
+            if not isinstance(item, str):
+                return False, (
+                    f"instructions[{i}] must be str, got {type(item).__name__!r}"
+                )
+    server = d.get("server")
+    if server is not None and not isinstance(server, dict):
+        return False, f"server must be object, got {type(server).__name__!r}"
+    return True, "OK"
 
-    if d.get("instructions", "") == old:
+
+def _update_config(instructions: str) -> bool:
+    """
+    Production-safe config-update pipeline:
+
+      1. Write assembled instructions text → ASSEMBLED.md (atomic rename)
+      2. Read existing opencode.json        (preserve ALL existing settings)
+      3. Set instructions = [str(ASSEMBLED_PATH)]
+         (array of file paths — OpenCode reads each file as system prompt)
+      4. Validate the new config against the known schema
+      5a. Valid   → atomic write to opencode.json
+      5b. Invalid → restore backup, log error, return False
+
+    A memory update must NEVER prevent OpenCode from starting.
+    If anything fails, the previous working config is preserved.
+    """
+    # ── 1. Write assembled instructions to the markdown file (atomic) ──
+    ASSEMBLED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_md = ASSEMBLED_PATH.with_suffix(".tmp")
+    try:
+        tmp_md.write_text(instructions, encoding="utf-8")
+        tmp_md.replace(ASSEMBLED_PATH)   # atomic on POSIX (same fs)
+        _log(f"  ASSEMBLED.md  {len(instructions):,} chars written")
+    except Exception as exc:
+        _log(f"[ERROR] Could not write {ASSEMBLED_PATH}: {exc}")
         return False
 
+    # ── 2. Read existing config (preserve all keys) ────────────────────
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(d, indent=2), encoding="utf-8")
-    return True
+    try:
+        existing_text = (
+            CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else "{}"
+        )
+        d: dict = json.loads(existing_text)
+    except Exception as exc:
+        _log(f"[WARN] Unreadable existing config ({exc}) — starting fresh")
+        existing_text = "{}"
+        d = {}
+
+    # ── 3. Backup existing config ──────────────────────────────────────
+    backup_path = CONFIG_PATH.with_suffix(".json.bak")
+    try:
+        backup_path.write_text(existing_text, encoding="utf-8")
+    except Exception as exc:
+        _log(f"[WARN] Backup failed: {exc}")
+
+    # ── 4. Inject instructions file-path reference ─────────────────────
+    new_instr: list[str] = [str(ASSEMBLED_PATH)]
+    if d.get("instructions") == new_instr:
+        # Pointer unchanged; ASSEMBLED.md content updated above — done.
+        _log("instructions pointer unchanged — config rewrite skipped")
+        return False
+    d["instructions"] = new_instr
+
+    # ── 5. Validate ────────────────────────────────────────────────────
+    ok, reason = _validate_config(d)
+    if not ok:
+        _log(f"[ERROR] Validation failed: {reason}")
+        _log("[ROLLBACK] Restoring previous config from backup…")
+        try:
+            CONFIG_PATH.write_text(existing_text, encoding="utf-8")
+            _log("[ROLLBACK] Previous config restored — OpenCode will start safely")
+        except Exception as re_exc:
+            _log(f"[ROLLBACK ERROR] Could not restore: {re_exc}")
+        return False
+
+    # ── 6. Atomic write ────────────────────────────────────────────────
+    tmp_cfg = CONFIG_PATH.with_suffix(".json.tmp")
+    new_text = json.dumps(d, indent=2)
+    try:
+        tmp_cfg.write_text(new_text, encoding="utf-8")
+        tmp_cfg.replace(CONFIG_PATH)     # atomic rename
+        _log(f'[OK] Config updated — instructions → ["{ASSEMBLED_PATH.name}"]')
+        return True
+    except Exception as exc:
+        _log(f"[ERROR] Atomic write failed: {exc}")
+        _log("[ROLLBACK] Restoring previous config…")
+        try:
+            CONFIG_PATH.write_text(existing_text, encoding="utf-8")
+            _log("[ROLLBACK] Previous config restored")
+        except Exception as re_exc:
+            _log(f"[ROLLBACK ERROR] Could not restore: {re_exc}")
+        return False
 
 
 # ── Change fingerprint ────────────────────────────────────────────────────────
