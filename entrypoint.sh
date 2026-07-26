@@ -62,22 +62,17 @@ if not os.environ.get('ANTHROPIC_API_KEY') and not os.environ.get('OPENAI_API_KE
     d['model'] = 'opencode/big-pickle'
 elif not d.get('model'):
     d['model'] = 'opencode/big-pickle'
-# Auto-load CLAUDE.md as persistent memory injected into every chat
-claude_md = '/projects/default/CLAUDE.md'
-try:
-    with open(claude_md) as f:
-        mem = f.read().strip()
-    if mem:
-        d['instructions'] = 'The following is your persistent memory (CLAUDE.md). Incorporate it automatically at the start of every conversation without being asked:\n\n' + mem
-        print('[CONFIG] CLAUDE.md loaded into instructions (' + str(len(mem)) + ' chars)')
-    else:
-        d.pop('instructions', None)
-except FileNotFoundError:
-    d.pop('instructions', None)
-    print('[CONFIG] No CLAUDE.md yet — create /projects/default/CLAUDE.md for persistent memory')
 json.dump(d, open(p, 'w'), indent=2)
-print('[CONFIG] Wrote config with model:', d.get('model'))
-" 2>/dev/null || true
+print('[CONFIG] Wrote base config with model:', d.get('model'))
+" || true
+
+# ─── Load persistent memory (CLAUDE.md → opencode.json instructions) ─────────
+# memory_updater.py reads CLAUDE.md (and future files like PROJECT.md, MEMORY.md)
+# from /projects/default and writes them as the OpenCode `instructions` field —
+# a system-level prompt injected into every new conversation automatically.
+echo "[MEMORY] Loading persistent memory from workspace..."
+python3 /memory_updater.py once
+
 echo "[CONFIG] Current configuration:"
 cat /data/config/opencode/opencode.json 2>/dev/null || echo "{}"
 
@@ -110,9 +105,12 @@ http {
     server {
         listen 7860;
 
-        # Redirect bare root to the chat UI
+        # Root: serve OpenCode chat UI directly.
+        # Returns 200 with a client-side redirect so HF Spaces iframe proxies
+        # (which may swallow HTTP 3xx responses) still land on the chat.
         location = / {
-            return 302 /server;
+            default_type text/html;
+            return 200 '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OpenCode</title><script>window.location.replace("/server")</script><meta http-equiv="refresh" content="0;url=/server"></head><body style="margin:0;background:#09090b;color:#a1a1aa;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><p>Loading OpenCode...</p></body></html>';
         }
 
         # Terminal (ttyd PTY)
@@ -300,6 +298,17 @@ python3 /cleaner.py &
 echo "[SYNC] Starting background sync daemon..."
 python3 /sync_engine.py watch 2>&1 | tee -a /data/logs/sync.log &
 echo "[SYNC] Sync daemon started. Logs: /data/logs/sync.log"
+
+# ─── Start memory live-watcher ────────────────────────────────────────
+# Polls CLAUDE.md (and any files listed in MEMORY_FILES in memory_updater.py)
+# every 15 seconds.  When a file changes, opencode.json is updated so that
+# the NEXT new session picks up the fresh content automatically.
+#
+# To add future memory files (PROJECT.md, MEMORY.md, TEAM.md, RULES.md,
+# AGENTS.md …) uncomment the relevant lines inside memory_updater.py.
+echo "[MEMORY] Starting memory live-watcher..."
+python3 /memory_updater.py watch 2>&1 | tee -a /data/logs/memory.log &
+echo "[MEMORY] Live-watcher started. Logs: /data/logs/memory.log"
 
 # ─── Ensure project dir exists ───────────────────────────────────────
 mkdir -p /projects/default
