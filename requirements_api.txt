@@ -1,0 +1,7 @@
+# Hermes App API Server - extra dependencies
+# Install alongside hermes-agent
+fastapi>=0.110.0,<1
+uvicorn[standard]>=0.29.0,<1
+python-dotenv>=1.0.0,<2
+aiohttp>=3.9.0,<4
+sse-starlette>=2.0.0,<3
