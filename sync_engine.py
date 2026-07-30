@@ -72,6 +72,10 @@ IGNORE_NAMES: set[str] = {
     ".pip",
     "dist",
     "build",
+    # Databases (ephemeral - auto-initialized on instance)
+    "opencode.db",
+    "opencode.db-wal",
+    "opencode.db-shm",
     # Android / SDK
     ".android",
     ".gradle",
