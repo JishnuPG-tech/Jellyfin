@@ -183,15 +183,23 @@ DB_PATH="/data/share/opencode/opencode.db"
 if [ -f "$DB_PATH" ]; then
     echo "[DB] Found database at $DB_PATH"
     python3 -c "
-import sqlite3
+import sqlite3, os, glob
 try:
     conn = sqlite3.connect('$DB_PATH', timeout=5)
     row = conn.execute('PRAGMA integrity_check').fetchone()
     conn.close()
-    print('[DB] Integrity:', row[0] if row else 'error')
+    if not row or row[0] != 'ok':
+        raise ValueError(f'Integrity check failed: {row}')
+    print('[DB] Integrity check passed: OK')
 except Exception as e:
-    print('[DB] Error:', e)
-" 2>/dev/null || echo "[DB] Could not read database"
+    print(f'[DB] Error: {e} — removing corrupt database files')
+    for f in glob.glob('$DB_PATH*'):
+        try:
+            os.remove(f)
+            print(f'[DB] Removed corrupt file: {f}')
+        except Exception as ex:
+            print(f'[DB] Failed to remove {f}: {ex}')
+" 2>/dev/null || echo "[DB] Could not check database"
 else
     echo "[DB] No database found (fresh start)"
 fi

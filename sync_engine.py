@@ -97,6 +97,7 @@ IGNORE_PREFIXES: tuple[str, ...] = (
 IGNORE_SUFFIXES: set[str] = {
     ".tmp", ".sock", ".pid", ".lock", ".pyc",
     ".log", ".bak", ".swp", ".swo",
+    ".db-wal", ".db-shm",
 }
 
 MAX_FILE_BYTES          = 50 * 1_024 * 1_024   # 50 MB hard limit per file
