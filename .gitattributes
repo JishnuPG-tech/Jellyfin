@@ -35,3 +35,6 @@ skills/research/research-paper-writing/templates/colm2025/colm2025_conference.pd
 skills/research/research-paper-writing/templates/iclr2026/iclr2026_conference.pdf filter=lfs diff=lfs merge=lfs -text
 skills/research/research-paper-writing/templates/icml2026/example_paper.pdf filter=lfs diff=lfs merge=lfs -text
 sqlite_leak_fix.png filter=lfs diff=lfs merge=lfs -text
+tools/neutts_samples/jo.wav filter=lfs diff=lfs merge=lfs -text
+tools/wakewords/hey_hermes.onnx filter=lfs diff=lfs merge=lfs -text
+tools/wakewords/hey_hermes.tflite filter=lfs diff=lfs merge=lfs -text
