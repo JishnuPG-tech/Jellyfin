@@ -1,0 +1,68 @@
+name: Keep Render Service Alive 24/7
+
+on:
+  schedule:
+    # Run every 5 minutes as backup to UptimeRobot
+    # NOTE: GitHub may delay these by up to 1 hour — use UptimeRobot as primary
+    - cron: '*/5 * * * *'
+  # Also trigger on every push so a deploy immediately wakes the service
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ping:
+    name: Ping Render Health Endpoint
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Ping service (with retries)
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+        run: |
+          TARGET="${RENDER_URL:-https://myhermesagent.onrender.com}"
+
+          echo "🏓 Pinging: $TARGET"
+          echo "🕐 Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          SUCCESS=false
+          for i in 1 2 3; do
+            echo "--- Attempt $i/3 ---"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 30 \
+              --connect-timeout 15 \
+              "$TARGET" 2>&1)
+
+            echo "HTTP Status: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "301" ] || [ "$HTTP_CODE" = "302" ]; then
+              echo "✅ Service is alive! (HTTP $HTTP_CODE)"
+              SUCCESS=true
+              break
+            else
+              echo "⚠️  Got HTTP $HTTP_CODE — retrying in 10s..."
+              sleep 10
+            fi
+          done
+
+          if [ "$SUCCESS" = "true" ]; then
+            echo "🟢 Render service is UP."
+          else
+            echo "🔴 Service may be cold-starting. UptimeRobot will handle it."
+          fi
+        continue-on-error: true
+
+      - name: Follow-up ping (confirms warm state)
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+        run: |
+          TARGET="${RENDER_URL:-https://myhermesagent.onrender.com}"
+          echo "🔄 Follow-up ping after 20s..."
+          sleep 20
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 15 \
+            --connect-timeout 10 \
+            "$TARGET" 2>&1)
+          echo "✅ Follow-up status: HTTP $HTTP_CODE"
+        continue-on-error: true

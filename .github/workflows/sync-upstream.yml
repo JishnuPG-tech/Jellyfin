@@ -1,0 +1,151 @@
+name: Sync Upstream Hermes + Deploy to Render & HF Space
+
+on:
+  schedule:
+    - cron: '30 19 * * *'   # 1:00 AM IST daily (19:30 UTC)
+  workflow_dispatch:
+    inputs:
+      force_merge:
+        description: 'Force merge even if no upstream changes'
+        required: false
+        default: 'false'
+
+jobs:
+  sync-and-deploy:
+    name: Sync Upstream → GitHub → Render + HF Space
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────
+      - name: Checkout MyHermesAgent
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+          lfs: true
+
+      # ── 2. Configure Git ──────────────────────────────────
+      - name: Configure Git
+        run: |
+          git config user.name  "Hermes Auto-Sync Bot"
+          git config user.email "bot@hermes-sync.local"
+
+      # ── 3. Fetch upstream ─────────────────────────────────
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
+          git fetch upstream main --tags
+
+      # ── 4. Check for upstream changes ─────────────────────
+      - name: Check for upstream changes
+        id: check
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          LOCAL_SHA=$(git rev-parse HEAD)
+          echo "upstream_sha=$UPSTREAM_SHA" >> $GITHUB_OUTPUT
+          echo "local_sha=$LOCAL_SHA"       >> $GITHUB_OUTPUT
+          if [ "$UPSTREAM_SHA" = "$LOCAL_SHA" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  No new upstream commits."
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "✅ New upstream commits found:"
+            git log --oneline $LOCAL_SHA..upstream/main | head -20
+          fi
+
+      # ── 5. Merge upstream (protect custom files) ──────────
+      - name: Merge upstream
+        if: steps.check.outputs.has_changes == 'true' || github.event.inputs.force_merge == 'true'
+        run: |
+          echo "💾 Saving custom files..."
+          cp hermes_app_api.py    /tmp/hermes_app_api.py.bak
+          cp Dockerfile.render    /tmp/Dockerfile.render.bak
+          cp requirements_api.txt /tmp/requirements_api.txt.bak 2>/dev/null || true
+
+          git merge upstream/main --no-edit --strategy-option=theirs \
+            -m "chore: sync upstream NousResearch/hermes-agent $(date +%Y-%m-%d)" || {
+            git checkout HEAD -- hermes_app_api.py Dockerfile.render requirements_api.txt 2>/dev/null || true
+            git add .
+            git commit --no-edit -m "chore: sync upstream + preserve custom API files $(date +%Y-%m-%d)"
+          }
+
+          echo "🔄 Restoring custom files..."
+          cp /tmp/hermes_app_api.py.bak    hermes_app_api.py
+          cp /tmp/Dockerfile.render.bak    Dockerfile.render
+          cp /tmp/requirements_api.txt.bak requirements_api.txt 2>/dev/null || true
+
+          git add hermes_app_api.py Dockerfile.render requirements_api.txt
+          git diff --cached --quiet || git commit -m "chore: restore custom API files after sync"
+          echo "✅ Merge complete."
+
+      # ── 6. Push to GitHub → triggers Render auto-deploy ───
+      - name: Push to GitHub
+        if: steps.check.outputs.has_changes == 'true' || github.event.inputs.force_merge == 'true'
+        run: |
+          git push origin main --tags
+          echo "✅ GitHub push done. Render will redeploy in ~2 min."
+
+      # ── 7. Deploy to HF Space via huggingface_hub API ─────
+      - name: Deploy to Hugging Face Space
+        if: always()
+        env:
+          HF_TOKEN:    ${{ secrets.HF_TOKEN }}
+          HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
+        run: |
+          if [ -z "$HF_TOKEN" ] || [ -z "$HF_SPACE_ID" ]; then
+            echo "⚠️  HF_TOKEN or HF_SPACE_ID not set — skipping."
+            exit 0
+          fi
+
+          echo "📦 Installing huggingface_hub..."
+          pip install -q huggingface_hub
+
+          echo "🤗 Uploading to HF Space: $HF_SPACE_ID"
+
+          python3 << 'PYEOF'
+          import os, sys
+          from huggingface_hub import HfApi
+
+          token    = os.environ["HF_TOKEN"]
+          space_id = os.environ["HF_SPACE_ID"]
+
+          api = HfApi(token=token)
+
+          # Files/dirs to skip when uploading to HF Space
+          ignore = [
+              "*.pyc", "**/__pycache__/**", "**/.git/**",
+              "**/node_modules/**", "**/.venv/**", "**/venv/**",
+              "**/.pytest_cache/**", "**/*.egg-info/**",
+              "**/hermes_app/**",          # Android app build artifacts
+              "**/hermes-agentic-unique/**",
+              "**/.plans/**", "**/.hub/**",
+              "uv.lock",                   # Large lockfile
+          ]
+
+          print(f"📤 Uploading workspace to space: {space_id}")
+          api.upload_folder(
+              folder_path=".",
+              repo_id=space_id,
+              repo_type="space",
+              ignore_patterns=ignore,
+              commit_message=f"chore: auto-deploy from GitHub Actions",
+          )
+          print(f"✅ Upload complete! Space will rebuild now.")
+          print(f"🔗 https://huggingface.co/spaces/{space_id}")
+          PYEOF
+
+      # ── 8. Summary ────────────────────────────────────────
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "  HERMES SYNC PIPELINE SUMMARY"
+          echo "════════════════════════════════════════"
+          echo "  Upstream: NousResearch/hermes-agent"
+          echo "  GitHub:   JishnuPG-tech/MyHermesAgent"
+          echo "  Render:   https://myhermesagent.onrender.com"
+          echo "  HF Space: https://huggingface.co/spaces/${{ secrets.HF_SPACE_ID }}"
+          echo "  Run at:   $(date -u '+%Y-%m-%d %H:%M UTC')"
+          echo "════════════════════════════════════════"
