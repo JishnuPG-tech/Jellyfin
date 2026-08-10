@@ -28,3 +28,7 @@ gateway/assets/telegram-botfather-threads-settings.jpg filter=lfs diff=lfs merge
 optional-skills/security/unbroker/assets/unbroker.png filter=lfs diff=lfs merge=lfs -text
 plugins/hermes-achievements/docs/assets/achievements-dashboard-hd.png filter=lfs diff=lfs merge=lfs -text
 plugins/hermes-achievements/docs/assets/achievements-tier-showcase-hd.png filter=lfs diff=lfs merge=lfs -text
+skills/research/research-paper-writing/templates/colm2025/colm2025_conference.pdf filter=lfs diff=lfs merge=lfs -text
+skills/research/research-paper-writing/templates/iclr2026/iclr2026_conference.pdf filter=lfs diff=lfs merge=lfs -text
+skills/research/research-paper-writing/templates/icml2026/example_paper.pdf filter=lfs diff=lfs merge=lfs -text
+sqlite_leak_fix.png filter=lfs diff=lfs merge=lfs -text
