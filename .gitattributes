@@ -8,3 +8,9 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+apps/bootstrap-installer/src-tauri/icons/128x128.png filter=lfs diff=lfs merge=lfs -text
+apps/bootstrap-installer/src-tauri/icons/128x128@2x.png filter=lfs diff=lfs merge=lfs -text
+apps/bootstrap-installer/src-tauri/icons/32x32.png filter=lfs diff=lfs merge=lfs -text
+apps/bootstrap-installer/src-tauri/icons/icon.icns filter=lfs diff=lfs merge=lfs -text
+apps/desktop/assets/icon.icns filter=lfs diff=lfs merge=lfs -text
+apps/desktop/assets/icon.png filter=lfs diff=lfs merge=lfs -text
