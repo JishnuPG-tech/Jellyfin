@@ -7,5 +7,5 @@ sdk: docker
 pinned: false
 ---
 
-# MyHermes Space
+# MyHermes
 Clean Hugging Face Space repository.
