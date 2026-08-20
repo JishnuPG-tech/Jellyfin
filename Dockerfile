@@ -3,7 +3,7 @@
 # Optimized for Hugging Face Spaces Free Tier (2 vCPU, 16 GB RAM, 50 GB Disk)
 # ==============================================================================
 
-# Stage 1: Get clean, standalone Caddy binary (no package manager / apt dependencies)
+# Stage 1: Get clean, standalone Caddy binary
 FROM caddy:2-alpine AS caddy-source
 
 # Stage 2: Main Stirling-PDF runtime
@@ -15,24 +15,50 @@ USER root
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
 RUN chmod +x /usr/local/bin/caddy
 
-# Set up working directory & storage
+# Set up working directory, directories & permissions
 WORKDIR /app
 RUN mkdir -p /app/portal \
+    /home/stirlingpdfuser \
     /tmp/caddy/data \
     /tmp/caddy/config \
     /tmp/stirling-pdf \
     /tmp/stirling-pdf/heap_dumps \
-    /configs /logs /customFiles /pipeline /storage
+    /tmp/stirling-pdf/libre \
+    /configs /logs /customFiles /pipeline /storage \
+    /usr/share/tessdata /usr/share/tesseract-ocr/5/tessdata \
+    /usr/local/bin
+
+# Pre-create Stirling diagnostic symlinks during build
+RUN if [ -f /scripts/stirling-diagnostics.sh ]; then \
+        ln -sf /scripts/stirling-diagnostics.sh /usr/local/bin/diagnostics && \
+        ln -sf /scripts/stirling-diagnostics.sh /usr/local/bin/stirling-diagnostics && \
+        ln -sf /scripts/stirling-diagnostics.sh /usr/local/bin/diag && \
+        ln -sf /scripts/stirling-diagnostics.sh /usr/local/bin/debug && \
+        ln -sf /scripts/stirling-diagnostics.sh /usr/local/bin/diagnostic; \
+    fi
 
 # Copy Gateway and Portal configuration
 COPY Caddyfile /app/Caddyfile
 COPY entrypoint.sh /app/entrypoint.sh
 COPY portal/ /app/portal/
 
-# Set up permissions for Hugging Face Spaces non-root execution (UID 1000)
+# Set up non-root permissions for Hugging Face Spaces (UID 1000)
 RUN chmod +x /app/entrypoint.sh \
-    && chown -R stirlingpdfuser:stirlingpdfgroup /app /tmp /configs /logs /customFiles /pipeline /storage \
+    && chown -R stirlingpdfuser:stirlingpdfgroup \
+        /app \
+        /home/stirlingpdfuser \
+        /tmp \
+        /configs \
+        /logs \
+        /customFiles \
+        /pipeline \
+        /storage \
+        /usr/share/tessdata \
+        /usr/share/tesseract-ocr \
+        /usr/local/bin \
+        /scripts \
     && chmod -R 777 /tmp \
+    && chmod -R 777 /usr/local/bin \
     && chmod -R 755 /app
 
 # Switch to non-root user (UID 1000)
