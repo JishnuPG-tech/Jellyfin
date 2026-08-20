@@ -10,145 +10,115 @@ echo "=================================================="
 PGBIN="/usr/lib/postgresql/17/bin"
 PGDATA="/data/postgres"
 
-# Helper: full PostgreSQL cluster health check
-pg_cluster_is_healthy() {
-    # Verify all required subdirectories exist (not just pg_control)
-    local required_dirs=(
-        "base" "global" "pg_commit_ts" "pg_dynshmem"
-        "pg_logical" "pg_logical/snapshots" "pg_logical/mappings"
-        "pg_multixact" "pg_multixact/members" "pg_multixact/offsets"
-        "pg_notify" "pg_replslot" "pg_serial" "pg_snapshots"
-        "pg_stat" "pg_stat_tmp" "pg_subtrans" "pg_tblspc"
-        "pg_twophase" "pg_wal" "pg_wal/archive_status" "pg_xact"
-    )
-    [ -f "$PGDATA/global/pg_control" ] || return 1
-    for dir in "${required_dirs[@]}"; do
-        [ -d "$PGDATA/$dir" ] || return 1
-    done
-    return 0
-}
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-# 1. Initialize persistent storage structure
-echo "[Apex] Initializing persistent storage structure..."
-mkdir -p /data/Stirling/configs \
-         /data/Stirling/logs \
-         /data/Stirling/customFiles \
-         /data/Stirling/pipeline \
-         /data/Stirling/storage \
-         /data/files \
-         /data/logs \
-         /data/ai/models \
-         /data/redis \
-         /data/.home \
-         /tmp/workspace \
-         /tmp/caddy/data \
-         /tmp/caddy/config \
-         /tmp/stirling-pdf 2>/dev/null || true
-
-echo "[Apex] Configuring volume permissions..."
-chown -R snapotter:snapotter /data/files /data/logs /data/ai /data/redis /data/.home /tmp/workspace 2>/dev/null || true
-chmod -R 777 /data/Stirling /tmp /data/files /data/logs /data/redis /data/.home 2>/dev/null || true
-
-# 2. Bootstrap or repair PostgreSQL cluster
-if pg_cluster_is_healthy; then
-    echo "[Apex] Existing PostgreSQL cluster looks healthy."
-else
-    echo "[Apex] PostgreSQL cluster missing or corrupted — reinitializing from scratch..."
+pg_init() {
+    echo "[Apex] Initializing fresh PostgreSQL 17 cluster..."
     rm -rf "$PGDATA"
     install -d -o postgres -g postgres -m 700 "$PGDATA"
-    su -s /bin/sh postgres -c "$PGBIN/initdb -D $PGDATA --username=snapotter --encoding=UTF8 --locale=C --auth-local=trust --auth-host=trust"
-    {
-      echo "listen_addresses = '127.0.0.1'"
-      echo "dynamic_shared_memory_type = mmap"
-    } >> "$PGDATA/postgresql.conf"
-    su -s /bin/sh postgres -c "$PGBIN/postgres --single -D $PGDATA postgres" <<EOF
+    su -s /bin/sh postgres -c \
+        "$PGBIN/initdb -D $PGDATA --username=snapotter \
+         --encoding=UTF8 --locale=C --auth-local=trust --auth-host=trust"
+    printf "listen_addresses = '127.0.0.1'\ndynamic_shared_memory_type = mmap\n" \
+        >> "$PGDATA/postgresql.conf"
+    su -s /bin/sh postgres -c "$PGBIN/postgres --single -D $PGDATA postgres" <<'EOF'
 CREATE DATABASE snapotter OWNER snapotter;
 ALTER ROLE snapotter WITH PASSWORD 'snapotter';
 EOF
     echo "[Apex] PostgreSQL 17 cluster initialized."
-fi
+}
 
-# Ensure ALL required subdirs exist and ownership is correct before start
-mkdir -p \
-    "$PGDATA/pg_commit_ts" "$PGDATA/pg_dynshmem" \
-    "$PGDATA/pg_logical/snapshots" "$PGDATA/pg_logical/mappings" \
-    "$PGDATA/pg_multixact/members" "$PGDATA/pg_multixact/offsets" \
-    "$PGDATA/pg_notify" "$PGDATA/pg_replslot" "$PGDATA/pg_serial" \
-    "$PGDATA/pg_snapshots" "$PGDATA/pg_stat" "$PGDATA/pg_stat_tmp" \
-    "$PGDATA/pg_subtrans" "$PGDATA/pg_tblspc" "$PGDATA/pg_twophase" \
-    "$PGDATA/pg_wal/archive_status" "$PGDATA/pg_wal/summaries" "$PGDATA/pg_xact" \
-    2>/dev/null || true
-chmod 700 "$PGDATA"
-chown -R postgres:postgres "$PGDATA"
+pg_ensure_dirs() {
+    # PostgreSQL will create most dirs itself, but after an unclean shutdown
+    # some may be missing. Pre-create all required ones.
+    mkdir -p \
+        "$PGDATA/pg_commit_ts" "$PGDATA/pg_dynshmem" \
+        "$PGDATA/pg_logical/snapshots" "$PGDATA/pg_logical/mappings" \
+        "$PGDATA/pg_multixact/members" "$PGDATA/pg_multixact/offsets" \
+        "$PGDATA/pg_notify" "$PGDATA/pg_replslot" "$PGDATA/pg_serial" \
+        "$PGDATA/pg_snapshots" "$PGDATA/pg_stat" "$PGDATA/pg_stat_tmp" \
+        "$PGDATA/pg_subtrans" "$PGDATA/pg_tblspc" "$PGDATA/pg_twophase" \
+        "$PGDATA/pg_wal/archive_status" "$PGDATA/pg_wal/summaries" \
+        "$PGDATA/pg_xact" 2>/dev/null || true
+    chmod 700 "$PGDATA"
+    chown -R postgres:postgres "$PGDATA"
+}
 
-# Cleanup handler
 cleanup() {
     echo "[Apex] Received termination signal. Stopping all services..."
-    [ -n "${CADDY_PID:-}" ]    && kill -TERM "$CADDY_PID" 2>/dev/null || true
-    [ -n "${STIRLING_PID:-}" ] && kill -TERM "$STIRLING_PID" 2>/dev/null || true
-    [ -n "${SNAPOTTER_PID:-}" ]&& kill -TERM "$SNAPOTTER_PID" 2>/dev/null || true
-    [ -n "${REDIS_PID:-}" ]    && kill -TERM "$REDIS_PID" 2>/dev/null || true
-    [ -n "${PG_PID:-}" ]       && kill -TERM "$PG_PID" 2>/dev/null || true
+    for pid_var in CADDY_PID STIRLING_PID SNAPOTTER_PID REDIS_PID PG_PID; do
+        pid="${!pid_var:-}"
+        [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+    done
     echo "[Apex] Services stopped."
     exit 0
 }
+
+# ── 1. Persistent storage layout ───────────────────────────────────────────────
+echo "[Apex] Initializing persistent storage structure..."
+mkdir -p /data/Stirling/configs /data/Stirling/logs /data/Stirling/customFiles \
+         /data/Stirling/pipeline /data/Stirling/storage \
+         /data/files /data/logs /data/redis /data/.home \
+         /tmp/workspace /tmp/caddy/data /tmp/caddy/config /tmp/stirling-pdf \
+         2>/dev/null || true
+
+echo "[Apex] Configuring volume permissions..."
+chown -R snapotter:snapotter /data/files /data/logs /data/redis /data/.home \
+    /tmp/workspace 2>/dev/null || true
+
+# ── 2. PostgreSQL cluster setup ────────────────────────────────────────────────
+# CRITICAL: Check FIRST, then ensure subdirs, then start.
+# Previous bug: health check ran before mkdir → always re-init.
+if [ -f "$PGDATA/global/pg_control" ]; then
+    echo "[Apex] Existing PostgreSQL cluster found — ensuring directory integrity..."
+    pg_ensure_dirs
+else
+    echo "[Apex] PostgreSQL cluster not found — initializing..."
+    pg_init
+    pg_ensure_dirs
+fi
+
 trap cleanup SIGTERM SIGINT
 
-# 3. Start PostgreSQL 17
+# ── 3. Start PostgreSQL 17 ─────────────────────────────────────────────────────
 echo "[Apex] Starting PostgreSQL 17..."
 su -s /bin/sh postgres -c "$PGBIN/postgres -D $PGDATA" &
 PG_PID=$!
 
-# Wait for PostgreSQL to be ready (up to 60s)
+# Wait up to 60s for PostgreSQL to accept connections.
+# If it crashes during recovery (corrupted cluster), reinit and retry once.
 echo "[Apex] Waiting for PostgreSQL to accept connections..."
+PG_READY=0
 for i in $(seq 1 60); do
-    if su -s /bin/sh postgres -c "$PGBIN/pg_isready -h 127.0.0.1 -p 5432" >/dev/null 2>&1; then
+    if su -s /bin/sh postgres -c "$PGBIN/pg_isready -h 127.0.0.1 -p 5432 -q" 2>/dev/null; then
         echo "[Apex] PostgreSQL ready after ${i}s."
+        PG_READY=1
         break
     fi
-    # If postgres died already, reinitialize and restart
     if ! kill -0 "$PG_PID" 2>/dev/null; then
-        echo "[Apex] PostgreSQL crashed during startup — reinitializing cluster..."
-        rm -rf "$PGDATA"
-        install -d -o postgres -g postgres -m 700 "$PGDATA"
-        su -s /bin/sh postgres -c "$PGBIN/initdb -D $PGDATA --username=snapotter --encoding=UTF8 --locale=C --auth-local=trust --auth-host=trust"
-        {
-          echo "listen_addresses = '127.0.0.1'"
-          echo "dynamic_shared_memory_type = mmap"
-        } >> "$PGDATA/postgresql.conf"
-        su -s /bin/sh postgres -c "$PGBIN/postgres --single -D $PGDATA postgres" <<EOF
-CREATE DATABASE snapotter OWNER snapotter;
-ALTER ROLE snapotter WITH PASSWORD 'snapotter';
-EOF
-        mkdir -p \
-            "$PGDATA/pg_commit_ts" "$PGDATA/pg_dynshmem" \
-            "$PGDATA/pg_logical/snapshots" "$PGDATA/pg_logical/mappings" \
-            "$PGDATA/pg_multixact/members" "$PGDATA/pg_multixact/offsets" \
-            "$PGDATA/pg_notify" "$PGDATA/pg_replslot" "$PGDATA/pg_serial" \
-            "$PGDATA/pg_snapshots" "$PGDATA/pg_stat" "$PGDATA/pg_stat_tmp" \
-            "$PGDATA/pg_subtrans" "$PGDATA/pg_tblspc" "$PGDATA/pg_twophase" \
-            "$PGDATA/pg_wal/archive_status" "$PGDATA/pg_wal/summaries" "$PGDATA/pg_xact" \
-            2>/dev/null || true
-        chmod 700 "$PGDATA"
-        chown -R postgres:postgres "$PGDATA"
+        echo "[Apex] PostgreSQL crashed during recovery — reinitializing cluster..."
+        pg_init
+        pg_ensure_dirs
         su -s /bin/sh postgres -c "$PGBIN/postgres -D $PGDATA" &
         PG_PID=$!
+        sleep 3
+        continue
     fi
     sleep 1
 done
 
-# 4. Start Redis 8
-echo "[Apex] Starting Redis 8..."
-su -s /bin/sh snapotter -c "redis-server --dir /data/redis --bind 127.0.0.1 --port 6379 --protected-mode no" &
-REDIS_PID=$!
-
-# 5. Bootstrap SnapOtter Python AI venv if needed
-if [ -d "/opt/venv" ] && [ ! -d "/data/ai/venv" ]; then
-    echo "[Apex] Bootstrapping SnapOtter AI venv..."
-    cp -a /opt/venv /data/ai/venv 2>/dev/null || true
+if [ "$PG_READY" -eq 0 ]; then
+    echo "[Apex] FATAL: PostgreSQL failed to start within 60s. Aborting."
+    cleanup
 fi
 
-# 6. Start Stirling-PDF on Port 8080
+# ── 4. Start Redis 8 ───────────────────────────────────────────────────────────
+echo "[Apex] Starting Redis 8..."
+su -s /bin/sh snapotter -c \
+    "redis-server --dir /data/redis --bind 127.0.0.1 --port 6379 --protected-mode no" &
+REDIS_PID=$!
+
+# ── 5. Start Stirling-PDF on port 8080 ────────────────────────────────────────
 echo "[Apex] Starting Stirling-PDF Backend on Port 8080..."
 (
   cd /stirling-app
@@ -167,7 +137,7 @@ echo "[Apex] Starting Stirling-PDF Backend on Port 8080..."
 ) &
 STIRLING_PID=$!
 
-# 7. Start SnapOtter on Port 1349
+# ── 6. Start SnapOtter on port 1349 ───────────────────────────────────────────
 echo "[Apex] Starting SnapOtter Engine on Port 1349..."
 export DATABASE_URL="postgres://snapotter:snapotter@127.0.0.1:5432/snapotter"
 export REDIS_URL="redis://127.0.0.1:6379"
@@ -181,26 +151,32 @@ export DEFAULT_PASSWORD="admin"
 
 (
   cd /app/apps/api
-  exec su -s /bin/sh snapotter -c "export HOME=/data/.home && ./node_modules/.bin/tsx --import ./src/tracing.ts --import ./src/instrument.ts src/index.ts"
+  exec su -s /bin/sh snapotter -c \
+    "export HOME=/data/.home && \
+     ./node_modules/.bin/tsx \
+       --import ./src/tracing.ts \
+       --import ./src/instrument.ts \
+       src/index.ts"
 ) &
 SNAPOTTER_PID=$!
 
-# 8. Start Caddy Gateway on Port 7860
+# ── 7. Start Caddy Gateway on port 7860 ───────────────────────────────────────
 echo "[Apex] Starting Caddy Gateway on Port 7860..."
-caddy run --config /app/Caddyfile --adapter caddyfile &
+caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
 CADDY_PID=$!
 
-echo "[Apex] All services online! Gateway running on Port 7860."
+echo "[Apex] All services online! Gateway → http://0.0.0.0:7860"
+echo "[Apex]   Portal     → /"
+echo "[Apex]   SnapOtter  → / (AI tools)"
+echo "[Apex]   Stirling   → /stirling"
 
-# Monitor: restart if postgres or caddy die
+# ── 8. Process monitor ─────────────────────────────────────────────────────────
 while true; do
     if ! kill -0 "$CADDY_PID" 2>/dev/null; then
-        echo "[Apex] Caddy died — shutting down."
-        cleanup
+        echo "[Apex] Caddy exited — shutting down."; cleanup
     fi
     if ! kill -0 "$PG_PID" 2>/dev/null; then
-        echo "[Apex] PostgreSQL died — shutting down."
-        cleanup
+        echo "[Apex] PostgreSQL exited — shutting down."; cleanup
     fi
     sleep 5
 done

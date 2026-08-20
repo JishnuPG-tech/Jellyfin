@@ -4,38 +4,38 @@
 # ==============================================================================
 
 :7860 {
-    # 1. Apex Portal Landing Page (served first: root & portal static assets)
-    handle /portal/* {
-        root * /app/portal
-        file_server
-    }
-
-    handle / {
-        root * /app/portal
-        file_server
-    }
-
-    handle /index.html {
-        root * /app/portal
-        file_server
-    }
-
-    # 2. Stirling-PDF Routing (Full PDF Suite on Port 8080)
+    # 1. Stirling-PDF — strip /stirling prefix before proxying
     handle_path /stirling* {
-        reverse_proxy http://127.0.0.1:8080 {
-            header_up X-Forwarded-Prefix /stirling
-            header_up Host {host}
-            header_up X-Real-IP {remote_host}
+        reverse_proxy http://127.0.0.1:8080
+    }
+
+    # 2. Apex Portal static files — explicitly served from /srv/portal
+    handle /portal/* {
+        root * /srv/portal
+        file_server
+    }
+
+    # 3. Root and index — serve portal index.html
+    handle / {
+        root * /srv/portal
+        file_server {
+            index index.html
         }
     }
 
-    # 3. SnapOtter Routing (200+ Media, Video, Audio & AI Suite on Port 1349)
+    handle /index.html {
+        root * /srv/portal
+        file_server
+    }
+
+    # 4. SnapOtter — catch-all for everything else
     handle {
         reverse_proxy http://127.0.0.1:1349 {
             header_up Host {host}
             header_up X-Real-IP {remote_host}
             transport http {
                 response_header_timeout 300s
+                dial_timeout 30s
             }
         }
     }

@@ -22,16 +22,26 @@ COPY --from=stirling-source /opt/java/openjdk /opt/java/openjdk
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
 RUN chmod +x /usr/local/bin/caddy
 
-# Set up Stirling-PDF complete layered application and scripts
-RUN mkdir -p /stirling-app /data/Stirling/configs /data/Stirling/logs /data/Stirling/customFiles /data/Stirling/pipeline /data/Stirling/storage /tmp/stirling-pdf
+# Set up Stirling-PDF complete layered application
+RUN mkdir -p /stirling-app /tmp/stirling-pdf
 COPY --from=stirling-source /app /stirling-app
 COPY --from=stirling-source /scripts /stirling-scripts
 
-# Copy Portal, Caddyfile, and multi-service Entrypoint
-COPY portal/ /app/portal/
-COPY Caddyfile /app/Caddyfile
+# Portal goes to /srv/portal — OUTSIDE /app to avoid conflicts with SnapOtter's runtime
+RUN mkdir -p /srv/portal
+COPY portal/ /srv/portal/
+
+# Caddyfile and entrypoint
+COPY Caddyfile /etc/caddy/Caddyfile
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Pre-create persistent storage scaffolding at build time
+RUN mkdir -p /data/Stirling/configs /data/Stirling/logs \
+             /data/Stirling/customFiles /data/Stirling/pipeline \
+             /data/Stirling/storage /data/files /data/logs \
+             /data/redis /data/.home /tmp/workspace \
+             /tmp/caddy/data /tmp/caddy/config
 
 # Environment Configuration
 ENV JAVA_HOME="/opt/java/openjdk" \
