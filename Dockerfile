@@ -7,7 +7,7 @@
 # Stage 1: Get clean, standalone Caddy binary
 FROM caddy:2-alpine AS caddy-source
 
-# Stage 2: Extract Stirling-PDF executable jar and Java 25 runtime
+# Stage 2: Extract Stirling-PDF complete application and Java 25 runtime
 FROM stirlingtools/stirling-pdf:latest AS stirling-source
 
 # Stage 3: SnapOtter production runtime (Ubuntu 24.04 + Node 22 + Postgres 17 + Redis 8 + FFmpeg + AI)
@@ -22,9 +22,10 @@ COPY --from=stirling-source /opt/java/openjdk /opt/java/openjdk
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
 RUN chmod +x /usr/local/bin/caddy
 
-# Set up Stirling-PDF
-RUN mkdir -p /stirling /data/Stirling/configs /data/Stirling/logs /data/Stirling/customFiles /data/Stirling/pipeline /data/Stirling/storage /tmp/stirling-pdf
-COPY --from=stirling-source /app/app.jar /stirling/app.jar
+# Set up Stirling-PDF complete layered application and scripts
+RUN mkdir -p /stirling-app /data/Stirling/configs /data/Stirling/logs /data/Stirling/customFiles /data/Stirling/pipeline /data/Stirling/storage /tmp/stirling-pdf
+COPY --from=stirling-source /app /stirling-app
+COPY --from=stirling-source /scripts /stirling-scripts
 
 # Copy Portal, Caddyfile, and multi-service Entrypoint
 COPY portal/ /app/portal/

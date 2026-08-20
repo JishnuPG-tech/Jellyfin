@@ -28,12 +28,12 @@ mkdir -p /data/Stirling/configs \
          /tmp/caddy/config \
          /tmp/stirling-pdf 2>/dev/null || true
 
-# 2. Fix directory ownership and permissions
+# 2. Fix directory ownership and permissions (Strictly 700 for postgres)
 echo "[Apex] Configuring volume permissions..."
+chmod 700 /data/postgres
 chown -R postgres:postgres /data/postgres 2>/dev/null || true
 chown -R snapotter:snapotter /data/files /data/logs /data/ai /data/redis /data/.home /tmp/workspace 2>/dev/null || true
 chmod -R 777 /data/Stirling /tmp /data/files /data/logs /data/redis /data/.home 2>/dev/null || true
-chmod 777 /data 2>/dev/null || true
 
 # 3. Bootstrap SnapOtter Postgres if needed
 PGBIN="/usr/lib/postgresql/17/bin"
@@ -50,6 +50,10 @@ if [ ! -f "$PGDATA/PG_VERSION" ]; then
     echo "ALTER ROLE snapotter WITH PASSWORD 'snapotter';" | su -s /bin/sh postgres -c "$PGBIN/postgres --single -D $PGDATA postgres"
     echo "[Apex] PostgreSQL 17 initialized."
 fi
+
+# Ensure 700 permissions right before postgres start
+chmod 700 "$PGDATA"
+chown -R postgres:postgres "$PGDATA"
 
 # Start PostgreSQL 17
 echo "[Apex] Starting PostgreSQL 17..."
@@ -84,19 +88,23 @@ trap cleanup SIGTERM SIGINT
 
 # 5. Start Stirling-PDF on Port 8080
 echo "[Apex] Starting Stirling-PDF Backend on Port 8080..."
-java -Dstirling.base-path=/data/Stirling/ \
-     -Dserver.port=8080 \
-     -XX:+ExitOnOutOfMemoryError \
-     -XX:+HeapDumpOnOutOfMemoryError \
-     -XX:HeapDumpPath=/data/Stirling/configs/heap_dumps \
-     -XX:+UseG1GC \
-     -XX:MaxGCPauseMillis=200 \
-     -Dspring.threads.virtual.enabled=true \
-     -Djava.awt.headless=true \
-     -XX:InitialRAMPercentage=5 \
-     -XX:MaxRAMPercentage=25 \
-     -XX:MaxMetaspaceSize=256m \
-     -jar /stirling/app.jar &
+(
+  cd /stirling-app
+  exec java -Dstirling.base-path=/data/Stirling/ \
+            -Dserver.port=8080 \
+            -XX:+ExitOnOutOfMemoryError \
+            -XX:+HeapDumpOnOutOfMemoryError \
+            -XX:HeapDumpPath=/data/Stirling/configs/heap_dumps \
+            -XX:+UseG1GC \
+            -XX:MaxGCPauseMillis=200 \
+            -Dspring.threads.virtual.enabled=true \
+            -Djava.awt.headless=true \
+            -XX:InitialRAMPercentage=5 \
+            -XX:MaxRAMPercentage=25 \
+            -XX:MaxMetaspaceSize=256m \
+            -cp "/stirling-app/app.jar:/stirling-app/lib/*" \
+            stirling.software.SPDF.SPDFApplication
+) &
 STIRLING_PID=$!
 
 # 6. Start SnapOtter on Port 1349
