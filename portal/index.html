@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apex Workspace | Multi-Tool Cloud Suite</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: rgba(22, 30, 49, 0.7);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --card-hover-border: rgba(99, 102, 241, 0.4);
+      --primary: #6366f1;
+      --primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+      --text: #f3f4f6;
+      --text-muted: #9ca3af;
+      --text-dim: #6b7280;
+      --badge-bg: rgba(99, 102, 241, 0.15);
+      --badge-text: #818cf8;
+      --success: #10b981;
+      --glow: rgba(99, 102, 241, 0.15);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      background-color: var(--bg);
+      background-image: 
+        radial-gradient(circle at 15% 15%, rgba(99, 102, 241, 0.12) 0%, transparent 40%),
+        radial-gradient(circle at 85% 85%, rgba(168, 85, 247, 0.1) 0%, transparent 40%),
+        radial-gradient(circle at 50% 50%, rgba(14, 165, 233, 0.05) 0%, transparent 60%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      padding: 2.5rem 1.5rem;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      width: 100%;
+      flex: 1;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 3.5rem;
+    }
+
+    .badge-hub {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.35rem 1rem;
+      background: var(--badge-bg);
+      color: var(--badge-text);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      border-radius: 9999px;
+      font-size: 0.825rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      margin-bottom: 1.25rem;
+      backdrop-filter: blur(10px);
+    }
+
+    .badge-dot {
+      width: 7px;
+      height: 7px;
+      background: var(--success);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--success);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0% { opacity: 0.6; transform: scale(0.9); }
+      50% { opacity: 1; transform: scale(1.1); }
+      100% { opacity: 0.6; transform: scale(0.9); }
+    }
+
+    h1 {
+      font-size: clamp(2.2rem, 4vw, 3.2rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.75rem;
+      background: linear-gradient(135deg, #ffffff 30%, #cbd5e1 70%, #94a3b8 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .subtitle {
+      font-size: 1.1rem;
+      color: var(--text-muted);
+      max-width: 620px;
+      margin: 0 auto;
+      line-height: 1.6;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 1.75rem;
+      margin-bottom: 3.5rem;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 1.25rem;
+      padding: 2rem;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      overflow: hidden;
+      backdrop-filter: blur(16px);
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+    }
+
+    .card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: var(--primary-gradient);
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+
+    .card:hover {
+      border-color: var(--card-hover-border);
+      transform: translateY(-4px);
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.35), 0 0 25px var(--glow);
+    }
+
+    .card:hover::before {
+      opacity: 1;
+    }
+
+    .card.placeholder-card {
+      border-style: dashed;
+      background: rgba(18, 24, 39, 0.4);
+    }
+
+    .card.placeholder-card:hover {
+      border-color: rgba(255, 255, 255, 0.2);
+      box-shadow: none;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      margin-bottom: 1.25rem;
+    }
+
+    .icon-wrapper {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.75rem;
+      background: rgba(99, 102, 241, 0.12);
+      border: 1px solid rgba(99, 102, 241, 0.25);
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.25rem 0.65rem;
+      border-radius: 9999px;
+      background: rgba(16, 185, 129, 0.12);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.2);
+    }
+
+    .status-badge.offline {
+      background: rgba(107, 114, 128, 0.15);
+      color: #9ca3af;
+      border-color: rgba(107, 114, 128, 0.3);
+    }
+
+    .card-title {
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: #ffffff;
+      margin-bottom: 0.5rem;
+    }
+
+    .card-description {
+      font-size: 0.925rem;
+      color: var(--text-muted);
+      line-height: 1.55;
+      margin-bottom: 1.5rem;
+      flex: 1;
+    }
+
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-bottom: 1.75rem;
+    }
+
+    .tag {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      padding: 0.2rem 0.55rem;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      color: #cbd5e1;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .launch-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      width: 100%;
+      padding: 0.85rem 1.25rem;
+      background: var(--primary-gradient);
+      color: #ffffff;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 0.95rem;
+      border-radius: 0.85rem;
+      transition: all 0.25s ease;
+      box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+    }
+
+    .launch-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 25px rgba(99, 102, 241, 0.45);
+    }
+
+    .launch-btn svg {
+      width: 18px;
+      height: 18px;
+      transition: transform 0.2s ease;
+    }
+
+    .launch-btn:hover svg {
+      transform: translateX(3px);
+    }
+
+    .specs-box {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--card-border);
+      border-radius: 1rem;
+      padding: 1.5rem;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-around;
+      gap: 1.5rem;
+      margin-bottom: 3rem;
+      backdrop-filter: blur(12px);
+    }
+
+    .spec-item {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 0.25rem;
+    }
+
+    .spec-label {
+      font-size: 0.775rem;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+
+    .spec-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #e2e8f0;
+    }
+
+    footer {
+      text-align: center;
+      font-size: 0.85rem;
+      color: var(--text-dim);
+      padding-top: 1.5rem;
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    footer a {
+      color: var(--text-muted);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+
+    footer a:hover {
+      color: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="badge-hub">
+        <span class="badge-dot"></span>
+        Hugging Face Space Cluster
+      </div>
+      <h1>Apex Multi-Tool Suite</h1>
+      <p class="subtitle">High-performance private micro-services and developer utilities running on cloud container infrastructure.</p>
+    </header>
+
+    <div class="specs-box">
+      <div class="spec-item">
+        <span class="spec-label">Environment</span>
+        <span class="spec-value">HF Spaces (Docker)</span>
+      </div>
+      <div class="spec-item">
+        <span class="spec-label">Memory</span>
+        <span class="spec-value">16 GB RAM</span>
+      </div>
+      <div class="spec-item">
+        <span class="spec-label">Compute</span>
+        <span class="spec-value">2 vCPU</span>
+      </div>
+      <div class="spec-item">
+        <span class="spec-label">Gateway</span>
+        <span class="spec-value">Nginx (Port 7860)</span>
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- Stirling-PDF App Card -->
+      <div class="card">
+        <div class="card-header">
+          <div class="icon-wrapper">📄</div>
+          <span class="status-badge">
+            <span class="badge-dot"></span> Active
+          </span>
+        </div>
+        <h2 class="card-title">Stirling-PDF</h2>
+        <p class="card-description">Comprehensive, private PDF manipulation suite. Split, merge, convert, OCR, watermark, sign, encrypt, and edit any PDF file directly in your browser.</p>
+        
+        <div class="tags">
+          <span class="tag">OCR / Tesseract</span>
+          <span class="tag">LibreOffice</span>
+          <span class="tag">PDF Tools</span>
+          <span class="tag">API</span>
+        </div>
+
+        <a href="/stirling/" class="launch-btn">
+          Launch Application
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12h14M12 5l7 7-7 7"/>
+          </svg>
+        </a>
+      </div>
+
+      <!-- Expandable App Card 1 -->
+      <div class="card placeholder-card">
+        <div class="card-header">
+          <div class="icon-wrapper" style="background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1);">🚀</div>
+          <span class="status-badge offline">Slot Available</span>
+        </div>
+        <h2 class="card-title">Project Slot 2</h2>
+        <p class="card-description">Ready to host your second Docker tool (e.g. IT-Tools, FileBrowser, CyberChef, Jupyter, or custom microservice). Connect to port 8081 via Nginx.</p>
+        
+        <div class="tags">
+          <span class="tag">Route: /tool2/</span>
+          <span class="tag">Port 8081</span>
+        </div>
+
+        <a href="#" class="launch-btn" style="background: rgba(255,255,255,0.08); box-shadow: none; cursor: default; opacity: 0.6;">
+          Ready to Configure
+        </a>
+      </div>
+
+      <!-- Expandable App Card 2 -->
+      <div class="card placeholder-card">
+        <div class="card-header">
+          <div class="icon-wrapper" style="background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1);">⚡</div>
+          <span class="status-badge offline">Slot Available</span>
+        </div>
+        <h2 class="card-title">Project Slot 3</h2>
+        <p class="card-description">Ready to host your third Docker project or background worker. Connect to port 8082 via Nginx routing.</p>
+        
+        <div class="tags">
+          <span class="tag">Route: /tool3/</span>
+          <span class="tag">Port 8082</span>
+        </div>
+
+        <a href="#" class="launch-btn" style="background: rgba(255,255,255,0.08); box-shadow: none; cursor: default; opacity: 0.6;">
+          Ready to Configure
+        </a>
+      </div>
+    </div>
+
+    <footer>
+      <p>Hosted on <a href="https://huggingface.co/spaces/Jishnupg/Apex" target="_blank">Hugging Face Space: Jishnupg/Apex</a> • Powered by Nginx & Docker</p>
+    </footer>
+  </div>
+</body>
+</html>
