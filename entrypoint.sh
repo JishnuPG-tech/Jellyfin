@@ -28,27 +28,59 @@ pg_init() {
 listen_addresses        = '127.0.0.1'
 dynamic_shared_memory_type = mmap
 unix_socket_directories = '/tmp'
-# Improve resilience against transient I/O errors on HF persistent volumes
 data_sync_retry         = on
-# Reduce fsync cost on container restart; HF storage is already durable
 full_page_writes        = off
 synchronous_commit      = off
 wal_level               = minimal
 max_wal_senders         = 0
-# Performance tuning
 shared_buffers          = 128MB
 effective_cache_size    = 512MB
 checkpoint_timeout      = 15min
 checkpoint_completion_target = 0.9
 PGCONF
 
-    # Bootstrap DB and user (use single-user mode so no running server needed)
-    su -s /bin/sh postgres -c "$PGBIN/postgres --single -D $PGDATA postgres" <<'EOF'
-CREATE DATABASE snapotter OWNER snapotter;
-ALTER ROLE snapotter WITH PASSWORD 'snapotter';
-EOF
+    # Bootstrap: start a temporary server, create DB/user via psql, stop it.
+    # Much more robust than postgres --single which requires an existing DB.
+    echo "[Apex] Bootstrapping snapotter database..."
+    su -s /bin/sh postgres -c \
+        "$PGBIN/pg_ctl -D $PGDATA -w -t 60 start -l /tmp/pg_bootstrap.log" || {
+        echo "[Apex] Bootstrap server failed to start. Log:"; cat /tmp/pg_bootstrap.log || true; exit 1
+    }
+    su -s /bin/sh postgres -c \
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -c \"CREATE DATABASE snapotter OWNER snapotter;\""
+    su -s /bin/sh postgres -c \
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -c \"ALTER ROLE snapotter WITH PASSWORD 'snapotter';\""
+    su -s /bin/sh postgres -c \
+        "$PGBIN/pg_ctl -D $PGDATA -w -t 30 stop"
     echo "[Apex] PostgreSQL 17 cluster initialized."
 }
+
+# Idempotent DB/role check — runs after every PG startup.
+# Catches cases where a prior initdb succeeded but bootstrap was interrupted.
+pg_ensure_db() {
+    echo "[Apex] Verifying snapotter database and role..."
+    # Create role if missing (initdb --username sets it, but guard anyway)
+    su -s /bin/sh postgres -c \
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -tAc \
+        \"SELECT 1 FROM pg_roles WHERE rolname='snapotter'\"" 2>/dev/null | grep -q 1 || \
+    su -s /bin/sh postgres -c \
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -c \
+        \"CREATE ROLE snapotter WITH LOGIN PASSWORD 'snapotter';\"" 2>/dev/null || true
+
+    # Create database if missing
+    if ! su -s /bin/sh postgres -c \
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -tAc \
+        \"SELECT 1 FROM pg_database WHERE datname='snapotter'\"" 2>/dev/null | grep -q 1; then
+        echo "[Apex] snapotter database missing — creating now..."
+        su -s /bin/sh postgres -c \
+            "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -c \
+            \"CREATE DATABASE snapotter OWNER snapotter;\""
+        echo "[Apex] snapotter database created."
+    else
+        echo "[Apex] snapotter database OK."
+    fi
+}
+
 
 pg_ensure_dirs() {
     # Pre-create WAL/transaction subdirectories that may vanish after
@@ -160,6 +192,9 @@ if [ "$PG_READY" -eq 0 ]; then
     echo "[Apex] FATAL: PostgreSQL failed to start within 300s. Aborting."
     cleanup
 fi
+
+# Always verify snapotter DB/role exist — handles partial init from prior boots
+pg_ensure_db
 
 # ── 4. Start Redis 8 ───────────────────────────────────────────────────────────
 echo "[Apex] Starting Redis 8..."
