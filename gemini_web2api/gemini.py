@@ -56,14 +56,45 @@ def load_cookie() -> tuple:
             return _cookie_cache["str"], _cookie_cache["sapisid"]
         with open(cookie_file, "r") as f:
             content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
+        
+        cookie_str = ""
+        sapisid = None
+
+        if content.startswith("[") or content.startswith("{"):
+            try:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    # Cookie-Editor / EditThisCookie array format: [{"name": "..", "value": ".."}, ...]
+                    pairs = []
+                    for item in data:
+                        if isinstance(item, dict) and "name" in item and "value" in item:
+                            pairs.append(f"{item['name']}={item['value']}")
+                            if item["name"] in ("SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID") and not sapisid:
+                                sapisid = item["value"]
+                    cookie_str = "; ".join(pairs)
+                elif isinstance(data, dict):
+                    if "cookie" in data:
+                        cookie_str = data.get("cookie", "")
+                        sapisid = data.get("sapisid", "")
+                    else:
+                        # Key-value map: {"__Secure-1PSID": "...", "SAPISID": "..."}
+                        pairs = [f"{k}={v}" for k, v in data.items() if isinstance(v, str)]
+                        cookie_str = "; ".join(pairs)
+                        sapisid = data.get("SAPISID") or data.get("__Secure-3PAPISID")
+            except Exception:
+                cookie_str = content
         else:
             cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
+
+        if not sapisid and cookie_str:
+            for p in cookie_str.split(";"):
+                p = p.strip()
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    if k in ("SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"):
+                        sapisid = v
+                        break
+
         _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
