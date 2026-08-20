@@ -145,6 +145,39 @@ def _apply_chat_persistence_flags(inner: list) -> None:
         inner[41] = [2]
 
 
+def fetch_xsrf_token() -> str:
+    """Fetch SNlM0e (XSRF token) dynamically from Gemini web UI using session cookies."""
+    global _cookie_cache
+    if _cookie_cache.get("snlm0e"):
+        return _cookie_cache["snlm0e"]
+    cookie_str, _ = load_cookie()
+    if not cookie_str:
+        return None
+    try:
+        url = f"https://gemini.google.com{_account_prefix()}/app"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Cookie": cookie_str,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        ctx = _get_ssl_ctx()
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+            m = re.search(r'"SNlM0e":"([^"]+)"', html)
+            if m:
+                token = m.group(1)
+                _cookie_cache["snlm0e"] = token
+                log(f"Auto-fetched Gemini SNlM0e token successfully: {token[:12]}...")
+                return token
+            m_bl = re.search(r'"cfb2h":"([^"]+)"', html)
+            if m_bl:
+                CONFIG["gemini_bl"] = m_bl.group(1)
+    except Exception as e:
+        log(f"Failed to auto-fetch XSRF token from Gemini web: {e}")
+    return None
+
+
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     inner = [None] * 102
     if file_refs:
@@ -173,8 +206,9 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
             inner[k] = v
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if CONFIG.get("xsrf_token"):
-        params["at"] = CONFIG["xsrf_token"]
+    at_token = CONFIG.get("xsrf_token") or fetch_xsrf_token()
+    if at_token:
+        params["at"] = at_token
     return urllib.parse.urlencode(params)
 
 
