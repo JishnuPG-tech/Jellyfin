@@ -1,0 +1,34 @@
+{
+    admin off
+    persist_config off
+    auto_https off
+}
+
+:7860 {
+    # Stirling-PDF Reverse Proxy
+    @stirling path /stirling*
+    handle @stirling {
+        reverse_proxy 127.0.0.1:8080 {
+            transport http {
+                response_header_timeout 600s
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
+    }
+
+    # -------------------------------------------------------------
+    # Template for Project 2 (Uncomment when adding a new tool)
+    # -------------------------------------------------------------
+    # @tool2 path /tool2*
+    # handle @tool2 {
+    #     reverse_proxy 127.0.0.1:8081
+    # }
+
+    # Root Dashboard Portal
+    handle {
+        root * /app/portal
+        file_server
+        try_files {path} /index.html
+    }
+}

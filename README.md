@@ -12,7 +12,7 @@ pinned: false
 
 A high-performance containerized workspace hosted on **Hugging Face Spaces** free tier (2 vCPU, 16 GB RAM, 50 GB disk).
 
-This Space uses a **Reverse Proxy Gateway (Nginx)** architecture, allowing you to host multiple self-contained tools and Docker applications inside a single Hugging Face Space.
+This Space uses a **Reverse Proxy Gateway (Caddy)** architecture, allowing you to host multiple self-contained tools and Docker applications inside a single Hugging Face Space.
 
 ---
 
@@ -38,7 +38,7 @@ This Space uses a **Reverse Proxy Gateway (Nginx)** architecture, allowing you t
                                             │
                                             ▼
                              ┌──────────────────────────────┐
-                             │        Nginx Gateway         │
+                             │        Caddy Gateway         │
                              │      Reverse Proxy & Hub     │
                              └──────┬───────────────┬───────┘
                                     │               │
@@ -58,30 +58,21 @@ This Space uses a **Reverse Proxy Gateway (Nginx)** architecture, allowing you t
 
 To host an additional tool or microservice (e.g. IT-Tools, CyberChef, FileBrowser, custom Python/Node API):
 
-### 1. Install your tool in `Dockerfile`
-Add the binary or repository installation in `Dockerfile`. For example:
-```dockerfile
-# Example: Install a second application
-RUN apt-get install -y my-app
+### 1. Copy or install your tool in `Dockerfile`
+Copy the application binary/files in `Dockerfile`.
+
+### 2. Start the service in `entrypoint.sh`
+Add a background startup line in `entrypoint.sh`:
+```bash
+/path/to/my-tool --port 8081 &
 ```
 
-### 2. Register with `supervisord.conf`
-Uncomment and configure the process in `supervisord.conf`:
-```ini
-[program:project2]
-command=/usr/bin/my-app --port 8081
-autostart=true
-autorestart=true
-priority=30
-```
-
-### 3. Add reverse proxy route in `nginx.conf`
-Uncomment and adjust the location block in `nginx.conf`:
-```nginx
-location /tool2/ {
-    proxy_pass http://127.0.0.1:8081/;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
+### 3. Add reverse proxy route in `Caddyfile`
+Uncomment and adjust the route in `Caddyfile`:
+```caddyfile
+@tool2 path /tool2*
+handle @tool2 {
+    reverse_proxy 127.0.0.1:8081
 }
 ```
 
