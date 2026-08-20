@@ -47,9 +47,9 @@ PGCONF
         echo "[Apex] Bootstrap server failed to start. Log:"; cat /tmp/pg_bootstrap.log || true; exit 1
     }
     su -s /bin/sh postgres -c \
-        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -c \"CREATE DATABASE snapotter OWNER snapotter;\""
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -U snapotter -d postgres -c \"CREATE DATABASE snapotter OWNER snapotter;\""
     su -s /bin/sh postgres -c \
-        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -c \"ALTER ROLE snapotter WITH PASSWORD 'snapotter';\""
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -U snapotter -d postgres -c \"ALTER ROLE snapotter WITH PASSWORD 'snapotter';\""
     su -s /bin/sh postgres -c \
         "$PGBIN/pg_ctl -D $PGDATA -w -t 30 stop"
     echo "[Apex] PostgreSQL 17 cluster initialized."
@@ -57,23 +57,25 @@ PGCONF
 
 # Idempotent DB/role check — runs after every PG startup.
 # Catches cases where a prior initdb succeeded but bootstrap was interrupted.
+# NOTE: initdb --username=snapotter makes snapotter the superuser.
+#       There is NO 'postgres' role — always use -U snapotter.
 pg_ensure_db() {
     echo "[Apex] Verifying snapotter database and role..."
-    # Create role if missing (initdb --username sets it, but guard anyway)
+    # Create role if somehow missing
     su -s /bin/sh postgres -c \
-        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -tAc \
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -U snapotter -d postgres -tAc \
         \"SELECT 1 FROM pg_roles WHERE rolname='snapotter'\"" 2>/dev/null | grep -q 1 || \
     su -s /bin/sh postgres -c \
-        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -c \
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -U snapotter -d postgres -c \
         \"CREATE ROLE snapotter WITH LOGIN PASSWORD 'snapotter';\"" 2>/dev/null || true
 
     # Create database if missing
     if ! su -s /bin/sh postgres -c \
-        "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -tAc \
+        "$PGBIN/psql -h 127.0.0.1 -p 5432 -U snapotter -d postgres -tAc \
         \"SELECT 1 FROM pg_database WHERE datname='snapotter'\"" 2>/dev/null | grep -q 1; then
         echo "[Apex] snapotter database missing — creating now..."
         su -s /bin/sh postgres -c \
-            "$PGBIN/psql -h 127.0.0.1 -p 5432 -d postgres -c \
+            "$PGBIN/psql -h 127.0.0.1 -p 5432 -U snapotter -d postgres -c \
             \"CREATE DATABASE snapotter OWNER snapotter;\""
         echo "[Apex] snapotter database created."
     else
