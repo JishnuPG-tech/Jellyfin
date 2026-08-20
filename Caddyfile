@@ -4,26 +4,29 @@
 # ==============================================================================
 
 :7860 {
-    # 1. Stirling-PDF Routing (Full PDF Suite on Port 8080)
+    # 1. Apex Portal Landing Page (served first: root & portal static assets)
+    handle /portal/* {
+        root * /app/portal
+        file_server
+    }
+
+    handle / {
+        root * /app/portal
+        file_server
+    }
+
+    handle /index.html {
+        root * /app/portal
+        file_server
+    }
+
+    # 2. Stirling-PDF Routing (Full PDF Suite on Port 8080)
     handle_path /stirling* {
         reverse_proxy http://127.0.0.1:8080 {
             header_up X-Forwarded-Prefix /stirling
             header_up Host {host}
             header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
-            header_up X-Forwarded-Proto {scheme}
         }
-    }
-
-    # 2. Apex Portal Landing Page (Root & Static Portal Assets)
-    @portal {
-        path /
-        path /index.html
-        path /portal/*
-    }
-    handle @portal {
-        root * /app/portal
-        file_server
     }
 
     # 3. SnapOtter Routing (200+ Media, Video, Audio & AI Suite on Port 1349)
@@ -31,8 +34,6 @@
         reverse_proxy http://127.0.0.1:1349 {
             header_up Host {host}
             header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
-            header_up X-Forwarded-Proto {scheme}
             transport http {
                 response_header_timeout 300s
             }
