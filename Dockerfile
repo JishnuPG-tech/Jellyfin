@@ -77,6 +77,7 @@ ENV SYSTEM_ROOTURIPATH="/stirling" \
     DOCKER_ENABLE_SECURITY="false" \
     STIRLING_BASE_PATH="/data/Stirling/" \
     CONFIG_FILE="/data/Stirling/configs/settings.yml" \
+    STORAGE_LOCAL_BASEPATH="/data/Stirling/storage" \
     STIRLING_TEMPFILES_DIRECTORY="/tmp/stirling-pdf" \
     TMPDIR="/tmp/stirling-pdf" \
     TEMP="/tmp/stirling-pdf" \
