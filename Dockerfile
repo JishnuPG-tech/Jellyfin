@@ -7,7 +7,7 @@
 # Stage 1: Get clean, standalone Caddy binary
 FROM caddy:2-alpine AS caddy-source
 
-# Stage 2: Extract Stirling-PDF executable jar
+# Stage 2: Extract Stirling-PDF executable jar and Java 25 runtime
 FROM stirlingtools/stirling-pdf:latest AS stirling-source
 
 # Stage 3: SnapOtter production runtime (Ubuntu 24.04 + Node 22 + Postgres 17 + Redis 8 + FFmpeg + AI)
@@ -15,10 +15,8 @@ FROM snapotter/snapotter:latest AS production
 
 USER root
 
-# Install OpenJDK 21 for Stirling-PDF Spring Boot backend
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    openjdk-21-jre-headless \
-    && rm -rf /var/lib/apt/lists/*
+# Copy official Eclipse Temurin Java 25 JRE from Stirling-PDF
+COPY --from=stirling-source /opt/java/openjdk /opt/java/openjdk
 
 # Copy standalone Caddy binary
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
@@ -35,7 +33,9 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Environment Configuration
-ENV PORT="1349" \
+ENV JAVA_HOME="/opt/java/openjdk" \
+    PATH="/opt/java/openjdk/bin:${PATH}" \
+    PORT="1349" \
     DATA_DIR="/data" \
     WORKSPACE_PATH="/tmp/workspace" \
     SYSTEM_ROOTURIPATH="/stirling" \
