@@ -58,13 +58,14 @@ cleanup() {
 echo "[Apex] Initializing persistent storage structure..."
 mkdir -p /data/Stirling/configs /data/Stirling/logs /data/Stirling/customFiles \
          /data/Stirling/pipeline /data/Stirling/storage \
-         /data/files /data/logs /data/redis /data/.home \
+         /data/files /data/logs /data/redis /data/.home /data/ai \
          /tmp/workspace /tmp/caddy/data /tmp/caddy/config /tmp/stirling-pdf \
          2>/dev/null || true
 
 echo "[Apex] Configuring volume permissions..."
 chown -R snapotter:snapotter /data/files /data/logs /data/redis /data/.home \
-    /tmp/workspace 2>/dev/null || true
+    /data/ai /tmp/workspace 2>/dev/null || true
+chmod 755 /data/ai 2>/dev/null || true
 
 # ── 2. PostgreSQL cluster setup ────────────────────────────────────────────────
 # CRITICAL: Check FIRST, then ensure subdirs, then start.
@@ -92,7 +93,7 @@ PG_PID=$!
 echo "[Apex] Waiting for PostgreSQL to accept connections (up to 300s)..."
 PG_READY=0
 for i in $(seq 1 300); do
-    if su -s /bin/sh postgres -c "$PGBIN/pg_isready -h 127.0.0.1 -p 5432 -q" 2>/dev/null; then
+    if su -s /bin/sh postgres -c "$PGBIN/pg_isready -h 127.0.0.1 -p 5432 -U snapotter -q" 2>/dev/null; then
         echo "[Apex] PostgreSQL ready after ${i}s."
         PG_READY=1
         break

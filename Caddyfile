@@ -4,39 +4,76 @@
 # ==============================================================================
 
 :7860 {
-    # 1. Stirling-PDF — strip /stirling prefix before proxying
-    handle_path /stirling* {
-        reverse_proxy http://127.0.0.1:8080
-    }
+	# ── Security: Block sensitive file & path-traversal access ──────────────
+	# CRITICAL: SnapOtter serves static files from its working dir.
+	# Without these blocks, /.env, /.env.local, /file=../../.env etc. return 200.
+	@sensitive {
+		path /.env
+		path /.env.*
+		path /.env-*
+		path /.streamlit
+		path /.streamlit/*
+		path /.git
+		path /.git/*
+		path /.ssh/*
+		path /.aws/*
+		path /secrets
+		path /secrets/*
+	}
+	respond @sensitive "Forbidden" 403
 
-    # 2. Apex Portal static files — explicitly served from /srv/portal
-    handle /portal/* {
-        root * /srv/portal
-        file_server
-    }
+	# Block path-traversal file-serving attempts (e.g. /file=../../.env)
+	@traversal path_regexp traversal `^/file[=\?]?\.\.`
+	respond @traversal "Forbidden" 403
 
-    # 3. Root and index — serve portal index.html
-    handle / {
-        root * /srv/portal
-        file_server {
-            index index.html
-        }
-    }
+	# Block common secret file extensions served from any path
+	@secretfiles path_regexp secretfiles `\.(flock|toml|key|pem|p12|pfx|crt|cert)$`
+	respond @secretfiles "Forbidden" 403
 
-    handle /index.html {
-        root * /srv/portal
-        file_server
-    }
+	# ── Security Headers ──────────────────────────────────────────────────────
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		X-XSS-Protection "1; mode=block"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
 
-    # 4. SnapOtter — catch-all for everything else
-    handle {
-        reverse_proxy http://127.0.0.1:1349 {
-            header_up Host {host}
-            header_up X-Real-IP {remote_host}
-            transport http {
-                response_header_timeout 300s
-                dial_timeout 30s
-            }
-        }
-    }
+	# ── 1. Stirling-PDF — strip /stirling prefix before proxying ─────────────
+	handle_path /stirling* {
+		reverse_proxy http://127.0.0.1:8080
+	}
+
+	# ── 2. Apex Portal static files — explicitly served from /srv/portal ─────
+	handle /portal/* {
+		root * /srv/portal
+		file_server
+	}
+
+	# ── 3. Root and index — serve portal index.html ───────────────────────────
+	handle / {
+		root * /srv/portal
+		file_server {
+			index index.html
+		}
+	}
+
+	handle /index.html {
+		root * /srv/portal
+		file_server
+	}
+
+	# ── 4. SnapOtter — catch-all for everything else ──────────────────────────
+	handle {
+		reverse_proxy http://127.0.0.1:1349 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			transport http {
+				response_header_timeout 300s
+				dial_timeout 30s
+			}
+		}
+	}
 }

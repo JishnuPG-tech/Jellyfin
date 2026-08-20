@@ -40,7 +40,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 RUN mkdir -p /data/Stirling/configs /data/Stirling/logs \
              /data/Stirling/customFiles /data/Stirling/pipeline \
              /data/Stirling/storage /data/files /data/logs \
-             /data/redis /data/.home /tmp/workspace \
+             /data/redis /data/.home /data/ai /tmp/workspace \
              /tmp/caddy/data /tmp/caddy/config
 
 # Environment Configuration
