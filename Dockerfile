@@ -48,7 +48,7 @@ COPY Caddyfile /app/Caddyfile
 COPY entrypoint.sh /app/entrypoint.sh
 COPY portal/ /app/portal/
 
-# Set up universal permissions for Hugging Face Spaces (UID 1000/1001)
+# Set up universal permissions
 RUN chmod +x /app/entrypoint.sh \
     && chown -R stirlingpdfuser:stirlingpdfgroup \
         /app \
@@ -65,9 +65,6 @@ RUN chmod +x /app/entrypoint.sh \
         /usr/local/bin \
         /scripts \
     && chmod -R 777 /tmp /data /app /configs /logs /customFiles /pipeline /storage /usr/local/bin
-
-# Switch to non-root user (UID 1000)
-USER stirlingpdfuser
 
 # Environment variables
 ENV SYSTEM_ROOTURIPATH="/stirling" \
@@ -91,5 +88,6 @@ ENV SYSTEM_ROOTURIPATH="/stirling" \
 # Hugging Face default container port
 EXPOSE 7860
 
-# Run multi-service entrypoint
+# Run entrypoint as root to fix mount volume permissions before Stirling drops to non-root
+USER root
 ENTRYPOINT ["/app/entrypoint.sh"]
