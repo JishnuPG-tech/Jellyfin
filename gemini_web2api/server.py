@@ -124,10 +124,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            clean_path = self.path.split("?")[0].rstrip("/")
+            if clean_path in ("", "/v1", "/gemini"):
+                self.send_json({
+                    "status": "online",
+                    "service": "Gemini Web2API",
+                    "version": __version__,
+                    "endpoints": {
+                        "chat_completions": "/v1/chat/completions",
+                        "models": "/v1/models"
+                    },
+                    "models": list(MODELS.keys())
+                })
+                return
+
+            if self.path.startswith("/v1") and not self._authorized() and not self.path.startswith("/v1/models"):
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+
+            if self.path.startswith("/v1/models"):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
@@ -139,10 +154,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
-                self.send_json({"error": "not found"}, 404)
+                self.send_json({"error": "not found", "hint": "Use /v1/models or /v1/chat/completions"}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
