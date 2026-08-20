@@ -1,34 +1,41 @@
-{
-	admin off
-	persist_config off
-	auto_https off
-}
+# ==============================================================================
+# Apex Multi-Project Gateway Configuration
+# Reverse Proxy & Routing for Hugging Face Spaces (Port 7860)
+# ==============================================================================
 
 :7860 {
-	# Stirling-PDF Reverse Proxy
-	@stirling path /stirling*
-	handle @stirling {
-		reverse_proxy 127.0.0.1:8080 {
-			transport http {
-				response_header_timeout 600s
-				read_timeout 600s
-				write_timeout 600s
-			}
-		}
-	}
+    # 1. Stirling-PDF Routing (Full PDF Suite on Port 8080)
+    handle_path /stirling* {
+        reverse_proxy http://127.0.0.1:8080 {
+            header_up X-Forwarded-Prefix /stirling
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
 
-	# -------------------------------------------------------------
-	# Template for Project 2 (Uncomment when adding a new tool)
-	# -------------------------------------------------------------
-	# @tool2 path /tool2*
-	# handle @tool2 {
-	# 	reverse_proxy 127.0.0.1:8081
-	# }
+    # 2. Apex Portal Landing Page (Root & Static Portal Assets)
+    @portal {
+        path /
+        path /index.html
+        path /portal/*
+    }
+    handle @portal {
+        root * /app/portal
+        file_server
+    }
 
-	# Root Dashboard Portal
-	handle {
-		root * /app/portal
-		file_server
-		try_files {path} /index.html
-	}
+    # 3. SnapOtter Routing (200+ Media, Video, Audio & AI Suite on Port 1349)
+    handle {
+        reverse_proxy http://127.0.0.1:1349 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            transport http {
+                response_header_timeout 300s
+            }
+        }
+    }
 }

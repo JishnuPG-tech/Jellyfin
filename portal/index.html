@@ -15,6 +15,7 @@
       --card-hover-border: rgba(99, 102, 241, 0.4);
       --primary: #6366f1;
       --primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+      --otter-gradient: linear-gradient(135deg, #e07832 0%, #f59e0b 100%);
       --text: #f3f4f6;
       --text-muted: #9ca3af;
       --text-dim: #6b7280;
@@ -35,7 +36,7 @@
       background-color: var(--bg);
       background-image: 
         radial-gradient(circle at 15% 15%, rgba(99, 102, 241, 0.12) 0%, transparent 40%),
-        radial-gradient(circle at 85% 85%, rgba(168, 85, 247, 0.1) 0%, transparent 40%),
+        radial-gradient(circle at 85% 85%, rgba(224, 120, 50, 0.1) 0%, transparent 40%),
         radial-gradient(circle at 50% 50%, rgba(14, 165, 233, 0.05) 0%, transparent 60%);
       color: var(--text);
       min-height: 100vh;
@@ -100,14 +101,14 @@
     .subtitle {
       font-size: 1.1rem;
       color: var(--text-muted);
-      max-width: 620px;
+      max-width: 650px;
       margin: 0 auto;
       line-height: 1.6;
     }
 
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
       gap: 1.75rem;
       margin-bottom: 3.5rem;
     }
@@ -136,6 +137,10 @@
       background: var(--primary-gradient);
       opacity: 0;
       transition: opacity 0.3s ease;
+    }
+
+    .card.card-otter::before {
+      background: var(--otter-gradient);
     }
 
     .card:hover {
@@ -175,6 +180,11 @@
       font-size: 1.75rem;
       background: rgba(99, 102, 241, 0.12);
       border: 1px solid rgba(99, 102, 241, 0.25);
+    }
+
+    .icon-wrapper.icon-otter {
+      background: rgba(224, 120, 50, 0.12);
+      border-color: rgba(224, 120, 50, 0.25);
     }
 
     .status-badge {
@@ -245,9 +255,18 @@
       box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
     }
 
+    .launch-btn.btn-otter {
+      background: var(--otter-gradient);
+      box-shadow: 0 4px 15px rgba(224, 120, 50, 0.3);
+    }
+
     .launch-btn:hover {
       transform: translateY(-2px);
       box-shadow: 0 8px 25px rgba(99, 102, 241, 0.45);
+    }
+
+    .launch-btn.btn-otter:hover {
+      box-shadow: 0 8px 25px rgba(224, 120, 50, 0.45);
     }
 
     .launch-btn svg {
@@ -340,8 +359,8 @@
         <span class="spec-value">2 vCPU</span>
       </div>
       <div class="spec-item">
-        <span class="spec-label">Gateway</span>
-        <span class="spec-value">Nginx (Port 7860)</span>
+        <span class="spec-label">Storage</span>
+        <span class="spec-value">Persistent (/data)</span>
       </div>
     </div>
 
@@ -361,47 +380,54 @@
           <span class="tag">OCR / Tesseract</span>
           <span class="tag">LibreOffice</span>
           <span class="tag">PDF Tools</span>
-          <span class="tag">API</span>
+          <span class="tag">Port 8080</span>
         </div>
 
         <a href="/stirling/" class="launch-btn">
-          Launch Application
+          Launch Stirling-PDF
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M5 12h14M12 5l7 7-7 7"/>
           </svg>
         </a>
       </div>
 
-      <!-- Expandable App Card 1 -->
-      <div class="card placeholder-card">
+      <!-- SnapOtter App Card -->
+      <div class="card card-otter">
         <div class="card-header">
-          <div class="icon-wrapper" style="background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1);">🚀</div>
-          <span class="status-badge offline">Slot Available</span>
+          <div class="icon-wrapper icon-otter">🦦</div>
+          <span class="status-badge">
+            <span class="badge-dot"></span> Active
+          </span>
         </div>
-        <h2 class="card-title">Project Slot 2</h2>
-        <p class="card-description">Ready to host your second Docker tool (e.g. IT-Tools, FileBrowser, CyberChef, Jupyter, or custom microservice). Connect to port 8081 via Nginx.</p>
+        <h2 class="card-title">SnapOtter</h2>
+        <p class="card-description">Open-source file processing platform with 200+ tools across Image, Video, Audio, PDF & Documents. Features local AI background removal, OCR, and video transcription.</p>
         
         <div class="tags">
-          <span class="tag">Route: /tool2/</span>
-          <span class="tag">Port 8081</span>
+          <span class="tag">Image / Video / Audio</span>
+          <span class="tag">Local AI Models</span>
+          <span class="tag">Postgres 17 + Redis</span>
+          <span class="tag">Port 1349</span>
         </div>
 
-        <a href="#" class="launch-btn" style="background: rgba(255,255,255,0.08); box-shadow: none; cursor: default; opacity: 0.6;">
-          Ready to Configure
+        <a href="/login" class="launch-btn btn-otter">
+          Launch SnapOtter
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12h14M12 5l7 7-7 7"/>
+          </svg>
         </a>
       </div>
 
-      <!-- Expandable App Card 2 -->
+      <!-- Expandable App Card -->
       <div class="card placeholder-card">
         <div class="card-header">
           <div class="icon-wrapper" style="background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1);">⚡</div>
           <span class="status-badge offline">Slot Available</span>
         </div>
         <h2 class="card-title">Project Slot 3</h2>
-        <p class="card-description">Ready to host your third Docker project or background worker. Connect to port 8082 via Nginx routing.</p>
+        <p class="card-description">Ready to host your third Docker project or background worker (e.g. IT-Tools, FileBrowser, Uptime Kuma, or custom microservice).</p>
         
         <div class="tags">
-          <span class="tag">Route: /tool3/</span>
+          <span class="tag">Available</span>
           <span class="tag">Port 8082</span>
         </div>
 
@@ -412,7 +438,7 @@
     </div>
 
     <footer>
-      <p>Hosted on <a href="https://huggingface.co/spaces/Jishnupg/Apex" target="_blank">Hugging Face Space: Jishnupg/Apex</a> • Powered by Nginx & Docker</p>
+      <p>Hosted on <a href="https://huggingface.co/spaces/Jishnupg/Apex" target="_blank">Hugging Face Space: Jishnupg/Apex</a> • Powered by Caddy & Docker</p>
     </footer>
   </div>
 </body>
