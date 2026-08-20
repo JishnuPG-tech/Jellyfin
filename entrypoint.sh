@@ -5,7 +5,7 @@ echo " Starting Apex Multi-Project Cloud Suite          "
 echo " Hugging Face Space (Persistent Storage Enabled)  "
 echo "=================================================="
 
-# Ensure all persistent and temporary directories exist
+# 1. Ensure all persistent directories exist
 mkdir -p /data/Stirling/configs \
          /data/Stirling/logs \
          /data/Stirling/customFiles \
@@ -18,7 +18,15 @@ mkdir -p /data/Stirling/configs \
          /tmp/stirling-pdf/heap_dumps \
          /tmp/stirling-pdf/libre 2>/dev/null || true
 
-# Load persistent Tesseract OCR language data if present
+# 2. Point /app working directories directly to /data/Stirling persistent storage
+rm -rf /app/configs /app/logs /app/customFiles /app/pipeline /app/storage 2>/dev/null || true
+ln -sfn /data/Stirling/configs /app/configs
+ln -sfn /data/Stirling/logs /app/logs
+ln -sfn /data/Stirling/customFiles /app/customFiles
+ln -sfn /data/Stirling/pipeline /app/pipeline
+ln -sfn /data/Stirling/storage /app/storage
+
+# 3. Load persistent Tesseract OCR language models if present
 if [ -d "/data/Stirling/tessdata" ] && [ "$(ls -A /data/Stirling/tessdata 2>/dev/null)" ]; then
     echo "[Apex] Loading persistent Tesseract OCR language models..."
     cp -rn /data/Stirling/tessdata/* /usr/share/tesseract-ocr/5/tessdata/ 2>/dev/null || true
@@ -40,12 +48,12 @@ cleanup() {
 
 trap cleanup SIGTERM SIGINT
 
-# 1. Start Caddy Gateway on port 7860
+# 4. Start Caddy Gateway on port 7860
 echo "[Apex] Starting Caddy Gateway on Port 7860..."
 caddy run --config /app/Caddyfile --adapter caddyfile &
 CADDY_PID=$!
 
-# 2. Start Stirling-PDF on port 8080
+# 5. Start Stirling-PDF on port 8080
 echo "[Apex] Starting Stirling-PDF Backend..."
 /scripts/init.sh &
 STIRLING_PID=$!

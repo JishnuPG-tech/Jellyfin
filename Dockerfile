@@ -30,16 +30,9 @@ RUN mkdir -p /app/portal \
     /tmp/stirling-pdf \
     /tmp/stirling-pdf/heap_dumps \
     /tmp/stirling-pdf/libre \
+    /configs /logs /customFiles /pipeline /storage \
     /usr/share/tessdata /usr/share/tesseract-ocr/5/tessdata \
     /usr/local/bin
-
-# Symlink system paths to persistent /data/Stirling
-RUN rm -rf /configs /logs /customFiles /pipeline /storage \
-    && ln -sf /data/Stirling/configs /configs \
-    && ln -sf /data/Stirling/logs /logs \
-    && ln -sf /data/Stirling/customFiles /customFiles \
-    && ln -sf /data/Stirling/pipeline /pipeline \
-    && ln -sf /data/Stirling/storage /storage
 
 # Pre-create Stirling diagnostic symlinks during build
 RUN if [ -f /scripts/stirling-diagnostics.sh ]; then \
@@ -62,6 +55,11 @@ RUN chmod +x /app/entrypoint.sh \
         /data \
         /home/stirlingpdfuser \
         /tmp \
+        /configs \
+        /logs \
+        /customFiles \
+        /pipeline \
+        /storage \
         /usr/share/tessdata \
         /usr/share/tesseract-ocr \
         /usr/local/bin \
@@ -69,7 +67,7 @@ RUN chmod +x /app/entrypoint.sh \
     && chmod -R 777 /tmp \
     && chmod -R 777 /usr/local/bin \
     && chmod -R 775 /data \
-    && chmod -R 755 /app
+    && chmod -R 755 /app /configs /logs /customFiles /pipeline /storage
 
 # Switch to non-root user (UID 1000)
 USER stirlingpdfuser
@@ -83,6 +81,7 @@ ENV SYSTEM_ROOTURIPATH="/stirling" \
     UMASK=022 \
     DISABLE_ADDITIONAL_FEATURES="false" \
     DOCKER_ENABLE_SECURITY="false" \
+    CONFIG_FILE="/data/Stirling/configs/settings.yml" \
     STIRLING_TEMPFILES_DIRECTORY="/tmp/stirling-pdf" \
     TMPDIR="/tmp/stirling-pdf" \
     TEMP="/tmp/stirling-pdf" \
