@@ -48,7 +48,7 @@ COPY Caddyfile /app/Caddyfile
 COPY entrypoint.sh /app/entrypoint.sh
 COPY portal/ /app/portal/
 
-# Set up non-root permissions for Hugging Face Spaces (UID 1000)
+# Set up universal permissions for Hugging Face Spaces (UID 1000/1001)
 RUN chmod +x /app/entrypoint.sh \
     && chown -R stirlingpdfuser:stirlingpdfgroup \
         /app \
@@ -64,10 +64,7 @@ RUN chmod +x /app/entrypoint.sh \
         /usr/share/tesseract-ocr \
         /usr/local/bin \
         /scripts \
-    && chmod -R 777 /tmp \
-    && chmod -R 777 /usr/local/bin \
-    && chmod -R 775 /data \
-    && chmod -R 755 /app /configs /logs /customFiles /pipeline /storage
+    && chmod -R 777 /tmp /data /app /configs /logs /customFiles /pipeline /storage /usr/local/bin
 
 # Switch to non-root user (UID 1000)
 USER stirlingpdfuser

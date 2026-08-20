@@ -5,7 +5,7 @@ echo " Starting Apex Multi-Project Cloud Suite          "
 echo " Hugging Face Space (Persistent Storage Enabled)  "
 echo "=================================================="
 
-# 1. Ensure all persistent directories exist
+# 1. Create persistent storage directories with full read/write permissions
 mkdir -p /data/Stirling/configs \
          /data/Stirling/logs \
          /data/Stirling/customFiles \
@@ -18,7 +18,9 @@ mkdir -p /data/Stirling/configs \
          /tmp/stirling-pdf/heap_dumps \
          /tmp/stirling-pdf/libre 2>/dev/null || true
 
-# 2. Point /app working directories directly to /data/Stirling persistent storage
+chmod -R 777 /data /tmp 2>/dev/null || true
+
+# 2. Point /app working directories directly to /data/Stirling
 rm -rf /app/configs /app/logs /app/customFiles /app/pipeline /app/storage 2>/dev/null || true
 ln -sfn /data/Stirling/configs /app/configs
 ln -sfn /data/Stirling/logs /app/logs
