@@ -78,13 +78,15 @@ ENV SYSTEM_ROOTURIPATH="/stirling" \
     UMASK=022 \
     DISABLE_ADDITIONAL_FEATURES="false" \
     DOCKER_ENABLE_SECURITY="false" \
+    STIRLING_BASE_PATH="/data/Stirling/" \
     CONFIG_FILE="/data/Stirling/configs/settings.yml" \
     STIRLING_TEMPFILES_DIRECTORY="/tmp/stirling-pdf" \
     TMPDIR="/tmp/stirling-pdf" \
     TEMP="/tmp/stirling-pdf" \
     TMP="/tmp/stirling-pdf" \
     XDG_DATA_HOME="/tmp/caddy/data" \
-    XDG_CONFIG_HOME="/tmp/caddy/config"
+    XDG_CONFIG_HOME="/tmp/caddy/config" \
+    JAVA_TOOL_OPTIONS="-Dstirling.base-path=/data/Stirling/ -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/Stirling/configs/heap_dumps -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Dspring.threads.virtual.enabled=true -Djava.awt.headless=true -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=50 -XX:MaxMetaspaceSize=256m"
 
 # Hugging Face default container port
 EXPOSE 7860
