@@ -22,24 +22,24 @@ mkdir -p /data/Stirling/configs \
          /data/ai/venv \
          /data/redis \
          /data/.home \
-         /data/postgres \
          /tmp/workspace \
          /tmp/caddy/data \
          /tmp/caddy/config \
          /tmp/stirling-pdf 2>/dev/null || true
 
-# 2. Fix directory ownership and permissions (Strictly 700 for postgres)
+# 2. Fix directory ownership and general permissions
 echo "[Apex] Configuring volume permissions..."
-chmod 700 /data/postgres
-chown -R postgres:postgres /data/postgres 2>/dev/null || true
 chown -R snapotter:snapotter /data/files /data/logs /data/ai /data/redis /data/.home /tmp/workspace 2>/dev/null || true
 chmod -R 777 /data/Stirling /tmp /data/files /data/logs /data/redis /data/.home 2>/dev/null || true
 
 # 3. Bootstrap SnapOtter Postgres if needed
 PGBIN="/usr/lib/postgresql/17/bin"
 PGDATA="/data/postgres"
-if [ ! -f "$PGDATA/PG_VERSION" ]; then
+
+# If pg_control is missing, cluster was not completely initialized
+if [ ! -f "$PGDATA/global/pg_control" ]; then
     echo "[Apex] Initializing SnapOtter embedded PostgreSQL 17..."
+    rm -rf "$PGDATA"
     install -d -o postgres -g postgres -m 700 "$PGDATA"
     su -s /bin/sh postgres -c "$PGBIN/initdb -D $PGDATA --username=snapotter --encoding=UTF8 --locale=C --auth-local=trust --auth-host=trust"
     {
@@ -51,7 +51,8 @@ if [ ! -f "$PGDATA/PG_VERSION" ]; then
     echo "[Apex] PostgreSQL 17 initialized."
 fi
 
-# Ensure 700 permissions right before postgres start
+# Ensure all subdirectories and strict 0700 permissions are guaranteed
+mkdir -p "$PGDATA/pg_notify" "$PGDATA/pg_tblspc" "$PGDATA/pg_twophase" "$PGDATA/pg_snapshots" "$PGDATA/pg_commit_ts" "$PGDATA/pg_logical/snapshots" "$PGDATA/pg_logical/mappings" "$PGDATA/pg_wal" "$PGDATA/pg_stat_tmp" "$PGDATA/pg_subtrans" 2>/dev/null || true
 chmod 700 "$PGDATA"
 chown -R postgres:postgres "$PGDATA"
 
