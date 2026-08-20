@@ -22,51 +22,52 @@ This Space uses a **Reverse Proxy Gateway (Caddy)** architecture, allowing you t
 | :--- | :--- | :--- | :--- |
 | **Portal Hub** | `/` | `7860` | Interactive dashboard listing all hosted tools. |
 | **Stirling-PDF** | `/stirling/` | `8080` | Full-featured offline & private PDF suite (OCR, merge, split, convert, edit). |
-| *Project Slot 2* | `/tool2/` | `8081` | *Ready for your next application* |
+| **Gemini Web2API** | `/v1/` or `/gemini/` | `8081` | OpenAI-compatible API gateway for Google Gemini (Cursor/Cline ready). |
 | *Project Slot 3* | `/tool3/` | `8082` | *Ready for your next application* |
+
+---
+
+## 🤖 Using Gemini Web2API with AI Tools
+
+You can connect **Cursor**, **Cline**, **NextChat**, or any OpenAI-compatible tool to this Space:
+
+* **Base URL**: `https://<your-space-name>.hf.space/v1`
+* **API Key**: `sk-gemini` (or custom key configured in `/data/gemini/config.json`)
+* **Available Models**:
+  * `gemini-3.6-flash`
+  * `gemini-3.6-pro`
+  * `gemini-3.5-pro`
+  * `gemini-3.5-flash`
+
+### Optional: Setting Custom Cookies for Authenticated Gemini Access
+To use your own Gemini account limits:
+1. Copy your Gemini session cookies as a JSON string.
+2. In HF Space Settings -> **Variables and secrets**, add a secret named `GEMINI_COOKIES` with your JSON content.
+3. The Space will automatically persist it to `/data/gemini/cookies.json` upon boot.
 
 ---
 
 ## 💾 Persistent Storage Structure
 
-All Stirling-PDF credentials, user accounts, custom configurations, pipelines, and logs are automatically preserved across restarts in the persistent folder:
+All Stirling-PDF credentials, configurations, pipelines, and Gemini Web2API settings are automatically preserved across restarts:
 
 ```
-/data/Stirling/
-├── configs/       # User accounts, H2 database, settings.yml, password hashes
-├── logs/          # Server and access logs
-├── customFiles/   # Custom fonts, digital signature certificates, stamps
-├── pipeline/      # Saved automated conversion pipelines & workflows
-├── storage/       # File storage
-└── tessdata/      # Custom Tesseract OCR language models (.traineddata)
+/data/
+├── Stirling/
+│   ├── configs/       # User accounts, H2 database, settings.yml
+│   ├── logs/          # Server logs
+│   ├── customFiles/   # Custom fonts, digital signatures, certificates
+│   ├── pipeline/      # Saved automated conversion pipelines & workflows
+│   ├── storage/       # File storage
+│   └── tessdata/      # Custom Tesseract OCR language models (.traineddata)
+└── gemini/
+    ├── config.json    # Gemini Web2API configuration & custom API keys
+    └── cookies.json   # Saved session cookies (optional)
 ```
-
-> **Note**: In Hugging Face Spaces, persistent storage is mounted at `/data`. Everything under `/data/Stirling` remains completely safe and persists across container restarts, rebuilds, and redeployments.
-
----
-
-## 🔐 Enabling Authentication & Security in Stirling-PDF
-
-To enable login authentication, set these environment variables in your Hugging Face Space Settings (**Settings -> Variables and secrets**):
-
-* `DOCKER_ENABLE_SECURITY`: `true`
-* `SECURITY_ENABLELOGIN`: `true`
-* `SECURITY_INITIALLOGIN_USERNAME`: `admin`
-* `SECURITY_INITIALLOGIN_PASSWORD`: `<your-secure-password>`
-
-*Once created, all user credentials and settings are permanently saved to `/data/Stirling/configs/`.*
-
----
-
-## ➕ How to Add Another Docker Project to this Space
-
-1. **Install/Copy your tool in `Dockerfile`**
-2. **Start the service in `entrypoint.sh`** (e.g. `/my-tool --port 8081 &`)
-3. **Add the route in `Caddyfile`** (e.g. `handle @tool2 { reverse_proxy 127.0.0.1:8081 }`)
-4. **Update `portal/index.html`** with the new tool link.
 
 ---
 
 ## 📄 License & Credits
 * [Stirling-PDF](https://github.com/Stirling-Tools/Stirling-PDF) — GPL-3.0 License
+* [gemini-web2api](https://github.com/Sophomoresty/gemini-web2api) — MIT License
 * Powered by [Hugging Face Spaces](https://huggingface.co/spaces)

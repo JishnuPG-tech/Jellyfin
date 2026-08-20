@@ -1,20 +1,33 @@
 # ==============================================================================
-# Apex Multi-Tool Cloud Space
-# Architecture: Stirling-PDF + Caddy Gateway + Portal Hub
+# Apex Multi-Project Cloud Space
+# Architecture: Stirling-PDF + Gemini Web2API + Caddy Gateway + Portal Hub
 # Optimized for Hugging Face Spaces (Persistent Storage + Fast Boot)
 # ==============================================================================
 
 # Stage 1: Clean Caddy binary
 FROM caddy:2-alpine AS caddy-source
 
-# Stage 2: Official Stirling-PDF (Complete PDF suite with OCR, LibreOffice, WeasyPrint)
+# Stage 2: Official Stirling-PDF (Complete PDF suite with OCR & Python runtime)
 FROM stirlingtools/stirling-pdf:latest
 
 USER root
 
-# Install Caddy
+# Install Caddy Gateway
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
 RUN chmod +x /usr/local/bin/caddy
+
+# Install Python requirements for Gemini Web2API
+RUN if [ -f /opt/venv/bin/pip ]; then \
+        /opt/venv/bin/pip install --no-cache-dir httpx; \
+    else \
+        apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-venv && \
+        pip3 install --no-cache-dir httpx && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# Install Gemini Web2API service
+RUN mkdir -p /opt/gemini_web2api /etc/gemini_web2api /data/gemini
+COPY gemini_web2api/ /opt/gemini_web2api/gemini_web2api/
+COPY gemini_config.json /etc/gemini_web2api/config.json
 
 # Portal Dashboard
 RUN mkdir -p /srv/portal
@@ -32,6 +45,7 @@ RUN mkdir -p /data/Stirling/configs \
              /data/Stirling/pipeline \
              /data/Stirling/storage \
              /data/Stirling/tessdata \
+             /data/gemini \
              /tmp/stirling-pdf \
              /tmp/caddy/data \
              /tmp/caddy/config
@@ -44,11 +58,13 @@ ENV PORT="8080" \
     CONFIG_FILE="/data/Stirling/configs/settings.yml" \
     STORAGE_LOCAL_BASEPATH="/data/Stirling/storage" \
     STIRLING_TEMPFILES_DIRECTORY="/tmp/stirling-pdf" \
+    GEMINI_PORT="8081" \
+    GEMINI_CONFIG="/data/gemini/config.json" \
     XDG_DATA_HOME="/tmp/caddy/data" \
     XDG_CONFIG_HOME="/tmp/caddy/config" \
-    JAVA_TOOL_OPTIONS="-Dstirling.base-path=/data/Stirling/ -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/Stirling/configs/heap_dumps -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Dspring.threads.virtual.enabled=true -Djava.awt.headless=true -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=60 -XX:MaxMetaspaceSize=384m"
+    JAVA_TOOL_OPTIONS="-Dstirling.base-path=/data/Stirling/ -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/Stirling/configs/heap_dumps -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Dspring.threads.virtual.enabled=true -Djava.awt.headless=true -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=50 -XX:MaxMetaspaceSize=384m"
 
-# Hugging Face Spaces port
+# Hugging Face Spaces default port
 EXPOSE 7860
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

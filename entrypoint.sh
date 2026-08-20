@@ -4,7 +4,7 @@ set -e
 echo "=================================================="
 echo " 🚀 Starting Apex Multi-Tool Cloud Suite          "
 echo " Hugging Face Space (Persistent Storage Enabled)  "
-echo " Included: Stirling-PDF + Caddy Gateway + Portal  "
+echo " Included: Stirling-PDF + Gemini Web2API + Caddy  "
 echo "=================================================="
 
 # ── 1. Initialize persistent storage layout ───────────────────────────────────
@@ -15,22 +15,44 @@ mkdir -p /data/Stirling/configs \
          /data/Stirling/pipeline \
          /data/Stirling/storage \
          /data/Stirling/tessdata \
+         /data/gemini \
          /tmp/stirling-pdf \
          /tmp/caddy/data \
          /tmp/caddy/config \
          2>/dev/null || true
 
+# ── 2. Configure Gemini Web2API config in persistent storage ───────────────────
+if [ ! -f "/data/gemini/config.json" ]; then
+    echo "[Apex] Initializing default Gemini Web2API configuration in /data/gemini/config.json..."
+    cp /etc/gemini_web2api/config.json /data/gemini/config.json 2>/dev/null || true
+fi
+
+# If GEMINI_COOKIES env/secret is provided, write to /data/gemini/cookies.json
+if [ -n "${GEMINI_COOKIES:-}" ]; then
+    echo "[Apex] Configuring Gemini cookies from environment secret..."
+    echo "$GEMINI_COOKIES" > /data/gemini/cookies.json
+fi
+
+# Locate Python runtime
+PYTHON_BIN="python3"
+if [ -f "/opt/venv/bin/python3" ]; then
+    PYTHON_BIN="/opt/venv/bin/python3"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+fi
+
 cleanup() {
-    echo "[Apex] Received termination signal. Stopping services..."
-    [ -n "$CADDY_PID" ] && kill -TERM "$CADDY_PID" 2>/dev/null || true
-    [ -n "$STIRLING_PID" ] && kill -TERM "$STIRLING_PID" 2>/dev/null || true
+    echo "[Apex] Received termination signal. Stopping all services..."
+    [ -n "${CADDY_PID:-}" ] && kill -TERM "$CADDY_PID" 2>/dev/null || true
+    [ -n "${STIRLING_PID:-}" ] && kill -TERM "$STIRLING_PID" 2>/dev/null || true
+    [ -n "${GEMINI_PID:-}" ] && kill -TERM "$GEMINI_PID" 2>/dev/null || true
     echo "[Apex] Services stopped."
     exit 0
 }
 
 trap cleanup SIGTERM SIGINT
 
-# ── 2. Locate Stirling-PDF jar ────────────────────────────────────────────────
+# ── 3. Locate Stirling-PDF jar ────────────────────────────────────────────────
 echo "[Apex] Locating Stirling-PDF application..."
 APP_JAR=""
 for candidate in /app/app.jar /app.jar /stirling-app/app.jar; do
@@ -44,10 +66,10 @@ if [ -z "$APP_JAR" ]; then
     APP_JAR="$(find / -name "app.jar" 2>/dev/null | head -n 1)"
 fi
 
-echo "[Apex] Found application jar at: ${APP_JAR:-/app/app.jar}"
+echo "[Apex] Found Stirling-PDF jar at: ${APP_JAR:-/app/app.jar}"
 APP_DIR="$(dirname "${APP_JAR:-/app/app.jar}")"
 
-# ── 3. Start Stirling-PDF backend on Port 8080 ────────────────────────────────
+# ── 4. Start Stirling-PDF backend on Port 8080 ────────────────────────────────
 echo "[Apex] Starting Stirling-PDF Backend on Port 8080..."
 (
     cd "$APP_DIR"
@@ -62,16 +84,32 @@ echo "[Apex] Starting Stirling-PDF Backend on Port 8080..."
 ) &
 STIRLING_PID=$!
 
-# ── 4. Start Caddy Gateway on Port 7860 ───────────────────────────────────────
+# ── 5. Start Gemini Web2API backend on Port 8081 ──────────────────────────────
+echo "[Apex] Starting Gemini Web2API on Port 8081..."
+(
+    cd /opt/gemini_web2api
+    COOKIE_ARG=()
+    if [ -f "/data/gemini/cookies.json" ]; then
+        COOKIE_ARG=(--cookie-file "/data/gemini/cookies.json")
+    fi
+    exec "$PYTHON_BIN" -m gemini_web2api \
+        --port 8081 \
+        --config "/data/gemini/config.json" \
+        "${COOKIE_ARG[@]}"
+) &
+GEMINI_PID=$!
+
+# ── 6. Start Caddy Gateway on Port 7860 ───────────────────────────────────────
 echo "[Apex] Starting Caddy Gateway on Port 7860..."
 caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
 CADDY_PID=$!
 
 echo "[Apex] All services dispatched!"
-echo "[Apex]   Portal Hub    → http://0.0.0.0:7860/"
-echo "[Apex]   Stirling-PDF  → http://0.0.0.0:7860/stirling"
+echo "[Apex]   Portal Hub      → http://0.0.0.0:7860/"
+echo "[Apex]   Stirling-PDF    → http://0.0.0.0:7860/stirling"
+echo "[Apex]   Gemini Web2API  → http://0.0.0.0:7860/v1"
 
-# ── 5. Process Supervisor ──────────────────────────────────────────────────────
+# ── 7. Process Supervisor ──────────────────────────────────────────────────────
 sleep 3
 
 while true; do
@@ -94,6 +132,22 @@ while true; do
                 -jar "$APP_JAR"
         ) &
         STIRLING_PID=$!
+    fi
+
+    if ! kill -0 "$GEMINI_PID" 2>/dev/null; then
+        echo "[Apex] WARNING: Gemini Web2API exited — restarting..."
+        (
+            cd /opt/gemini_web2api
+            COOKIE_ARG=()
+            if [ -f "/data/gemini/cookies.json" ]; then
+                COOKIE_ARG=(--cookie-file "/data/gemini/cookies.json")
+            fi
+            exec "$PYTHON_BIN" -m gemini_web2api \
+                --port 8081 \
+                --config "/data/gemini/config.json" \
+                "${COOKIE_ARG[@]}"
+        ) &
+        GEMINI_PID=$!
     fi
 
     sleep 5
