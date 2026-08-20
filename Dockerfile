@@ -1,6 +1,6 @@
 # ==============================================================================
 # Apex Multi-Project Cloud Space (Stirling-PDF + Microservices Gateway)
-# Optimized for Hugging Face Spaces Free Tier (2 vCPU, 16 GB RAM, 50 GB Disk)
+# Optimized for Hugging Face Spaces (Persistent Storage + Free Tier)
 # ==============================================================================
 
 # Stage 1: Get clean, standalone Caddy binary
@@ -15,9 +15,15 @@ USER root
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
 RUN chmod +x /usr/local/bin/caddy
 
-# Set up working directory, directories & permissions
+# Set up working directory, persistent storage root & system directories
 WORKDIR /app
 RUN mkdir -p /app/portal \
+    /data/Stirling/configs \
+    /data/Stirling/logs \
+    /data/Stirling/customFiles \
+    /data/Stirling/pipeline \
+    /data/Stirling/storage \
+    /data/Stirling/tessdata \
     /home/stirlingpdfuser \
     /tmp/caddy/data \
     /tmp/caddy/config \
@@ -46,6 +52,7 @@ COPY portal/ /app/portal/
 RUN chmod +x /app/entrypoint.sh \
     && chown -R stirlingpdfuser:stirlingpdfgroup \
         /app \
+        /data \
         /home/stirlingpdfuser \
         /tmp \
         /configs \
@@ -59,6 +66,7 @@ RUN chmod +x /app/entrypoint.sh \
         /scripts \
     && chmod -R 777 /tmp \
     && chmod -R 777 /usr/local/bin \
+    && chmod -R 775 /data \
     && chmod -R 755 /app
 
 # Switch to non-root user (UID 1000)
