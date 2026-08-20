@@ -30,9 +30,16 @@ RUN mkdir -p /app/portal \
     /tmp/stirling-pdf \
     /tmp/stirling-pdf/heap_dumps \
     /tmp/stirling-pdf/libre \
-    /configs /logs /customFiles /pipeline /storage \
     /usr/share/tessdata /usr/share/tesseract-ocr/5/tessdata \
     /usr/local/bin
+
+# Symlink system paths to persistent /data/Stirling
+RUN rm -rf /configs /logs /customFiles /pipeline /storage \
+    && ln -sf /data/Stirling/configs /configs \
+    && ln -sf /data/Stirling/logs /logs \
+    && ln -sf /data/Stirling/customFiles /customFiles \
+    && ln -sf /data/Stirling/pipeline /pipeline \
+    && ln -sf /data/Stirling/storage /storage
 
 # Pre-create Stirling diagnostic symlinks during build
 RUN if [ -f /scripts/stirling-diagnostics.sh ]; then \
@@ -55,11 +62,6 @@ RUN chmod +x /app/entrypoint.sh \
         /data \
         /home/stirlingpdfuser \
         /tmp \
-        /configs \
-        /logs \
-        /customFiles \
-        /pipeline \
-        /storage \
         /usr/share/tessdata \
         /usr/share/tesseract-ocr \
         /usr/local/bin \
