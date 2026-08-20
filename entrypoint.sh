@@ -43,7 +43,7 @@ checkpoint_completion_target = 0.9
 PGCONF
 
     # Bootstrap DB and user (use single-user mode so no running server needed)
-    su -s /bin/sh postgres -c "$PGBIN/postgres --single -D $PGDATA snapotter" <<'EOF'
+    su -s /bin/sh postgres -c "$PGBIN/postgres --single -D $PGDATA postgres" <<'EOF'
 CREATE DATABASE snapotter OWNER snapotter;
 ALTER ROLE snapotter WITH PASSWORD 'snapotter';
 EOF
