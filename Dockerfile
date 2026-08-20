@@ -26,7 +26,7 @@ RUN chmod +x /usr/local/bin/caddy
 
 # Set up Stirling-PDF
 RUN mkdir -p /stirling /data/Stirling/configs /data/Stirling/logs /data/Stirling/customFiles /data/Stirling/pipeline /data/Stirling/storage /tmp/stirling-pdf
-COPY --from=stirling-source /app.jar /stirling/app.jar
+COPY --from=stirling-source /app/app.jar /stirling/app.jar
 
 # Copy Portal, Caddyfile, and multi-service Entrypoint
 COPY portal/ /app/portal/
