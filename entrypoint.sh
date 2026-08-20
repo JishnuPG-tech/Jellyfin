@@ -33,9 +33,11 @@ if [ -n "${GEMINI_COOKIES:-}" ]; then
     echo "$GEMINI_COOKIES" > /data/gemini/cookies.json
 fi
 
-# Locate Python runtime
+# Locate Python runtime for Gemini Web2API
 PYTHON_BIN="python3"
-if [ -f "/opt/venv/bin/python3" ]; then
+if [ -f "/opt/gemini_venv/bin/python3" ]; then
+    PYTHON_BIN="/opt/gemini_venv/bin/python3"
+elif [ -f "/opt/venv/bin/python3" ]; then
     PYTHON_BIN="/opt/venv/bin/python3"
 elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python3)"

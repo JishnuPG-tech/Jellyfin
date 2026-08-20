@@ -7,7 +7,7 @@
 # Stage 1: Clean Caddy binary
 FROM caddy:2-alpine AS caddy-source
 
-# Stage 2: Official Stirling-PDF (Complete PDF suite with OCR & Python runtime)
+# Stage 2: Official Stirling-PDF (Complete PDF suite)
 FROM stirlingtools/stirling-pdf:latest
 
 USER root
@@ -16,13 +16,12 @@ USER root
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
 RUN chmod +x /usr/local/bin/caddy
 
-# Install Python requirements for Gemini Web2API
-RUN if [ -f /opt/venv/bin/pip ]; then \
-        /opt/venv/bin/pip install --no-cache-dir httpx; \
-    else \
-        apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-venv && \
-        pip3 install --no-cache-dir httpx && rm -rf /var/lib/apt/lists/*; \
-    fi
+# Set up clean isolated Python environment for Gemini Web2API
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-httpx || true && \
+    python3 -m venv /opt/gemini_venv && \
+    /opt/gemini_venv/bin/pip install --no-cache-dir httpx || true && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install Gemini Web2API service
 RUN mkdir -p /opt/gemini_web2api /etc/gemini_web2api /data/gemini
