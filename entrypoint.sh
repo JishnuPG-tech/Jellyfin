@@ -14,14 +14,36 @@ PGDATA="/data/postgres"
 
 pg_init() {
     echo "[Apex] Initializing fresh PostgreSQL 17 cluster..."
-    rm -rf "$PGDATA"
+    # Safe wipe: delete contents recursively but tolerate protected files on
+    # persistent volumes (rm -rf can fail silently on some HF volume mounts).
+    find "$PGDATA" -mindepth 1 -delete 2>/dev/null || rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.[!.]* 2>/dev/null || true
+    rmdir "$PGDATA" 2>/dev/null || true
     install -d -o postgres -g postgres -m 700 "$PGDATA"
     su -s /bin/sh postgres -c \
         "$PGBIN/initdb -D $PGDATA --username=snapotter \
          --encoding=UTF8 --locale=C --auth-local=trust --auth-host=trust"
-    printf "listen_addresses = '127.0.0.1'\ndynamic_shared_memory_type = mmap\n" \
-        >> "$PGDATA/postgresql.conf"
-    su -s /bin/sh postgres -c "$PGBIN/postgres --single -D $PGDATA postgres" <<'EOF'
+
+    # Container-optimised postgresql.conf settings
+    cat >> "$PGDATA/postgresql.conf" <<'PGCONF'
+listen_addresses        = '127.0.0.1'
+dynamic_shared_memory_type = mmap
+unix_socket_directories = '/tmp'
+# Improve resilience against transient I/O errors on HF persistent volumes
+data_sync_retry         = on
+# Reduce fsync cost on container restart; HF storage is already durable
+full_page_writes        = off
+synchronous_commit      = off
+wal_level               = minimal
+max_wal_senders         = 0
+# Performance tuning
+shared_buffers          = 128MB
+effective_cache_size    = 512MB
+checkpoint_timeout      = 15min
+checkpoint_completion_target = 0.9
+PGCONF
+
+    # Bootstrap DB and user (use single-user mode so no running server needed)
+    su -s /bin/sh postgres -c "$PGBIN/postgres --single -D $PGDATA snapotter" <<'EOF'
 CREATE DATABASE snapotter OWNER snapotter;
 ALTER ROLE snapotter WITH PASSWORD 'snapotter';
 EOF
@@ -29,8 +51,8 @@ EOF
 }
 
 pg_ensure_dirs() {
-    # PostgreSQL will create most dirs itself, but after an unclean shutdown
-    # some may be missing. Pre-create all required ones.
+    # Pre-create WAL/transaction subdirectories that may vanish after
+    # an unclean shutdown on a persistent volume.
     mkdir -p \
         "$PGDATA/pg_commit_ts" "$PGDATA/pg_dynshmem" \
         "$PGDATA/pg_logical/snapshots" "$PGDATA/pg_logical/mappings" \
@@ -42,6 +64,51 @@ pg_ensure_dirs() {
         "$PGDATA/pg_xact" 2>/dev/null || true
     chmod 700 "$PGDATA"
     chown -R postgres:postgres "$PGDATA"
+}
+
+pg_start() {
+    # Use -k /tmp so the Unix socket is on tmpfs (avoids HF persistent-volume
+    # locking quirks that can cause "postmaster.pid" FATAL errors).
+    su -s /bin/sh postgres -c \
+        "HOME=/var/lib/postgresql $PGBIN/postgres -D $PGDATA -k /tmp" &
+    PG_PID=$!
+}
+
+pg_wait_ready() {
+    # Wait up to 300s. During crash recovery (fsync phase) pg_isready returns
+    # "the database system is starting up" — this is NORMAL. Only reinitialise
+    # if pg_control is gone (genuine data loss), otherwise just restart.
+    echo "[Apex] Waiting for PostgreSQL to accept connections (up to 300s)..."
+    PG_READY=0
+    for i in $(seq 1 300); do
+        if su -s /bin/sh postgres -c \
+               "$PGBIN/pg_isready -h 127.0.0.1 -p 5432 -U snapotter -q" \
+               2>/dev/null; then
+            echo "[Apex] PostgreSQL ready after ${i}s."
+            PG_READY=1
+            break
+        fi
+
+        # If the postmaster died mid-recovery, decide whether to restart or reinit
+        if ! kill -0 "$PG_PID" 2>/dev/null; then
+            if [ -f "$PGDATA/global/pg_control" ]; then
+                # Data is intact — just restart; do NOT call pg_init (no data wipe)
+                echo "[Apex] PostgreSQL crashed mid-recovery — restarting (data intact)..."
+                pg_ensure_dirs
+                pg_start
+            else
+                # pg_control is gone — data is unrecoverable, reinitialise
+                echo "[Apex] PostgreSQL data lost — reinitialising cluster..."
+                pg_init
+                pg_ensure_dirs
+                pg_start
+            fi
+        fi
+
+        [ $((i % 10)) -eq 0 ] && \
+            echo "[Apex] Still waiting for PostgreSQL... (${i}s elapsed, recovery in progress)"
+        sleep 1
+    done
 }
 
 cleanup() {
@@ -60,16 +127,19 @@ mkdir -p /data/Stirling/configs /data/Stirling/logs /data/Stirling/customFiles \
          /data/Stirling/pipeline /data/Stirling/storage \
          /data/files /data/logs /data/redis /data/.home /data/ai \
          /tmp/workspace /tmp/caddy/data /tmp/caddy/config /tmp/stirling-pdf \
+         /tmp/pg-socket \
          2>/dev/null || true
 
 echo "[Apex] Configuring volume permissions..."
 chown -R snapotter:snapotter /data/files /data/logs /data/redis /data/.home \
     /data/ai /tmp/workspace 2>/dev/null || true
 chmod 755 /data/ai 2>/dev/null || true
+# Ensure postgres user owns its socket dir
+chown postgres:postgres /tmp/pg-socket 2>/dev/null || true
+chmod 755 /tmp/pg-socket 2>/dev/null || true
 
 # ── 2. PostgreSQL cluster setup ────────────────────────────────────────────────
-# CRITICAL: Check FIRST, then ensure subdirs, then start.
-# Previous bug: health check ran before mkdir → always re-init.
+# Check FIRST, then ensure subdirs, then start.
 if [ -f "$PGDATA/global/pg_control" ]; then
     echo "[Apex] Existing PostgreSQL cluster found — ensuring directory integrity..."
     pg_ensure_dirs
@@ -83,32 +153,8 @@ trap cleanup SIGTERM SIGINT
 
 # ── 3. Start PostgreSQL 17 ─────────────────────────────────────────────────────
 echo "[Apex] Starting PostgreSQL 17..."
-su -s /bin/sh postgres -c "$PGBIN/postgres -D $PGDATA" &
-PG_PID=$!
-
-# Wait up to 300s for PostgreSQL to accept connections.
-# During crash recovery PG does a long fsync (can take 60-120s) — all
-# incoming pg_isready attempts get "FATAL: database system is starting up".
-# This is NORMAL — do NOT reinit. Only reinit if the PG process itself dies.
-echo "[Apex] Waiting for PostgreSQL to accept connections (up to 300s)..."
-PG_READY=0
-for i in $(seq 1 300); do
-    if su -s /bin/sh postgres -c "$PGBIN/pg_isready -h 127.0.0.1 -p 5432 -U snapotter -q" 2>/dev/null; then
-        echo "[Apex] PostgreSQL ready after ${i}s."
-        PG_READY=1
-        break
-    fi
-    # Only reinit if the PG postmaster process itself has exited (genuine crash)
-    if ! kill -0 "$PG_PID" 2>/dev/null; then
-        echo "[Apex] PostgreSQL process died — reinitializing cluster..."
-        pg_init
-        pg_ensure_dirs
-        su -s /bin/sh postgres -c "$PGBIN/postgres -D $PGDATA" &
-        PG_PID=$!
-    fi
-    [ $((i % 10)) -eq 0 ] && echo "[Apex] Still waiting for PostgreSQL... (${i}s elapsed, recovery in progress)"
-    sleep 1
-done
+pg_start
+pg_wait_ready
 
 if [ "$PG_READY" -eq 0 ]; then
     echo "[Apex] FATAL: PostgreSQL failed to start within 300s. Aborting."
@@ -148,9 +194,9 @@ export DATA_DIR="/data"
 export WORKSPACE_PATH="/tmp/workspace"
 export HOME="/data/.home"
 export PORT="1349"
-export AUTH_ENABLED="true"
-export DEFAULT_USERNAME="admin"
-export DEFAULT_PASSWORD="admin"
+export AUTH_ENABLED="${AUTH_ENABLED:-true}"
+export DEFAULT_USERNAME="${SNAPOTTER_USERNAME:-admin}"
+export DEFAULT_PASSWORD="${SNAPOTTER_PASSWORD:-admin}"
 
 (
   cd /app/apps/api
@@ -168,18 +214,67 @@ echo "[Apex] Starting Caddy Gateway on Port 7860..."
 caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
 CADDY_PID=$!
 
-echo "[Apex] All services online! Gateway → http://0.0.0.0:7860"
-echo "[Apex]   Portal     → /"
-echo "[Apex]   SnapOtter  → / (AI tools)"
-echo "[Apex]   Stirling   → /stirling"
+echo "[Apex] All services dispatched!"
+echo "[Apex]   Portal     → https://jishnupg-apex.hf.space/"
+echo "[Apex]   SnapOtter  → https://jishnupg-apex.hf.space/ (AI tools)"
+echo "[Apex]   Stirling   → https://jishnupg-apex.hf.space/stirling"
 
-# ── 8. Process monitor ─────────────────────────────────────────────────────────
+# ── 8. Process supervisor ──────────────────────────────────────────────────────
+# Monitor all critical services and restart where possible.
 while true; do
+    # Caddy: gateway must stay up — if it dies, shut everything down
     if ! kill -0 "$CADDY_PID" 2>/dev/null; then
-        echo "[Apex] Caddy exited — shutting down."; cleanup
+        echo "[Apex] CRITICAL: Caddy gateway exited — shutting down."
+        cleanup
     fi
+
+    # PostgreSQL: restart without data wipe if pg_control is intact
     if ! kill -0 "$PG_PID" 2>/dev/null; then
-        echo "[Apex] PostgreSQL exited — shutting down."; cleanup
+        if [ -f "$PGDATA/global/pg_control" ]; then
+            echo "[Apex] WARNING: PostgreSQL exited — restarting (data intact)..."
+            pg_ensure_dirs
+            pg_start
+        else
+            echo "[Apex] CRITICAL: PostgreSQL data lost — reinitialising and restarting..."
+            pg_init
+            pg_ensure_dirs
+            pg_start
+        fi
     fi
+
+    # SnapOtter: auto-restart on crash
+    if ! kill -0 "$SNAPOTTER_PID" 2>/dev/null; then
+        echo "[Apex] WARNING: SnapOtter exited — restarting..."
+        (
+          cd /app/apps/api
+          exec su -s /bin/sh snapotter -c \
+            "export HOME=/data/.home && \
+             ./node_modules/.bin/tsx \
+               --import ./src/tracing.ts \
+               --import ./src/instrument.ts \
+               src/index.ts"
+        ) &
+        SNAPOTTER_PID=$!
+    fi
+
+    # Stirling-PDF: auto-restart on crash
+    if ! kill -0 "$STIRLING_PID" 2>/dev/null; then
+        echo "[Apex] WARNING: Stirling-PDF exited — restarting..."
+        (
+          cd /stirling-app
+          exec java \
+            -Dstirling.base-path=/data/Stirling/ \
+            -Dserver.port=8080 \
+            -XX:+UseG1GC -XX:MaxGCPauseMillis=200 \
+            -Dspring.threads.virtual.enabled=true \
+            -Djava.awt.headless=true \
+            -XX:InitialRAMPercentage=5 -XX:MaxRAMPercentage=25 \
+            -XX:MaxMetaspaceSize=256m \
+            -cp "/stirling-app/app.jar:/stirling-app/lib/*" \
+            stirling.software.SPDF.SPDFApplication
+        ) &
+        STIRLING_PID=$!
+    fi
+
     sleep 5
 done
