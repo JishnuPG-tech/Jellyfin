@@ -85,30 +85,32 @@ echo "[Apex] Starting PostgreSQL 17..."
 su -s /bin/sh postgres -c "$PGBIN/postgres -D $PGDATA" &
 PG_PID=$!
 
-# Wait up to 60s for PostgreSQL to accept connections.
-# If it crashes during recovery (corrupted cluster), reinit and retry once.
-echo "[Apex] Waiting for PostgreSQL to accept connections..."
+# Wait up to 300s for PostgreSQL to accept connections.
+# During crash recovery PG does a long fsync (can take 60-120s) — all
+# incoming pg_isready attempts get "FATAL: database system is starting up".
+# This is NORMAL — do NOT reinit. Only reinit if the PG process itself dies.
+echo "[Apex] Waiting for PostgreSQL to accept connections (up to 300s)..."
 PG_READY=0
-for i in $(seq 1 60); do
+for i in $(seq 1 300); do
     if su -s /bin/sh postgres -c "$PGBIN/pg_isready -h 127.0.0.1 -p 5432 -q" 2>/dev/null; then
         echo "[Apex] PostgreSQL ready after ${i}s."
         PG_READY=1
         break
     fi
+    # Only reinit if the PG postmaster process itself has exited (genuine crash)
     if ! kill -0 "$PG_PID" 2>/dev/null; then
-        echo "[Apex] PostgreSQL crashed during recovery — reinitializing cluster..."
+        echo "[Apex] PostgreSQL process died — reinitializing cluster..."
         pg_init
         pg_ensure_dirs
         su -s /bin/sh postgres -c "$PGBIN/postgres -D $PGDATA" &
         PG_PID=$!
-        sleep 3
-        continue
     fi
+    [ $((i % 10)) -eq 0 ] && echo "[Apex] Still waiting for PostgreSQL... (${i}s elapsed, recovery in progress)"
     sleep 1
 done
 
 if [ "$PG_READY" -eq 0 ]; then
-    echo "[Apex] FATAL: PostgreSQL failed to start within 60s. Aborting."
+    echo "[Apex] FATAL: PostgreSQL failed to start within 300s. Aborting."
     cleanup
 fi
 
