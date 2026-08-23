@@ -50,7 +50,17 @@
 		}
 	}
 
-	# ── 3. Apex Portal Hub (Static Web UI) ────────────────────────────────────
+	# ── 3. PDF Enhancer & Restorer (Streamlit App on /enhancer*) ───────────────
+	handle /enhancer* {
+		reverse_proxy 127.0.0.1:8082 {
+			transport http {
+				response_header_timeout 600s
+				dial_timeout 30s
+			}
+		}
+	}
+
+	# ── 4. Apex Portal Hub (Static Web UI) ────────────────────────────────────
 	handle {
 		root * /srv/portal
 		file_server {

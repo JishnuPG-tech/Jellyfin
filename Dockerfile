@@ -1,6 +1,6 @@
 # ==============================================================================
 # Apex Multi-Project Cloud Space
-# Architecture: Stirling-PDF + Gemini Web2API + Caddy Gateway + Portal Hub
+# Architecture: Stirling-PDF + Gemini Web2API + PDF Enhancer (Streamlit) + Caddy + Portal Hub
 # Optimized for Hugging Face Spaces (Persistent Storage + Fast Boot)
 # ==============================================================================
 
@@ -16,17 +16,21 @@ USER root
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
 RUN chmod +x /usr/local/bin/caddy
 
-# Set up clean isolated Python environment for Gemini Web2API
+# Set up clean isolated Python environment for Gemini Web2API & PDF Enhancer (Streamlit)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 python3-pip python3-venv python3-httpx || true && \
+    apt-get install -y --no-install-recommends python3 python3-pip python3-venv libgl1 libglib2.0-0 || true && \
     python3 -m venv /opt/gemini_venv && \
-    /opt/gemini_venv/bin/pip install --no-cache-dir httpx || true && \
+    /opt/gemini_venv/bin/pip install --no-cache-dir httpx streamlit pymupdf opencv-python-headless numpy pillow || true && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Gemini Web2API service
 RUN mkdir -p /opt/gemini_web2api /etc/gemini_web2api /data/gemini
 COPY gemini_web2api/ /opt/gemini_web2api/gemini_web2api/
 COPY gemini_config.json /etc/gemini_web2api/config.json
+
+# Install PDF Enhancer (Streamlit) service
+RUN mkdir -p /opt/pdf_enhancer
+COPY pdf_enhancer/ /opt/pdf_enhancer/
 
 # Portal Dashboard
 RUN mkdir -p /srv/portal
@@ -59,9 +63,10 @@ ENV PORT="8080" \
     STIRLING_TEMPFILES_DIRECTORY="/tmp/stirling-pdf" \
     GEMINI_PORT="8081" \
     GEMINI_CONFIG="/data/gemini/config.json" \
+    ENHANCER_PORT="8082" \
     XDG_DATA_HOME="/tmp/caddy/data" \
     XDG_CONFIG_HOME="/tmp/caddy/config" \
-    JAVA_TOOL_OPTIONS="-Dstirling.base-path=/data/Stirling/ -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/Stirling/configs/heap_dumps -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Dspring.threads.virtual.enabled=true -Djava.awt.headless=true -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=50 -XX:MaxMetaspaceSize=384m"
+    JAVA_TOOL_OPTIONS="-Dstirling.base-path=/data/Stirling/ -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/Stirling/configs/heap_dumps -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Dspring.threads.virtual.enabled=true -Djava.awt.headless=true -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=40 -XX:MaxMetaspaceSize=384m"
 
 # Hugging Face Spaces default port
 EXPOSE 7860

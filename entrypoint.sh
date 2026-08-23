@@ -4,7 +4,7 @@ set -e
 echo "=================================================="
 echo " 🚀 Starting Apex Multi-Tool Cloud Suite          "
 echo " Hugging Face Space (Persistent Storage Enabled)  "
-echo " Included: Stirling-PDF + Gemini Web2API + Caddy  "
+echo " Included: Stirling-PDF + Gemini Web2API + PDF Enhancer + Caddy "
 echo "=================================================="
 
 # ── 1. Initialize persistent storage layout ───────────────────────────────────
@@ -33,14 +33,18 @@ if [ -n "${GEMINI_COOKIES:-}" ]; then
     echo "$GEMINI_COOKIES" > /data/gemini/cookies.json
 fi
 
-# Locate Python runtime for Gemini Web2API
+# Locate Python runtime
 PYTHON_BIN="python3"
+STREAMLIT_BIN="streamlit"
 if [ -f "/opt/gemini_venv/bin/python3" ]; then
     PYTHON_BIN="/opt/gemini_venv/bin/python3"
+    STREAMLIT_BIN="/opt/gemini_venv/bin/streamlit"
 elif [ -f "/opt/venv/bin/python3" ]; then
     PYTHON_BIN="/opt/venv/bin/python3"
+    STREAMLIT_BIN="/opt/venv/bin/streamlit"
 elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python3)"
+    STREAMLIT_BIN="$(command -v streamlit || echo 'streamlit')"
 fi
 
 cleanup() {
@@ -48,6 +52,7 @@ cleanup() {
     [ -n "${CADDY_PID:-}" ] && kill -TERM "$CADDY_PID" 2>/dev/null || true
     [ -n "${STIRLING_PID:-}" ] && kill -TERM "$STIRLING_PID" 2>/dev/null || true
     [ -n "${GEMINI_PID:-}" ] && kill -TERM "$GEMINI_PID" 2>/dev/null || true
+    [ -n "${ENHANCER_PID:-}" ] && kill -TERM "$ENHANCER_PID" 2>/dev/null || true
     echo "[Apex] Services stopped."
     exit 0
 }
@@ -101,7 +106,22 @@ echo "[Apex] Starting Gemini Web2API on Port 8081..."
 ) &
 GEMINI_PID=$!
 
-# ── 6. Start Caddy Gateway on Port 7860 ───────────────────────────────────────
+# ── 6. Start PDF Enhancer (Streamlit) on Port 8082 ────────────────────────────
+echo "[Apex] Starting PDF Enhancer (Streamlit) on Port 8082..."
+(
+    cd /opt/pdf_enhancer
+    exec "$STREAMLIT_BIN" run app.py \
+        --server.port 8082 \
+        --server.baseUrlPath /enhancer \
+        --server.headless true \
+        --server.enableCORS false \
+        --server.enableXsrfProtection false \
+        --theme.base dark \
+        --theme.primaryColor "#6366f1"
+) &
+ENHANCER_PID=$!
+
+# ── 7. Start Caddy Gateway on Port 7860 ───────────────────────────────────────
 echo "[Apex] Starting Caddy Gateway on Port 7860..."
 caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
 CADDY_PID=$!
@@ -110,8 +130,9 @@ echo "[Apex] All services dispatched!"
 echo "[Apex]   Portal Hub      → http://0.0.0.0:7860/"
 echo "[Apex]   Stirling-PDF    → http://0.0.0.0:7860/stirling"
 echo "[Apex]   Gemini Web2API  → http://0.0.0.0:7860/v1"
+echo "[Apex]   PDF Enhancer    → http://0.0.0.0:7860/enhancer"
 
-# ── 7. Process Supervisor ──────────────────────────────────────────────────────
+# ── 8. Process Supervisor ──────────────────────────────────────────────────────
 sleep 3
 
 while true; do
@@ -150,6 +171,22 @@ while true; do
                 "${COOKIE_ARG[@]}"
         ) &
         GEMINI_PID=$!
+    fi
+
+    if ! kill -0 "$ENHANCER_PID" 2>/dev/null; then
+        echo "[Apex] WARNING: PDF Enhancer exited — restarting..."
+        (
+            cd /opt/pdf_enhancer
+            exec "$STREAMLIT_BIN" run app.py \
+                --server.port 8082 \
+                --server.baseUrlPath /enhancer \
+                --server.headless true \
+                --server.enableCORS false \
+                --server.enableXsrfProtection false \
+                --theme.base dark \
+                --theme.primaryColor "#6366f1"
+        ) &
+        ENHANCER_PID=$!
     fi
 
     sleep 5
