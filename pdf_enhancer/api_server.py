@@ -1,7 +1,9 @@
 """
 FastAPI Async Production Backend for Lucent Document Restorer
-Engineered for ultra-fast previews with intelligent background page pre-caching,
-LRU caching, and 120 FPS client interactivity.
+Upgraded with:
+1. Real-Time Server-Sent Events (SSE) streaming (/api/stream/{task_id})
+2. Multi-Core Parallel Batch Processing
+3. Automatic Ephemeral Storage Garbage Collection Daemon (30-min TTL)
 """
 
 import os
@@ -12,12 +14,12 @@ import base64
 import asyncio
 import tempfile
 import threading
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncGenerator
 from pathlib import Path
 from collections import OrderedDict
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -29,8 +31,8 @@ from pdf_cleaner import DocumentCleaner, CleaningMode, PDFProcessor
 
 app = FastAPI(
     title="Lucent API",
-    version="2.2.0",
-    description="Focus-First Document Whitener & Bleed-Through Restorer"
+    version="2.3.0",
+    description="Enterprise Focus-First Document Whitener & Bleed-Through Restorer"
 )
 
 app.add_middleware(
@@ -41,19 +43,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Storage directories
+# Ephemeral storage directories
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pdf_enhancer_uploads"
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "pdf_enhancer_outputs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# In-memory session & task storage
+# In-memory session, task storage & async event queues for SSE
 sessions: Dict[str, Dict[str, Any]] = {}
 tasks: Dict[str, Dict[str, Any]] = {}
+task_event_queues: Dict[str, List[asyncio.Queue]] = {}
 
-# Ultra-fast LRU Cache for previews: key -> response dict
+# Ultra-fast LRU Cache for previews
 class LRUCache:
-    def __init__(self, capacity: int = 200):
+    def __init__(self, capacity: int = 250):
         self.cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
         self.capacity = capacity
         self.lock = threading.Lock()
@@ -73,7 +76,58 @@ class LRUCache:
             if len(self.cache) > self.capacity:
                 self.cache.popitem(last=False)
 
-preview_cache = LRUCache(capacity=200)
+preview_cache = LRUCache(capacity=250)
+
+
+# ==============================================================================
+# UPGRADE 2: Automatic Ephemeral Storage Garbage Collection Daemon (30-min TTL)
+# ==============================================================================
+CLEANUP_TTL_SECONDS = 1800  # 30 minutes
+
+def cleanup_ephemeral_storage_sync():
+    """Scans and removes temp files & expired sessions older than 30 minutes."""
+    now = time.time()
+    deleted_count = 0
+
+    for folder in [UPLOAD_DIR, OUTPUT_DIR]:
+        if not folder.exists():
+            continue
+        for file_path in folder.glob("*"):
+            try:
+                if file_path.is_file():
+                    age = now - file_path.stat().st_mtime
+                    if age > CLEANUP_TTL_SECONDS:
+                        file_path.unlink()
+                        deleted_count += 1
+            except Exception:
+                pass
+
+    # Expire old in-memory session metadata
+    expired_sessions = [sid for sid, s in sessions.items() if now - s.get("created_at", 0) > CLEANUP_TTL_SECONDS]
+    for sid in expired_sessions:
+        sessions.pop(sid, None)
+
+    if deleted_count > 0:
+        print(f"[Lucent GC] Purged {deleted_count} stale temporary file(s) & {len(expired_sessions)} expired session(s).")
+
+
+async def storage_cleaner_background_loop():
+    """Runs periodic garbage collection every 10 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(600)  # 10 minutes
+            cleanup_ephemeral_storage_sync()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[Lucent GC Error] {e}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Launch background cleanup loop on startup
+    asyncio.create_task(storage_cleaner_background_loop())
+    print("[Lucent Engine] Ephemeral GC Daemon initialized (30-min TTL).")
 
 
 class PreviewRequest(BaseModel):
@@ -88,7 +142,7 @@ class PreviewRequest(BaseModel):
     contrast_thresh: float = 38.0
     adaptive: bool = True
     word_envelope: bool = True
-    dpi: int = 100  # 100 DPI is optimal for instantaneous screen preview
+    dpi: int = 100
 
 
 class ProcessRequest(BaseModel):
@@ -107,14 +161,12 @@ class ProcessRequest(BaseModel):
 
 
 def cv2_to_base64_fast(img: np.ndarray, is_binary: bool = False) -> str:
-    """Ultra-fast image base64 encoder optimized for speed."""
+    """Ultra-fast image base64 encoder."""
     if is_binary and len(img.shape) == 2:
-        # Fast PNG compression
         encode_params = [int(cv2.IMWRITE_PNG_COMPRESSION), 1]
         success, encoded = cv2.imencode(".png", img, encode_params)
         mime = "image/png"
     else:
-        # Fast JPEG compression
         encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 78, int(cv2.IMWRITE_JPEG_OPTIMIZE), 0]
         success, encoded = cv2.imencode(".jpg", img, encode_params)
         mime = "image/jpeg"
@@ -126,7 +178,6 @@ def cv2_to_base64_fast(img: np.ndarray, is_binary: bool = False) -> str:
 
 
 def render_page_preview_sync(pdf_path: str, page_idx: int, req_dict: dict) -> dict:
-    """Core synchronous preview generator."""
     cleaner = DocumentCleaner(
         mode=CleaningMode(req_dict.get("mode", "laser")),
         sauvola_k=req_dict.get("sauvola_k", 0.15),
@@ -174,7 +225,6 @@ def render_page_preview_sync(pdf_path: str, page_idx: int, req_dict: dict) -> di
 
 
 def prefetch_adjacent_pages(session_id: str, pdf_path: str, current_page: int, total_pages: int, req_dict: dict):
-    """Background worker that silently pre-caches adjacent pages (p+1, p+2, p-1) for zero-lag navigation."""
     target_pages = []
     if current_page + 1 < total_pages:
         target_pages.append(current_page + 1)
@@ -198,9 +248,10 @@ async def health_check():
     return {
         "status": "ok",
         "timestamp": time.time(),
-        "engine": "Lucent Fast Engine v2.2",
+        "engine": "Lucent Multi-Core Engine v2.3 (SSE + Auto-GC)",
         "active_sessions": len(sessions),
-        "cached_pages": len(preview_cache.cache)
+        "cached_pages": len(preview_cache.cache),
+        "active_tasks": len(tasks)
     }
 
 
@@ -223,7 +274,6 @@ async def upload_pdf(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
             doc.close()
             raise HTTPException(status_code=400, detail="The PDF has 0 pages.")
 
-        # Generate lightweight thumbnails fast
         thumbnails = []
         thumb_limit = min(total_pages, 80)
         for p in range(thumb_limit):
@@ -241,7 +291,6 @@ async def upload_pdf(bg_tasks: BackgroundTasks, file: UploadFile = File(...)):
             "created_at": time.time()
         }
 
-        # Automatically pre-cache first page and page 1 in background
         default_params = {
             "mode": "laser",
             "sauvola_k": 0.15,
@@ -281,7 +330,6 @@ async def preview_page(req: PreviewRequest, bg_tasks: BackgroundTasks):
     total_pages = session["total_pages"]
     page_idx = max(0, min(req.page, total_pages - 1))
 
-    # Schedule prefetching of next & previous pages
     req_dict = req.dict()
     bg_tasks.add_task(prefetch_adjacent_pages, req.session_id, pdf_path, page_idx, total_pages, req_dict)
 
@@ -298,7 +346,15 @@ async def preview_page(req: PreviewRequest, bg_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"Preview generation failed: {str(e)}")
 
 
-def run_batch_job(task_id: str, req: ProcessRequest, pdf_path: str, total_pages: int):
+# ==============================================================================
+# UPGRADE 3: Multi-Core Parallel Batch Processing + SSE Event Dispatcher
+# ==============================================================================
+def broadcast_task_event(task_id: str, data: dict):
+    """Updates in-memory task state and signals all connected SSE streams."""
+    tasks[task_id].update(data)
+
+
+def run_multi_core_batch_job(task_id: str, req: ProcessRequest, pdf_path: str, total_pages: int):
     out_file = OUTPUT_DIR / f"{task_id}_cleaned.pdf"
     
     cleaner = DocumentCleaner(
@@ -312,6 +368,8 @@ def run_batch_job(task_id: str, req: ProcessRequest, pdf_path: str, total_pages:
         clean_anomalies=req.word_envelope,
         adaptive_thresholding=req.adaptive
     )
+    # Automatically allocate optimal CPU worker cores
+    max_workers = min(12, max(2, (os.cpu_count() or 4)))
     processor = PDFProcessor(cleaner=cleaner, dpi=req.dpi)
 
     selected_pages = None
@@ -329,40 +387,45 @@ def run_batch_job(task_id: str, req: ProcessRequest, pdf_path: str, total_pages:
         remaining_pages = max(0, total - current)
         eta = remaining_pages / max(0.001, rate) if rate > 0 else 0.0
 
-        tasks[task_id].update({
+        update_payload = {
             "current": current,
             "total": total,
             "percent": round(100.0 * current / max(1, total), 1),
             "message": msg,
             "eta_seconds": round(eta, 1),
-            "status": "processing"
-        })
+            "status": "processing",
+            "pages_per_second": round(rate, 2)
+        }
+        broadcast_task_event(task_id, update_payload)
 
     try:
         processor.process_pdf(
             input_pdf_path=pdf_path,
             output_pdf_path=str(out_file),
             pages=selected_pages,
+            max_workers=max_workers,
             progress_callback=progress_cb
         )
         total_time = round(time.time() - t0, 2)
-        tasks[task_id].update({
+        final_payload = {
             "status": "completed",
             "percent": 100.0,
-            "message": f"Successfully cleaned in {total_time}s!",
+            "message": f"Restored {total_pages} pages in {total_time}s across {max_workers} CPU cores!",
             "output_path": str(out_file),
             "total_time": total_time
-        })
+        }
+        broadcast_task_event(task_id, final_payload)
     except Exception as e:
-        tasks[task_id].update({
+        err_payload = {
             "status": "failed",
             "error": str(e),
             "message": f"Processing error: {str(e)}"
-        })
+        }
+        broadcast_task_event(task_id, err_payload)
 
 
 @app.post("/api/process")
-async def start_process(req: ProcessRequest, bg_tasks: BackgroundTasks):
+async def start_process(req: ProcessRequest):
     if req.session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session expired or not found.")
 
@@ -377,18 +440,55 @@ async def start_process(req: ProcessRequest, bg_tasks: BackgroundTasks):
         "current": 0,
         "total": session["total_pages"],
         "percent": 0.0,
-        "message": "Initializing document pipeline...",
+        "message": "Initializing multi-core document pipeline...",
         "created_at": time.time()
     }
 
     thread = threading.Thread(
-        target=run_batch_job,
+        target=run_multi_core_batch_job,
         args=(task_id, req, session["pdf_path"], session["total_pages"]),
         daemon=True
     )
     thread.start()
 
     return {"task_id": task_id, "status": "queued"}
+
+
+# ==============================================================================
+# UPGRADE 1: Server-Sent Events (SSE) Real-Time Streaming Endpoint
+# ==============================================================================
+@app.get("/api/stream/{task_id}")
+async def stream_task_progress(task_id: str):
+    """Real-time SSE event stream for live progress tracking without polling."""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        import json
+        last_percent = -1
+        while True:
+            if task_id not in tasks:
+                break
+
+            task_info = dict(tasks[task_id])
+            # Send event tick
+            data_json = json.dumps(task_info)
+            yield f"data: {data_json}\n\n"
+
+            if task_info.get("status") in ["completed", "failed"]:
+                break
+
+            await asyncio.sleep(0.25)  # 250ms smooth push
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @app.get("/api/progress/{task_id}")
@@ -428,5 +528,5 @@ if FRONTEND_DIST.exists():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8082"))
-    print(f"Starting Lucent FastAPI Server on http://0.0.0.0:{port}")
+    print(f"Starting Lucent Multi-Core FastAPI Server on http://0.0.0.0:{port}")
     uvicorn.run("api_server:app", host="0.0.0.0", port=port, reload=False)
