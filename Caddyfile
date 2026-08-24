@@ -50,8 +50,9 @@
 		}
 	}
 
-	# ── 3. PDF Enhancer & Restorer (Streamlit App on /enhancer*) ───────────────
-	handle /enhancer* {
+	# ── 3. Lucent — PDF Enhancer & Restorer (FastAPI + React 19 on /enhancer*) ───
+	redir /enhancer /enhancer/
+	handle_path /enhancer* {
 		reverse_proxy 127.0.0.1:8082 {
 			transport http {
 				response_header_timeout 600s

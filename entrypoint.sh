@@ -108,8 +108,7 @@ echo "[Apex] Starting PDF Enhancer (FastAPI + React 19) on Port 8082..."
     cd /opt/pdf_enhancer
     exec "$PYTHON_BIN" -m uvicorn api_server:app \
         --host 0.0.0.0 \
-        --port 8082 \
-        --root-path /enhancer
+        --port 8082
 ) &
 ENHANCER_PID=$!
 
@@ -171,8 +170,7 @@ while true; do
             cd /opt/pdf_enhancer
             exec "$PYTHON_BIN" -m uvicorn api_server:app \
                 --host 0.0.0.0 \
-                --port 8082 \
-                --root-path /enhancer
+                --port 8082
         ) &
         ENHANCER_PID=$!
     fi
