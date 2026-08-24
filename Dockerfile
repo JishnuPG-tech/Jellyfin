@@ -1,6 +1,6 @@
 # ==============================================================================
 # Apex Multi-Project Cloud Space
-# Architecture: Stirling-PDF + Gemini Web2API + PDF Enhancer (Streamlit) + Caddy + Portal Hub
+# Architecture: Stirling-PDF + Gemini Web2API + PDF Enhancer (FastAPI + React) + Caddy + Portal Hub
 # Optimized for Hugging Face Spaces (Persistent Storage + Fast Boot)
 # ==============================================================================
 
@@ -16,11 +16,11 @@ USER root
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
 RUN chmod +x /usr/local/bin/caddy
 
-# Set up clean isolated Python environment for Gemini Web2API & PDF Enhancer (Streamlit)
+# Set up clean isolated Python environment for Gemini Web2API & PDF Enhancer (FastAPI + React)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends python3 python3-pip python3-venv libgl1 libglib2.0-0 || true && \
     python3 -m venv /opt/gemini_venv && \
-    /opt/gemini_venv/bin/pip install --no-cache-dir httpx streamlit pymupdf opencv-python-headless numpy pillow || true && \
+    /opt/gemini_venv/bin/pip install --no-cache-dir httpx fastapi uvicorn python-multipart pydantic pymupdf opencv-python-headless numpy pillow || true && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Gemini Web2API service
@@ -28,7 +28,7 @@ RUN mkdir -p /opt/gemini_web2api /etc/gemini_web2api /data/gemini
 COPY gemini_web2api/ /opt/gemini_web2api/gemini_web2api/
 COPY gemini_config.json /etc/gemini_web2api/config.json
 
-# Install PDF Enhancer (Streamlit) service
+# Install PDF Enhancer (FastAPI + React 19 App) service
 RUN mkdir -p /opt/pdf_enhancer
 COPY pdf_enhancer/ /opt/pdf_enhancer/
 

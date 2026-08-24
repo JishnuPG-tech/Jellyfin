@@ -35,16 +35,12 @@ fi
 
 # Locate Python runtime
 PYTHON_BIN="python3"
-STREAMLIT_BIN="streamlit"
 if [ -f "/opt/gemini_venv/bin/python3" ]; then
     PYTHON_BIN="/opt/gemini_venv/bin/python3"
-    STREAMLIT_BIN="/opt/gemini_venv/bin/streamlit"
 elif [ -f "/opt/venv/bin/python3" ]; then
     PYTHON_BIN="/opt/venv/bin/python3"
-    STREAMLIT_BIN="/opt/venv/bin/streamlit"
 elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python3)"
-    STREAMLIT_BIN="$(command -v streamlit || echo 'streamlit')"
 fi
 
 cleanup() {
@@ -106,18 +102,14 @@ echo "[Apex] Starting Gemini Web2API on Port 8081..."
 ) &
 GEMINI_PID=$!
 
-# ── 6. Start PDF Enhancer (Streamlit) on Port 8082 ────────────────────────────
-echo "[Apex] Starting PDF Enhancer (Streamlit) on Port 8082..."
+# ── 6. Start PDF Enhancer (FastAPI + React) on Port 8082 ─────────────────────
+echo "[Apex] Starting PDF Enhancer (FastAPI + React 19) on Port 8082..."
 (
     cd /opt/pdf_enhancer
-    exec "$STREAMLIT_BIN" run app.py \
-        --server.port 8082 \
-        --server.baseUrlPath /enhancer \
-        --server.headless true \
-        --server.enableCORS false \
-        --server.enableXsrfProtection false \
-        --theme.base dark \
-        --theme.primaryColor "#6366f1"
+    exec "$PYTHON_BIN" -m uvicorn api_server:app \
+        --host 0.0.0.0 \
+        --port 8082 \
+        --root-path /enhancer
 ) &
 ENHANCER_PID=$!
 
@@ -177,14 +169,10 @@ while true; do
         echo "[Apex] WARNING: PDF Enhancer exited — restarting..."
         (
             cd /opt/pdf_enhancer
-            exec "$STREAMLIT_BIN" run app.py \
-                --server.port 8082 \
-                --server.baseUrlPath /enhancer \
-                --server.headless true \
-                --server.enableCORS false \
-                --server.enableXsrfProtection false \
-                --theme.base dark \
-                --theme.primaryColor "#6366f1"
+            exec "$PYTHON_BIN" -m uvicorn api_server:app \
+                --host 0.0.0.0 \
+                --port 8082 \
+                --root-path /enhancer
         ) &
         ENHANCER_PID=$!
     fi
