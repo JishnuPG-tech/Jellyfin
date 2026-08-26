@@ -82,6 +82,26 @@
 		}
 	}
 
+	# Forward root-level public assets and 3D models requested by God's Eye View
+	handle /logo.svg {
+		reverse_proxy 127.0.0.1:8083
+	}
+	handle /location.svg {
+		reverse_proxy 127.0.0.1:8083
+	}
+	handle /mic.svg {
+		reverse_proxy 127.0.0.1:8083
+	}
+	handle /pin.svg {
+		reverse_proxy 127.0.0.1:8083
+	}
+	handle /visual-presets.svg {
+		reverse_proxy 127.0.0.1:8083
+	}
+	handle /models/* {
+		reverse_proxy 127.0.0.1:8083
+	}
+
 	# ── 5. Apex Portal Hub (Static Web UI) ────────────────────────────────────
 	handle {
 		root * /srv/portal

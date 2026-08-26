@@ -45,6 +45,7 @@ RUN git clone --depth 1 https://github.com/bilawalsidhu/gods-eye-view.git /opt/g
     cd /opt/gods-eye-view && \
     npm install
 COPY gods-eye-view-vite.config.js /opt/gods-eye-view/vite.config.js
+COPY gods-eye-view-main.js /opt/gods-eye-view/src/main.js
 
 # Portal Dashboard
 RUN mkdir -p /srv/portal
