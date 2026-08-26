@@ -49,6 +49,7 @@ cleanup() {
     [ -n "${STIRLING_PID:-}" ] && kill -TERM "$STIRLING_PID" 2>/dev/null || true
     [ -n "${GEMINI_PID:-}" ] && kill -TERM "$GEMINI_PID" 2>/dev/null || true
     [ -n "${ENHANCER_PID:-}" ] && kill -TERM "$ENHANCER_PID" 2>/dev/null || true
+    [ -n "${GODSEYE_PID:-}" ] && kill -TERM "$GODSEYE_PID" 2>/dev/null || true
     echo "[Apex] Services stopped."
     exit 0
 }
@@ -112,7 +113,15 @@ echo "[Apex] Starting PDF Enhancer (FastAPI + React 19) on Port 8082..."
 ) &
 ENHANCER_PID=$!
 
-# ── 7. Start Caddy Gateway on Port 7860 ───────────────────────────────────────
+# ── 7. Start God's Eye View (Cesium 3D Globe) on Port 8083 ──────────────────
+echo "[Apex] Starting God's Eye View on Port 8083..."
+(
+    cd /opt/gods-eye-view
+    exec npm run dev -- --host 0.0.0.0 --port 8083
+) &
+GODSEYE_PID=$!
+
+# ── 8. Start Caddy Gateway on Port 7860 ───────────────────────────────────────
 echo "[Apex] Starting Caddy Gateway on Port 7860..."
 caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
 CADDY_PID=$!
@@ -122,8 +131,9 @@ echo "[Apex]   Portal Hub      → http://0.0.0.0:7860/"
 echo "[Apex]   Stirling-PDF    → http://0.0.0.0:7860/stirling"
 echo "[Apex]   Gemini Web2API  → http://0.0.0.0:7860/v1"
 echo "[Apex]   PDF Enhancer    → http://0.0.0.0:7860/enhancer"
+echo "[Apex]   God's Eye View  → http://0.0.0.0:7860/gods-eye/"
 
-# ── 8. Process Supervisor ──────────────────────────────────────────────────────
+# ── 9. Process Supervisor ──────────────────────────────────────────────────────
 sleep 3
 
 while true; do
@@ -173,6 +183,15 @@ while true; do
                 --port 8082
         ) &
         ENHANCER_PID=$!
+    fi
+
+    if ! kill -0 "$GODSEYE_PID" 2>/dev/null; then
+        echo "[Apex] WARNING: God's Eye View exited — restarting..."
+        (
+            cd /opt/gods-eye-view
+            exec npm run dev -- --host 0.0.0.0 --port 8083
+        ) &
+        GODSEYE_PID=$!
     fi
 
     sleep 5

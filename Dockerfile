@@ -1,6 +1,6 @@
 # ==============================================================================
 # Apex Multi-Project Cloud Space
-# Architecture: Stirling-PDF + Gemini Web2API + PDF Enhancer (FastAPI + React) + Caddy + Portal Hub
+# Architecture: Stirling-PDF + Gemini Web2API + PDF Enhancer (FastAPI + React) + God's Eye View (Cesium 3D) + Caddy + Portal Hub
 # Optimized for Hugging Face Spaces (Persistent Storage + Fast Boot)
 # ==============================================================================
 
@@ -18,9 +18,17 @@ RUN chmod +x /usr/local/bin/caddy
 
 # Set up clean isolated Python environment for Gemini Web2API & PDF Enhancer (FastAPI + React)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3 python3-pip python3-venv libgl1 libglib2.0-0 || true && \
+    apt-get install -y --no-install-recommends python3 python3-pip python3-venv libgl1 libglib2.0-0 curl gnupg || true && \
     python3 -m venv /opt/gemini_venv && \
     /opt/gemini_venv/bin/pip install --no-cache-dir httpx fastapi uvicorn python-multipart pydantic pymupdf opencv-python-headless numpy pillow || true && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 24 for God's Eye View
+RUN mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Gemini Web2API service
@@ -31,6 +39,12 @@ COPY gemini_config.json /etc/gemini_web2api/config.json
 # Install PDF Enhancer (FastAPI + React 19 App) service
 RUN mkdir -p /opt/pdf_enhancer
 COPY pdf_enhancer/ /opt/pdf_enhancer/
+
+# Install God's Eye View (Cesium 3D Globe App) service
+RUN git clone --depth 1 https://github.com/bilawalsidhu/gods-eye-view.git /opt/gods-eye-view && \
+    cd /opt/gods-eye-view && \
+    npm install
+COPY gods-eye-view-vite.config.js /opt/gods-eye-view/vite.config.js
 
 # Portal Dashboard
 RUN mkdir -p /srv/portal
@@ -64,6 +78,7 @@ ENV PORT="8080" \
     GEMINI_PORT="8081" \
     GEMINI_CONFIG="/data/gemini/config.json" \
     ENHANCER_PORT="8082" \
+    GODSEYE_PORT="8083" \
     XDG_DATA_HOME="/tmp/caddy/data" \
     XDG_CONFIG_HOME="/tmp/caddy/config" \
     JAVA_TOOL_OPTIONS="-Dstirling.base-path=/data/Stirling/ -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/Stirling/configs/heap_dumps -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Dspring.threads.virtual.enabled=true -Djava.awt.headless=true -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=40 -XX:MaxMetaspaceSize=384m"
@@ -72,3 +87,4 @@ ENV PORT="8080" \
 EXPOSE 7860
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+

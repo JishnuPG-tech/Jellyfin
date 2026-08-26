@@ -23,7 +23,8 @@ This Space uses a **Reverse Proxy Gateway (Caddy)** architecture, allowing you t
 | **Portal Hub** | `/` | `7860` | Interactive dashboard listing all hosted tools. |
 | **Stirling-PDF** | `/stirling/` | `8080` | Full-featured offline & private PDF suite (OCR, merge, split, convert, edit). |
 | **Gemini Web2API** | `/v1/` or `/gemini/` | `8081` | OpenAI-compatible API gateway for Google Gemini (Cursor/Cline ready). |
-| *Project Slot 3* | `/tool3/` | `8082` | *Ready for your next application* |
+| **Lucent — Document Restorer** | `/enhancer/` | `8082` | Laser-clean document whitening & bleed-through remover (FastAPI + React 19). |
+| **God's Eye View** | `/gods-eye/` | `8083` | Real-time 3D planetary intelligence console & tactical globe simulator. |
 
 ---
 

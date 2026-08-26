@@ -61,7 +61,28 @@
 		}
 	}
 
-	# ── 4. Apex Portal Hub (Static Web UI) ────────────────────────────────────
+	# ── 4. God's Eye View — 3D Geospatial Intelligence (Cesium on /gods-eye*) ──
+	redir /gods-eye /gods-eye/
+	handle /gods-eye* {
+		reverse_proxy 127.0.0.1:8083 {
+			transport http {
+				response_header_timeout 600s
+				dial_timeout 30s
+			}
+		}
+	}
+
+	# Forward /api* proxy endpoints to God's Eye View backend
+	handle /api* {
+		reverse_proxy 127.0.0.1:8083 {
+			transport http {
+				response_header_timeout 600s
+				dial_timeout 30s
+			}
+		}
+	}
+
+	# ── 5. Apex Portal Hub (Static Web UI) ────────────────────────────────────
 	handle {
 		root * /srv/portal
 		file_server {
