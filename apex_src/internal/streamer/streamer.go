@@ -38,19 +38,32 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid stream path", http.StatusBadRequest)
 		return
 	}
-	mediaID := parts[len(parts)-1]
+	rawMediaID := parts[len(parts)-1]
+	mediaID := rawMediaID
+	if dotIdx := strings.LastIndex(rawMediaID, "."); dotIdx > 0 {
+		mediaID = rawMediaID[:dotIdx]
+	}
 
 	item, err := g.database.GetMediaItem(mediaID)
 	if err != nil {
-		http.Error(w, "media item not found", http.StatusNotFound)
-		return
+		item, err = g.database.GetMediaItem(rawMediaID)
+		if err != nil {
+			log.Printf("[Streamer] Media item not found for requested ID: %s (raw: %s)", mediaID, rawMediaID)
+			http.Error(w, "media item not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	totalSize := item.FileSize
 	rangeHeader := r.Header.Get("Range")
 
+	contentType := item.MimeType
+	if contentType == "" || contentType == "application/octet-stream" {
+		contentType = "video/mp4"
+	}
+
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Type", item.MimeType)
+	w.Header().Set("Content-Type", contentType)
 
 	start := int64(0)
 	end := totalSize - 1

@@ -46,6 +46,17 @@ func (c *Client) Search(title string, year int, mediaType string) (*TMDBResult, 
 		return nil, fmt.Errorf("TMDB_API_KEY is not configured")
 	}
 
+	res, err := c.searchInternal(title, year, mediaType)
+	if err != nil && year > 0 {
+		// Fallback: search without year in case the year in filename is slightly offset
+		if resRetry, errRetry := c.searchInternal(title, 0, mediaType); errRetry == nil {
+			return resRetry, nil
+		}
+	}
+	return res, err
+}
+
+func (c *Client) searchInternal(title string, year int, mediaType string) (*TMDBResult, error) {
 	endpoint := "movie"
 	if mediaType == "series" {
 		endpoint = "tv"

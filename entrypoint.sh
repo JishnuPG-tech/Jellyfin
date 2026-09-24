@@ -95,9 +95,32 @@ if os.path.exists(db_path):
     except Exception as e:
         print(f'[Apex] Account unlock check notice: {e}')
 " 2>/dev/null || true
+ensure_jellyfin_api_key() {
+    ${PYTHON_BIN} -c "
+import os, sqlite3, datetime
+
+for db_path in ['/data/jellyfin/data/data/jellyfin.db', '/data/jellyfin/data/jellyfin.db']:
+    if os.path.exists(db_path):
+        try:
+            con = sqlite3.connect(db_path)
+            cur = con.cursor()
+            cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='ApiKeys';\")
+            if cur.fetchone():
+                cur.execute(\"SELECT Id FROM ApiKeys WHERE AccessToken='apex_internal_key_default';\")
+                if not cur.fetchone():
+                    now = datetime.datetime.utcnow().isoformat()
+                    cur.execute(\"INSERT INTO ApiKeys (AccessToken, Name, DateCreated, DateLastActivity) VALUES (?, ?, ?, ?);\",
+                                ('apex_internal_key_default', 'ApexCore', now, now))
+                    con.commit()
+                    print('[Apex] Registered internal Jellyfin API key: apex_internal_key_default')
+            con.close()
+        except Exception:
+            pass
+" 2>/dev/null || true
 }
 
 repair_jellyfin_auth
+ensure_jellyfin_api_key
 
 # ── 4. Periodic & Shutdown SQLite Snapshot Handlers ───────────────────────────
 backup_sqlite() {
@@ -307,6 +330,9 @@ while true; do
 
     # Periodic SQLite snapshots for Apex Core and Jellyfin (every 180 loops * 5s = 15 minutes)
     BACKUP_COUNTER=$((BACKUP_COUNTER + 1))
+    if [ $((BACKUP_COUNTER % 6)) -eq 0 ]; then
+        ensure_jellyfin_api_key
+    fi
     if [ "${BACKUP_COUNTER}" -ge 180 ]; then
         BACKUP_COUNTER=0
         backup_sqlite

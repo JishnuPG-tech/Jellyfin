@@ -54,6 +54,7 @@ func (c *Client) RefreshLibrary() error {
 	}
 	if c.apiKey != "" {
 		req.Header.Set("X-Emby-Token", c.apiKey)
+		req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", c.apiKey))
 	}
 
 	resp, err := c.httpClient.Do(req)

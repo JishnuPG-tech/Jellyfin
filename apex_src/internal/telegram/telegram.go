@@ -37,7 +37,34 @@ func NewManager(cfg *config.Config, database *db.Database) *Manager {
 	}
 }
 
-func (m *Manager) Start(ctx context.Context, onNewMedia func(ctx context.Context, doc *tg.Document, chatID int64, msgID int)) error {
+func isVideoExtension(filename string) bool {
+	ext := strings.ToLower(filepath.Ext(filename))
+	switch ext {
+	case ".mp4", ".mkv", ".avi", ".mov", ".webm", ".ts", ".m4v", ".flv", ".wmv", ".iso", ".mpg", ".mpeg":
+		return true
+	}
+	return false
+}
+
+func (m *Manager) sendReply(peer tg.InputPeerClass, text string) {
+	if peer == nil || m.rawAPI == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := m.rawAPI.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+			Peer:     peer,
+			Message:  text,
+			RandomID: rand.Int63(),
+		})
+		if err != nil {
+			log.Printf("[Telegram] Note: Reply send skipped: %v", err)
+		}
+	}()
+}
+
+func (m *Manager) Start(ctx context.Context, onNewMedia func(ctx context.Context, doc *tg.Document, chatID int64, msgID int, caption string)) error {
 	if m.cfg.TelegramAPIID == 0 || m.cfg.TelegramAPIHash == "" || m.cfg.TelegramBotToken == "" {
 		log.Printf("[Telegram] Warning: Telegram credentials not fully configured. Ingestion disabled.")
 		return nil
@@ -47,29 +74,112 @@ func (m *Manager) Start(ctx context.Context, onNewMedia func(ctx context.Context
 	_ = os.MkdirAll(sessionDir, 0700)
 
 	dispatcher := tg.NewUpdateDispatcher()
-	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
-		msg, ok := u.Message.(*tg.Message)
-		if !ok || msg.Media == nil {
+
+	processMessage := func(ctx context.Context, e tg.Entities, msgClass tg.MessageClass) error {
+		msg, ok := msgClass.(*tg.Message)
+		if !ok {
 			return nil
 		}
 
+		var chatID int64
+		var inputPeer tg.InputPeerClass
+		peerDesc := "unknown"
+
+		switch peer := msg.PeerID.(type) {
+		case *tg.PeerUser:
+			chatID = peer.UserID
+			peerDesc = fmt.Sprintf("User(%d)", peer.UserID)
+			if u, exists := e.Users[peer.UserID]; exists {
+				inputPeer = &tg.InputPeerUser{UserID: peer.UserID, AccessHash: u.AccessHash}
+			}
+		case *tg.PeerChat:
+			chatID = peer.ChatID
+			peerDesc = fmt.Sprintf("Chat(%d)", peer.ChatID)
+			inputPeer = &tg.InputPeerChat{ChatID: peer.ChatID}
+		case *tg.PeerChannel:
+			chatID = peer.ChannelID
+			peerDesc = fmt.Sprintf("Channel(%d)", peer.ChannelID)
+			if c, exists := e.Channels[peer.ChannelID]; exists {
+				inputPeer = &tg.InputPeerChannel{ChannelID: peer.ChannelID, AccessHash: c.AccessHash}
+			}
+		}
+
+		// Check if message is purely text without media
+		if msg.Media == nil {
+			text := strings.TrimSpace(msg.Message)
+			if text != "" {
+				log.Printf("[Telegram] Received text message #%d from %s: %s", msg.ID, peerDesc, text)
+				if strings.HasPrefix(text, "/start") || strings.HasPrefix(text, "/help") {
+					m.sendReply(inputPeer, "🎬 Apex Cloud Platform\n\nSend or forward any movie or TV series video file here.\nIt will be cataloged instantly and made available to stream on Jellyfin!")
+				}
+			}
+			return nil
+		}
+
+		// Inspect media for documents or videos
 		docMedia, ok := msg.Media.(*tg.MessageMediaDocument)
 		if !ok {
+			log.Printf("[Telegram] Message #%d from %s has non-document media (%T)", msg.ID, peerDesc, msg.Media)
 			return nil
 		}
 
 		doc, ok := docMedia.Document.(*tg.Document)
 		if !ok {
+			log.Printf("[Telegram] Message #%d from %s has empty document", msg.ID, peerDesc)
 			return nil
 		}
 
-		peerChannel, ok := msg.PeerID.(*tg.PeerChannel)
-		if !ok {
-			return nil
+		// Extract filename & video flag
+		var filename string
+		var isVideo bool
+		for _, attr := range doc.Attributes {
+			switch a := attr.(type) {
+			case *tg.DocumentAttributeFilename:
+				filename = a.FileName
+			case *tg.DocumentAttributeVideo:
+				isVideo = true
+			}
 		}
 
-		onNewMedia(ctx, doc, peerChannel.ChannelID, msg.ID)
+		caption := strings.TrimSpace(msg.Message)
+		if filename == "" {
+			if caption != "" {
+				filename = caption
+				if !strings.Contains(filename, ".") {
+					filename += ".mp4"
+				}
+			} else {
+				filename = fmt.Sprintf("media_%d.mp4", doc.ID)
+			}
+		}
+
+		if strings.HasPrefix(doc.MimeType, "video/") || isVideo || isVideoExtension(filename) {
+			log.Printf("[Telegram] Ingesting video media: '%s' (size: %d MB, mime: %s) from %s msg #%d",
+				filename, doc.Size/(1024*1024), doc.MimeType, peerDesc, msg.ID)
+
+			m.sendReply(inputPeer, fmt.Sprintf("📥 Ingesting '%s'...\nAdding to your Jellyfin library.", filename))
+
+			onNewMedia(ctx, doc, chatID, msg.ID, caption)
+		} else {
+			log.Printf("[Telegram] Ignored non-video document: '%s' (mime: %s) from %s msg #%d",
+				filename, doc.MimeType, peerDesc, msg.ID)
+		}
+
 		return nil
+	}
+
+	// Register update handlers for all message arrival vectors
+	dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
+		return processMessage(ctx, e, u.Message)
+	})
+	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
+		return processMessage(ctx, e, u.Message)
+	})
+	dispatcher.OnEditMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateEditMessage) error {
+		return processMessage(ctx, e, u.Message)
+	})
+	dispatcher.OnEditChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateEditChannelMessage) error {
+		return processMessage(ctx, e, u.Message)
 	})
 
 	updateOpts := telegram.Options{
@@ -116,12 +226,19 @@ func (m *Manager) Start(ctx context.Context, onNewMedia func(ctx context.Context
 		m.transferPool = append(m.transferPool, c)
 		clientIdx := i
 		go func(client *telegram.Client, idx int) {
-			_ = client.Run(ctx, func(ctx context.Context) error {
-				_, _ = client.Auth().Bot(ctx, m.cfg.TelegramBotToken)
+			err := client.Run(ctx, func(ctx context.Context) error {
+				_, authErr := client.Auth().Bot(ctx, m.cfg.TelegramBotToken)
+				if authErr != nil {
+					log.Printf("[Telegram] Media transfer connection #%d auth error: %v", idx+1, authErr)
+					return authErr
+				}
 				log.Printf("[Telegram] Media transfer connection #%d active.", idx+1)
 				<-ctx.Done()
 				return nil
 			})
+			if err != nil {
+				log.Printf("[Telegram] Media transfer connection #%d error: %v", idx+1, err)
+			}
 		}(c, clientIdx)
 	}
 
@@ -183,7 +300,7 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 
 		// Handle FILE_REFERENCE_EXPIRED
 		if strings.Contains(err.Error(), "FILE_REFERENCE_EXPIRED") || strings.Contains(err.Error(), "FILE_REFERENCE_INVALID") {
-			log.Printf("[Telegram] File reference expired for media %s. Refreshing from channel...", item.ID)
+			log.Printf("[Telegram] File reference expired for media %s. Refreshing file reference...", item.ID)
 			refreshed, refErr := m.refreshFileReference(ctx, item)
 			if refErr == nil && refreshed {
 				continue
@@ -200,6 +317,7 @@ func (m *Manager) refreshFileReference(ctx context.Context, item *db.MediaItem) 
 		return false, fmt.Errorf("raw API client not ready")
 	}
 
+	// 1. Try ChannelsGetMessages (for broadcast channels and supergroups)
 	channel := &tg.InputChannel{
 		ChannelID:  item.SourceChatID,
 		AccessHash: 0,
@@ -209,33 +327,46 @@ func (m *Manager) refreshFileReference(ctx context.Context, item *db.MediaItem) 
 		Channel: channel,
 		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: item.MessageID}},
 	})
-	if err != nil {
-		return false, err
+	if err == nil {
+		if chanMsgs, ok := messages.(*tg.MessagesChannelMessages); ok && len(chanMsgs.Messages) > 0 {
+			if msg, ok := chanMsgs.Messages[0].(*tg.Message); ok && msg.Media != nil {
+				if docMedia, ok := msg.Media.(*tg.MessageMediaDocument); ok {
+					if doc, ok := docMedia.Document.(*tg.Document); ok {
+						item.FileRef = doc.FileReference
+						item.AccessHash = doc.AccessHash
+						_ = m.database.UpdateFileReference(item.ID, doc.FileReference, doc.AccessHash)
+						return true, nil
+					}
+				}
+			}
+		}
 	}
 
-	chanMsgs, ok := messages.(*tg.MessagesChannelMessages)
-	if !ok || len(chanMsgs.Messages) == 0 {
-		return false, fmt.Errorf("message not found")
+	// 2. Try MessagesGetMessages (for private bot chats and basic groups)
+	userMsgs, err2 := m.rawAPI.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: item.MessageID}})
+	if err2 == nil {
+		var msgList []tg.MessageClass
+		switch ms := userMsgs.(type) {
+		case *tg.MessagesMessages:
+			msgList = ms.Messages
+		case *tg.MessagesMessagesSlice:
+			msgList = ms.Messages
+		case *tg.MessagesChannelMessages:
+			msgList = ms.Messages
+		}
+		if len(msgList) > 0 {
+			if msg, ok := msgList[0].(*tg.Message); ok && msg.Media != nil {
+				if docMedia, ok := msg.Media.(*tg.MessageMediaDocument); ok {
+					if doc, ok := docMedia.Document.(*tg.Document); ok {
+						item.FileRef = doc.FileReference
+						item.AccessHash = doc.AccessHash
+						_ = m.database.UpdateFileReference(item.ID, doc.FileReference, doc.AccessHash)
+						return true, nil
+					}
+				}
+			}
+		}
 	}
 
-	msg, ok := chanMsgs.Messages[0].(*tg.Message)
-	if !ok || msg.Media == nil {
-		return false, fmt.Errorf("invalid message media")
-	}
-
-	docMedia, ok := msg.Media.(*tg.MessageMediaDocument)
-	if !ok {
-		return false, fmt.Errorf("no document in message")
-	}
-
-	doc, ok := docMedia.Document.(*tg.Document)
-	if !ok {
-		return false, fmt.Errorf("document cast failed")
-	}
-
-	item.FileRef = doc.FileReference
-	item.AccessHash = doc.AccessHash
-
-	err = m.database.UpdateFileReference(item.ID, doc.FileReference, doc.AccessHash)
-	return err == nil, err
+	return false, fmt.Errorf("could not refresh file reference: channel err: %v, direct err: %v", err, err2)
 }

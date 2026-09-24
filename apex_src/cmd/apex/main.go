@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,13 +49,13 @@ func main() {
 	// 3. Initialize Metadata & Jellyfin Services
 	tmdbClient := metadata.NewClient(cfg.TMDBAPIKey)
 	jfWriter := jellyfin.NewWriter(cfg.JellyfinMedia)
-	jfClient := jellyfin.NewClient("http://127.0.0.1:8096", "")
+	jfClient := jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey)
 
 	// 4. Background Telegram Media Ingestion Handler
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	onNewMedia := func(ctx context.Context, doc *tg.Document, chatID int64, msgID int) {
+	onNewMedia := func(ctx context.Context, doc *tg.Document, chatID int64, msgID int, caption string) {
 		// Extract filename
 		filename := fmt.Sprintf("media_%d.mp4", doc.ID)
 		for _, attr := range doc.Attributes {
@@ -63,15 +65,44 @@ func main() {
 			}
 		}
 
-		log.Printf("[Apex] Ingesting media: %s (Chat: %d, Message: %d)", filename, chatID, msgID)
+		// Security: Validate allowed chat IDs if configured
+		if len(cfg.TelegramAllowedChats) > 0 {
+			allowed := false
+			for _, allowedID := range cfg.TelegramAllowedChats {
+				if allowedID == chatID || allowedID == -chatID || allowedID == (-1000000000000 - chatID) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				log.Printf("[Apex] Ignored media from unauthorized chat ID: %d (Allowed: %v)", chatID, cfg.TelegramAllowedChats)
+				return
+			}
+		}
+
+		log.Printf("[Apex] Ingesting media: %s (Chat: %d, Message: %d, Caption: %q)", filename, chatID, msgID, caption)
+
+		// Parse metadata
+		titleToParse := filename
+		if strings.TrimSpace(caption) != "" {
+			cleanFn := filepath.Base(filename)
+			if strings.HasPrefix(cleanFn, "media_") || strings.HasPrefix(cleanFn, "video_") || strings.HasPrefix(cleanFn, "file_") || len(cleanFn) < 8 {
+				titleToParse = caption
+			}
+		}
+
+		parsed := parser.Parse(titleToParse)
+		if parsed.CleanTitle == "" {
+			parsed.CleanTitle = strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+			if parsed.CleanTitle == "" {
+				parsed.CleanTitle = fmt.Sprintf("Media_%d", doc.ID)
+			}
+		}
 
 		// Generate stable opaque ID: apx_<sha256[:12]>
 		hasher := sha256.New()
 		hasher.Write([]byte(fmt.Sprintf("%d:%d:%d", chatID, msgID, doc.ID)))
 		opaqueID := fmt.Sprintf("apx_%s", hex.EncodeToString(hasher.Sum(nil))[:12])
-
-		// Parse metadata
-		parsed := parser.Parse(filename)
 
 		// Query TMDB
 		var tmdbID int
@@ -86,6 +117,20 @@ func main() {
 			rating = tmdbMeta.VoteAverage
 			posterPath = tmdbMeta.PosterPath
 			backdropPath = tmdbMeta.BackdropPath
+			if parsed.Year == 0 {
+				if parsed.MediaType == "series" && len(tmdbMeta.FirstAirDate) >= 4 {
+					parsed.Year, _ = strconv.Atoi(tmdbMeta.FirstAirDate[:4])
+				} else if len(tmdbMeta.ReleaseDate) >= 4 {
+					parsed.Year, _ = strconv.Atoi(tmdbMeta.ReleaseDate[:4])
+				}
+			}
+			canonicalTitle := tmdbMeta.Title
+			if canonicalTitle == "" {
+				canonicalTitle = tmdbMeta.Name
+			}
+			if canonicalTitle != "" {
+				parsed.CleanTitle = canonicalTitle
+			}
 		}
 
 		// Structure filesystem layout
@@ -96,8 +141,13 @@ func main() {
 			relDir = filepath.Join("Shows", parsed.CleanTitle, fmt.Sprintf("Season %02d", parsed.Season))
 			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s S%02dE%02d.strm", parsed.CleanTitle, parsed.Season, parsed.Episode))
 		} else {
-			relDir = filepath.Join("Movies", fmt.Sprintf("%s (%d)", parsed.CleanTitle, parsed.Year))
-			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s (%d).strm", parsed.CleanTitle, parsed.Year))
+			if parsed.Year > 0 {
+				relDir = filepath.Join("Movies", fmt.Sprintf("%s (%d)", parsed.CleanTitle, parsed.Year))
+				strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s (%d).strm", parsed.CleanTitle, parsed.Year))
+			} else {
+				relDir = filepath.Join("Movies", parsed.CleanTitle)
+				strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s.strm", parsed.CleanTitle))
+			}
 		}
 
 		// Write .strm pointer
@@ -155,10 +205,14 @@ func main() {
 		}
 		_ = database.SaveCapabilities(cap)
 
-		log.Printf("[Apex] Successfully cataloged: %s (ID: %s)", parsed.CleanTitle, opaqueID)
+		log.Printf("[Apex] Successfully cataloged: %s (ID: %s, STRM: %s)", parsed.CleanTitle, opaqueID, fullStrmPath)
 
 		// Trigger Jellyfin Library Refresh
-		_ = jfClient.RefreshLibrary()
+		if err := jfClient.RefreshLibrary(); err != nil {
+			log.Printf("[Apex] Notice: Jellyfin library refresh request: %v", err)
+		} else {
+			log.Printf("[Apex] Jellyfin library refresh triggered successfully.")
+		}
 	}
 
 	// 5. Start Telegram Connection Manager

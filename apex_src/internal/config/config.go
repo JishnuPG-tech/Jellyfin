@@ -27,6 +27,8 @@ type Config struct {
 	JellyfinMedia   string
 	SessionFilePath string
 	ServerPort      string
+	JellyfinURL     string
+	JellyfinAPIKey  string
 }
 
 func Load() *Config {
@@ -67,6 +69,8 @@ func Load() *Config {
 		JellyfinMedia:   getEnv("JELLYFIN_MEDIA_DIR", "/data/jellyfin/media"),
 		SessionFilePath: getEnv("APEX_SESSION_FILE", "/data/apex/session/session.json"),
 		ServerPort:      getEnv("APEX_CORE_PORT", "8084"),
+		JellyfinURL:     getEnv("JELLYFIN_URL", "http://127.0.0.1:8096"),
+		JellyfinAPIKey:  getEnv("APEX_JELLYFIN_API_KEY", getEnv("JELLYFIN_API_KEY", "apex_internal_key_default")),
 	}
 }
 
