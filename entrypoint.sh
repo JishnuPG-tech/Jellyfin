@@ -15,8 +15,10 @@ mkdir -p /data/Stirling/configs \
          /data/Stirling/pipeline \
          /data/Stirling/storage \
          /data/Stirling/tessdata \
+         /data/jellyfin/data \
          /data/jellyfin/config \
          /data/jellyfin/cache \
+         /data/jellyfin/log \
          /data/jellyfin/media/Movies \
          /data/jellyfin/media/Shows \
          /data/apex/backups \
@@ -116,15 +118,24 @@ if [ -n "${APP_JAR}" ]; then
 fi
 
 # ── 4. Start PDF Enhancer on Port 8082 ────────────────────────────────────────
-if [ -d "/opt/pdf_enhancer" ]; then
+UVICORN_BIN=""
+if [ -f "/opt/venv/bin/uvicorn" ]; then
+    UVICORN_BIN="/opt/venv/bin/uvicorn"
+elif command -v uvicorn >/dev/null 2>&1; then
+    UVICORN_BIN="$(command -v uvicorn)"
+fi
+
+if [ -d "/opt/pdf_enhancer" ] && [ -n "${UVICORN_BIN}" ]; then
     echo "[Apex] Starting PDF Enhancer on Port 8082..."
     (
         cd /opt/pdf_enhancer
-        exec "${PYTHON_BIN}" -m uvicorn api_server:app \
+        exec "${UVICORN_BIN}" api_server:app \
             --host 0.0.0.0 \
             --port 8082
     ) &
     ENHANCER_PID=$!
+elif [ -d "/opt/pdf_enhancer" ]; then
+    echo "[Apex] Notice: uvicorn not available. Skipping PDF Enhancer startup."
 fi
 
 # ── 5. Start Jellyfin Media Server on Port 8096 ───────────────────────────────
@@ -143,11 +154,12 @@ if [ -f "${JELLYFIN_BIN}" ]; then
 
     (
         exec "${JELLYFIN_BIN}" \
-            --datadir /data/jellyfin/config \
-            --cachedir /data/jellyfin/cache \
+            -d /data/jellyfin/data \
+            -c /data/jellyfin/config \
+            -C /data/jellyfin/cache \
+            -l /data/jellyfin/log \
             --ffmpeg "${FFMPEG_PATH}" \
-            --webdir "${WEBDIR}" \
-            --restartpath /usr/local/bin/entrypoint.sh
+            --webdir "${WEBDIR}"
     ) &
     JELLYFIN_PID=$!
 else
@@ -186,11 +198,12 @@ while true; do
         echo "[Apex] WARNING: Jellyfin exited — restarting..."
         (
             exec "${JELLYFIN_BIN}" \
-                --datadir /data/jellyfin/config \
-                --cachedir /data/jellyfin/cache \
+                -d /data/jellyfin/data \
+                -c /data/jellyfin/config \
+                -C /data/jellyfin/cache \
+                -l /data/jellyfin/log \
                 --ffmpeg "${FFMPEG_PATH}" \
-                --webdir "${WEBDIR}" \
-                --restartpath /usr/local/bin/entrypoint.sh
+                --webdir "${WEBDIR}"
         ) &
         JELLYFIN_PID=$!
     fi

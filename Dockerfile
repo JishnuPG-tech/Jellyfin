@@ -36,10 +36,11 @@ RUN mkdir -p /opt/apex
 COPY --from=go-builder /app/apex-core /opt/apex/apex-core
 RUN chmod +x /opt/apex/apex-core
 
-# 4. Set up clean Python virtualenv for PDF Enhancer (FastAPI + React)
-RUN python3 -m venv /opt/venv || true && \
-    /opt/venv/bin/pip install --no-cache-dir \
-        httpx fastapi uvicorn python-multipart pydantic pymupdf opencv-python-headless numpy pillow || true
+# 4. Set up Python environment for PDF Enhancer (FastAPI + React)
+RUN pip install --no-cache-dir --break-system-packages \
+        httpx fastapi uvicorn python-multipart pydantic pymupdf opencv-python-headless numpy pillow 2>/dev/null || \
+    python3 -m pip install --no-cache-dir --break-system-packages \
+        httpx fastapi uvicorn python-multipart pydantic pymupdf opencv-python-headless numpy pillow 2>/dev/null || true
 
 # 5. Install Services and Gateway Configuration
 RUN mkdir -p /opt/pdf_enhancer /srv/portal /etc/caddy
@@ -56,8 +57,10 @@ RUN mkdir -p /data/Stirling/configs \
              /data/Stirling/pipeline \
              /data/Stirling/storage \
              /data/Stirling/tessdata \
+             /data/jellyfin/data \
              /data/jellyfin/config \
              /data/jellyfin/cache \
+             /data/jellyfin/log \
              /data/jellyfin/media/Movies \
              /data/jellyfin/media/Shows \
              /data/apex/backups \
