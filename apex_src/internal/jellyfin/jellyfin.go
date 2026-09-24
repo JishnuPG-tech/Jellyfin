@@ -222,22 +222,78 @@ func (c *Client) EnsureDefaultLibraries() {
 		return
 	}
 
-	hasMovies := false
-	hasShows := false
+	moviesPath := "/data/jellyfin/media/Movies"
+	showsPath := "/data/jellyfin/media/Shows"
+
+	hasMoviesFolder := false
+	hasMoviesPath := false
+	moviesFolderName := "Movies"
+
+	hasShowsFolder := false
+	hasShowsPath := false
+	showsFolderName := "Shows"
+
 	for _, f := range folders {
 		if strings.EqualFold(f.Name, "Movies") {
-			hasMovies = true
+			hasMoviesFolder = true
+			moviesFolderName = f.Name
+			for _, p := range f.Locations {
+				if strings.EqualFold(p, moviesPath) {
+					hasMoviesPath = true
+				}
+			}
 		}
 		if strings.EqualFold(f.Name, "Shows") || strings.EqualFold(f.Name, "TV Shows") || strings.EqualFold(f.Name, "Series") {
-			hasShows = true
+			hasShowsFolder = true
+			showsFolderName = f.Name
+			for _, p := range f.Locations {
+				if strings.EqualFold(p, showsPath) {
+					hasShowsPath = true
+				}
+			}
 		}
 	}
 
-	if !hasMovies {
-		c.addVirtualFolder("Movies", "movies", "/data/jellyfin/media/Movies")
+	if !hasMoviesFolder {
+		c.addVirtualFolder("Movies", "movies", moviesPath)
+	} else if !hasMoviesPath {
+		c.addVirtualFolderPath(moviesFolderName, moviesPath)
 	}
-	if !hasShows {
-		c.addVirtualFolder("Shows", "tvshows", "/data/jellyfin/media/Shows")
+
+	if !hasShowsFolder {
+		c.addVirtualFolder("Shows", "tvshows", showsPath)
+	} else if !hasShowsPath {
+		c.addVirtualFolderPath(showsFolderName, showsPath)
+	}
+}
+
+func (c *Client) addVirtualFolderPath(name, path string) {
+	apiKey := c.GetAPIKey()
+	if apiKey == "" {
+		return
+	}
+
+	u := fmt.Sprintf("%s/Library/VirtualFolders/Paths?name=%s&path=%s&refreshLibrary=true",
+		c.baseURL, url.QueryEscape(name), url.QueryEscape(path))
+
+	req, err := http.NewRequest(http.MethodPost, u, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("X-Emby-Token", apiKey)
+	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", apiKey))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		log.Printf("[Jellyfin] Error adding path '%s' to library '%s': %v", path, name, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Printf("[Jellyfin] Auto-added path %s to library '%s' (Status: %d)", path, name, resp.StatusCode)
+	} else {
+		log.Printf("[Jellyfin] Failed adding path %s to library '%s' (Status: %d)", path, name, resp.StatusCode)
 	}
 }
 

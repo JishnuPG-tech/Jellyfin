@@ -20,37 +20,6 @@ ensure_jellyfin_dirs_and_libraries() {
              /tmp/jellyfin-cache \
              2>/dev/null || true
 
-    if [ ! -f "/data/jellyfin/data/root/default/Movies/options.xml" ]; then
-        cat << 'EOF' > /data/jellyfin/data/root/default/Movies/options.xml
-<?xml version="1.0" encoding="utf-8"?>
-<LibraryOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-  <Enabled>true</Enabled>
-  <EnablePhotos>false</EnablePhotos>
-  <EnableRealtimeMonitor>true</EnableRealtimeMonitor>
-  <PathInfos>
-    <MediaPathInfo>
-      <Path>/data/jellyfin/media/Movies</Path>
-    </MediaPathInfo>
-  </PathInfos>
-</LibraryOptions>
-EOF
-    fi
-
-    if [ ! -f "/data/jellyfin/data/root/default/Shows/options.xml" ]; then
-        cat << 'EOF' > /data/jellyfin/data/root/default/Shows/options.xml
-<?xml version="1.0" encoding="utf-8"?>
-<LibraryOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-  <Enabled>true</Enabled>
-  <EnablePhotos>false</EnablePhotos>
-  <EnableRealtimeMonitor>true</EnableRealtimeMonitor>
-  <PathInfos>
-    <MediaPathInfo>
-      <Path>/data/jellyfin/media/Shows</Path>
-    </MediaPathInfo>
-  </PathInfos>
-</LibraryOptions>
-EOF
-    fi
 }
 
 locate_jellyfin_db() {
