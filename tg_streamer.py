@@ -7,6 +7,7 @@ import logging
 import asyncio
 import socket
 import aiohttp
+import httpx
 from aiohttp import web
 
 # Pyrogram imports for MTProto direct chunk streaming
@@ -179,6 +180,12 @@ if API_ID and API_HASH and BOT_TOKEN:
         logger.error(f"[PYROGRAM] Error initializing Pyrogram: {e}")
 
 if tg_app:
+    @tg_app.on_message()
+    async def on_any_update(client, message):
+        chat = message.chat
+        chat_t = getattr(chat, "type", None)
+        logger.info(f"[PYROGRAM][RX] Received update: chat={chat.id if chat else '?'} type={chat_t} media={getattr(message, 'media', None)} caption={str(message.caption or '')[:40]!r}")
+
     @tg_app.on_message(filters.video | filters.document | filters.audio | filters.animation)
     async def on_media_message(client, message):
         is_channel_post = bool(message.chat and message.chat.type == ChatType.CHANNEL)
@@ -310,16 +317,24 @@ async def trigger_jellyfin_scan():
 WEBHOOK_SECRET = get_env("APEX_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET")
 
 async def telegram_api_call(method: str, **params):
-    """Call the Telegram Bot API synchronously via aiohttp."""
+    """Call the Telegram Bot API via httpx (uses trust_env to honor proxy vars)."""
     if not BOT_TOKEN:
         return None
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=params, timeout=15) as resp:
+    last_error = None
+    async with httpx.AsyncClient(trust_env=True, timeout=20.0) as client:
+        for attempt in range(3):
             try:
-                return await resp.json()
-            except Exception:
-                return {"ok": False, "description": f"HTTP {resp.status}"}
+                resp = await client.post(url, json=params)
+                try:
+                    return resp.json()
+                except Exception:
+                    return {"ok": False, "description": f"HTTP {resp.status_code}"}
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[TELEGRAM] {method} attempt {attempt+1} failed: {type(e).__name__}: {e}")
+                await asyncio.sleep(2)
+    return {"ok": False, "description": f"Telegram API error: {last_error}"}
 
 
 async def register_telegram_webhook():
@@ -334,15 +349,19 @@ async def register_telegram_webhook():
     if WEBHOOK_SECRET:
         params["secret_token"] = WEBHOOK_SECRET
     params["allowed_updates"] = ["message", "channel_post"]
-    try:
+
+    last_result = None
+    for attempt in range(3):
         result = await telegram_api_call("setWebhook", **params)
+        last_result = result
         ok = bool(result and result.get("ok"))
         desc = (result or {}).get("description", "no response")
-        logger.info(f"[WEBHOOK] setWebhook -> {webhook_url} ok={ok} {desc}")
-        return ok, webhook_url, desc
-    except Exception as e:
-        logger.error(f"[WEBHOOK] setWebhook failed: {e}")
-        return False, webhook_url, str(e)
+        logger.info(f"[WEBHOOK] setWebhook attempt {attempt+1}: ok={ok} desc={desc}")
+        if ok:
+            return True, webhook_url, desc
+        await asyncio.sleep(3)
+
+    return False, webhook_url, str((last_result or {}).get("description", "unknown error"))
 
 
 async def get_telegram_webhook_info():
