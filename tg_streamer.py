@@ -28,7 +28,7 @@ API_ID = os.environ.get("TG_API_ID")
 API_HASH = os.environ.get("TG_API_HASH")
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 RAW_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID", "")
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "b3901b0f5b9d332d7abfb9ae9e2d31f0") # Public fallback TMDB key for posters
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 
 DATA_DIR = "/data/jellyfin"
 MOVIES_DIR = os.path.join(DATA_DIR, "media/Movies")
@@ -123,7 +123,7 @@ def parse_media_type(filename_or_caption):
     """
     clean_text = clean_title_str(filename_or_caption) or "Unknown_Media"
     
-    pattern_s_e = re.search(r'(?i)(.*?)\b[S|season]\s*(\d{1,2})\s*[E|ep|episode]\s*(\d{1,2})\b', clean_text)
+    pattern_s_e = re.search(r'(?i)(.*?)\b(?:S|Season)\s*(\d{1,2})\s*(?:E|Ep|Episode)\s*(\d{1,2})\b', clean_text)
     if pattern_s_e:
         show_name = pattern_s_e.group(1).strip()
         season = int(pattern_s_e.group(2))
@@ -366,6 +366,19 @@ async def stream_file(request):
     return web.Response(status=500, text="Streaming temporarily unavailable.")
 
 async def restore_cached_strm_files():
+    logger.info('[MIGRATION] Cleaning up old Go .strm files...')
+    for root, _, files in os.walk(MEDIA_DIR):
+        for f in files:
+            if f.endswith('.strm'):
+                path = os.path.join(root, f)
+                try:
+                    with open(path, 'r') as strm_f:
+                        content = strm_f.read()
+                    if '8084' in content or 'apx_' in content:
+                        os.remove(path)
+                        logger.info(f'Removed obsolete Go STRM: {path}')
+                except Exception:
+                    pass
     """Restores all cached movie & TV show .strm files on boot"""
     count = 0
     for msg_id, data in FILE_ID_CACHE.items():
