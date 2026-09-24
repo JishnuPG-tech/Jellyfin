@@ -84,6 +84,72 @@ def save_cache():
 
 load_cache()
 
+def index_media(msg_id, chat_id, file_id, file_size, file_name):
+    """Core ingestion: cache the file and create a .strm for Jellyfin."""
+    if not file_id or not msg_id:
+        return False
+
+    is_tv, title, show_name, season, episode = parse_media_type(file_name)
+
+    FILE_ID_CACHE[str(msg_id)] = {
+        "file_id": file_id,
+        "chat_id": chat_id,
+        "file_size": file_size,
+        "title": title,
+        "is_tv": is_tv,
+        "show_name": show_name,
+        "season": season,
+        "episode": episode
+    }
+    save_cache()
+
+    strm_name = create_strm_file(msg_id, file_id, title, is_tv, show_name, season, episode)
+    logger.info(f"[INGEST] Media indexed from Telegram: {strm_name} (chat={chat_id})")
+    return strm_name
+
+
+def media_file_name(message, media):
+    return getattr(media, "file_name", None) or message.caption or f"Telegram_Media_{message.id}"
+
+
+def allowed_chat(chat_id) -> bool:
+    if not RAW_CHANNEL_ID:
+        return True
+    allowed = [a.strip() for a in RAW_CHANNEL_ID.split(",") if a.strip()]
+    if not allowed:
+        return True
+    return str(chat_id) in allowed
+
+
+async def process_telegram_media(message, is_channel_post):
+    """Shared media handler for Pyrogram DM + channel post updates."""
+    try:
+        media = message.video or message.document or message.audio or message.animation
+        if not media or not getattr(media, "file_id", None):
+            return
+        chat = message.chat
+        chat_id = chat.id if chat else None
+        if chat_id is None or not allowed_chat(chat_id):
+            return
+
+        if is_channel_post:
+            global DETECTED_CHANNEL_ID
+            DETECTED_CHANNEL_ID = chat_id
+            try:
+                with open(CONFIG_FILE, "w") as f:
+                    json.dump({"channel_id": chat_id}, f)
+            except Exception as e:
+                logger.warning(f"[CONFIG] Could not persist channel_id: {e}")
+
+        strm_name = index_media(message.id, chat_id, media.file_id, media.file_size or 0,
+                                media_file_name(message, media))
+        if strm_name:
+            logger.info(f"[PYROGRAM] 🎉 Ingested '{strm_name}' from chat {chat_id}")
+            await trigger_jellyfin_scan()
+    except Exception as e:
+        logger.error(f"[PYROGRAM] Error handling update: {e}")
+
+
 # Persistent Pyrogram Bot Client
 tg_app = None
 if API_ID and API_HASH and BOT_TOKEN:
@@ -99,6 +165,16 @@ if API_ID and API_HASH and BOT_TOKEN:
         logger.info("[PYROGRAM] Pyrogram persistent client initialized.")
     except Exception as e:
         logger.error(f"[PYROGRAM] Error initializing Pyrogram: {e}")
+
+if tg_app:
+    @tg_app.on_message(filters.video | filters.document | filters.audio | filters.animation)
+    async def on_media_message(client, message):
+        await process_telegram_media(message, False)
+
+    @tg_app.on_channel_post(filters.video | filters.document | filters.audio | filters.animation)
+    async def on_media_channel_post(client, message):
+        await process_telegram_media(message, True)
+    logger.info("[PYROGRAM] Message & channel-post media handlers registered.")
 
 routes = web.RouteTableDef()
 

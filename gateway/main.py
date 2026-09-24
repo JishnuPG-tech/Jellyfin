@@ -1,8 +1,8 @@
 import os
 import logging
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from gateway.utils import get_http_client, proxy_http_request
+from gateway.utils import get_http_client, proxy_http_request, proxy_websocket_stream
 from gateway.ops import router as ops_router
 
 logger = logging.getLogger("gateway.main")
@@ -64,4 +64,12 @@ async def route_catch_all(path: str, request: Request):
         return JSONResponse({"status": "live"})
         
     logger.info(f"[ROUTER] {req_path} -> Jellyfin fallback ({JELLYFIN_PORT})")
-    return await proxy_http_request(f"http://127.0.0.1:{JELLYFIN_PORT}{req_path}", request, default_prefix="")
+    sub_p = request.url.path
+    return await proxy_http_request(f"http://127.0.0.1:{JELLYFIN_PORT}{sub_p}", request, default_prefix="")
+
+@app.websocket("/socket")
+@app.websocket("/jellyfin/socket")
+async def jellyfin_socket(websocket: WebSocket):
+    JELLYFIN_WS = f"ws://127.0.0.1:{JELLYFIN_PORT}/socket"
+    logger.info(f"[ROUTER] WebSocket {websocket.url.path} -> Jellyfin ({JELLYFIN_PORT})")
+    await proxy_websocket_stream(websocket, JELLYFIN_WS)

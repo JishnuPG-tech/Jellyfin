@@ -24,7 +24,7 @@ RUN mkdir -p /etc/apt/keyrings \
  && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir \
-    aiohttp pyrogram tgcrypto httpx uvicorn fastapi \
+    aiohttp pyrogram tgcrypto httpx uvicorn[standard] fastapi websockets \
     --break-system-packages
 
 RUN mkdir -p /root/.cache /data/cache
