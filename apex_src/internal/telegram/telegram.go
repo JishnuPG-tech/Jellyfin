@@ -394,7 +394,7 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 				return file.Bytes, nil
 			case *tg.UploadFileCDNRedirect:
 				log.Printf("[Telegram] Received CDN redirect for media %s (DC: %d). Requesting re-upload to master DC...", item.ID, file.DCID)
-				_, reuploadErr := raw.UploadReuploadCdnFile(ctx, &tg.UploadReuploadCdnFileRequest{
+				_, reuploadErr := raw.UploadReuploadCDNFile(ctx, &tg.UploadReuploadCDNFileRequest{
 					FileToken:    file.FileToken,
 					RequestToken: file.FileToken,
 				})
