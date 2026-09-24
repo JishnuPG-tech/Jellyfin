@@ -25,6 +25,10 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+JELLYFIN_DB = "/opt/jellyfin-local/data/data/jellyfin.db"
+if not os.path.exists(JELLYFIN_DB):
+    JELLYFIN_DB = "/data/jellyfin/data/data/jellyfin.db"
+
 TARGET_DATABASES = [
     "/root/.omniroute/storage.sqlite",
     "/data/omniroute/storage.sqlite",
@@ -115,7 +119,7 @@ def _jellyfin_virtual_folders(auth):
 
 def _read_jellyfin_api_keys():
     """Read every row of Jellyfin's api_keys table (works even when the token is invalid)."""
-    db = "/data/jellyfin/data/data/jellyfin.db"
+    db = JELLYFIN_DB
     rows = []
     if not os.path.exists(db):
         return rows
@@ -198,7 +202,7 @@ def ensure_active_jellyfin_api_key():
 
 def _insert_jellyfin_api_key():
     """Insert an ACTIVE API key row directly into Jellyfin's sqlite api_keys table."""
-    db = "/data/jellyfin/data/data/jellyfin.db"
+    db = JELLYFIN_DB
     if not os.path.exists(db):
         return ""
     token = uuid.uuid4().hex
