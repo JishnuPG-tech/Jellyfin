@@ -55,25 +55,66 @@ else
     echo "[Apex] Fresh database initialized at /tmp/apex-db/apex.db."
 fi
 
-# ── 3.5 Jellyfin 10.9.11 SQLite Schema Compatibility Check ───────────────────
-if [ -f "/data/jellyfin/data/jellyfin.db" ] && command -v sqlite3 >/dev/null 2>&1; then
-    # Check if Users table exists and lacks MaxParentalAgeRating (schema incompatibility from 10.10+/10.11+)
-    HAS_USERS=$(sqlite3 /data/jellyfin/data/jellyfin.db "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='Users';" 2>/dev/null || echo "0")
-    if [ "${HAS_USERS}" = "1" ]; then
-        HAS_RATING_COL=$(sqlite3 /data/jellyfin/data/jellyfin.db "PRAGMA table_info(Users);" 2>/dev/null | grep -i "MaxParentalAgeRating" || true)
-        if [ -z "${HAS_RATING_COL}" ]; then
-            echo "[Apex] WARNING: Detected Jellyfin database schema mismatch (missing MaxParentalAgeRating in /data/jellyfin/data/jellyfin.db)."
-            echo "[Apex] The existing database was created by a newer Jellyfin version (10.10+/10.11+) and cannot be read by 10.9.11."
-            TIMESTAMP=$(date +%s)
-            BACKUP_DIR="/data/jellyfin/backups/incompatible_schema_${TIMESTAMP}"
-            mkdir -p "${BACKUP_DIR}"
-            echo "[Apex] Backing up incompatible database and config to ${BACKUP_DIR}..."
-            mv -f /data/jellyfin/data/jellyfin.db* "${BACKUP_DIR}/" 2>/dev/null || true
-            echo "[Apex] Initializing fresh, compatible database for Jellyfin 10.9.11..."
-        fi
-    fi
-fi
+JELLYFIN_DB="${JELLYFIN_DB_PATH:-/data/jellyfin/data/data/jellyfin.db}"
 
+quarantine_jellyfin_database() {
+    local reason="${1:-recovery}"
+    local timestamp="$(date +%s)"
+    local backup_dir="/data/jellyfin/backups/${reason}_${timestamp}"
+    mkdir -p "${backup_dir}"
+    [ -f "${JELLYFIN_DB}" ] && mv -f "${JELLYFIN_DB}" "${backup_dir}/" 2>/dev/null || true
+    [ -f "${JELLYFIN_DB}-wal" ] && mv -f "${JELLYFIN_DB}-wal" "${backup_dir}/" 2>/dev/null || true
+    [ -f "${JELLYFIN_DB}-shm" ] && mv -f "${JELLYFIN_DB}-shm" "${backup_dir}/" 2>/dev/null || true
+    echo "[Apex] Jellyfin database state quarantined in ${backup_dir} (${reason})."
+}
+
+prepare_jellyfin_database() {
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "[Apex] WARNING: sqlite3 is unavailable; skipping Jellyfin database preflight."
+        return 0
+    fi
+    if [ ! -f "${JELLYFIN_DB}" ]; then
+        echo "[Apex] [Schema Check] No Jellyfin database at ${JELLYFIN_DB}; Jellyfin will initialize a fresh database."
+        return 0
+    fi
+    echo "[Apex] [Schema Check] Inspecting Jellyfin database at: ${JELLYFIN_DB}..."
+    local integrity_output integrity_status=0
+    integrity_output="$(sqlite3 "${JELLYFIN_DB}" "PRAGMA integrity_check;" 2>&1)" || integrity_status=$?
+    if [ "${integrity_status}" -ne 0 ] || [ "${integrity_output}" != "ok" ]; then
+        echo "[Apex] [Schema Check] CRITICAL: Jellyfin SQLite integrity check failed."
+        echo "[Apex] [Schema Check] Result: ${integrity_output}"
+        quarantine_jellyfin_database "corrupt_db"
+        return 1
+    fi
+    local has_users users_query_status=0
+    has_users="$(sqlite3 "${JELLYFIN_DB}" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='Users';" 2>&1)" || users_query_status=$?
+    if [ "${users_query_status}" -ne 0 ]; then
+        echo "[Apex] [Schema Check] CRITICAL: SQLite schema query failed: ${has_users}"
+        quarantine_jellyfin_database "invalid_schema"
+        return 1
+    fi
+    if [ "${has_users}" = "1" ]; then
+        local users_schema schema_query_status=0
+        users_schema="$(sqlite3 "${JELLYFIN_DB}" "PRAGMA table_info(Users);" 2>&1)" || schema_query_status=$?
+        if [ "${schema_query_status}" -ne 0 ]; then
+            echo "[Apex] [Schema Check] CRITICAL: Users schema could not be inspected: ${users_schema}"
+            quarantine_jellyfin_database "invalid_users_schema"
+            return 1
+        fi
+        if ! printf '%s\n' "${users_schema}" | grep -qi "MaxParentalAgeRating"; then
+            echo "[Apex] [Schema Check] WARNING: Existing Jellyfin database is incompatible with Jellyfin 10.9.11 (missing Users.MaxParentalAgeRating)."
+            quarantine_jellyfin_database "incompatible_schema"
+            echo "[Apex] [Schema Check] Jellyfin will initialize a fresh compatible database."
+            return 1
+        fi
+        echo "[Apex] [Schema Check] PASSED: Database has valid Jellyfin 10.9.11 schema (Users.MaxParentalAgeRating verified)."
+    else
+        echo "[Apex] [Schema Check] 'Users' table not found. Database is valid but uninitialized or empty."
+    fi
+    return 0
+}
+
+prepare_jellyfin_database || true
 # ── 4. Pre-configure Jellyfin Library Structure ────────────────────────────────
 mkdir -p /data/jellyfin/data/root/default/Movies \
          /data/jellyfin/data/root/default/Shows
@@ -217,21 +258,16 @@ while true; do
         cleanup
     fi
 
-    # Check Jellyfin with crash loop backoff
+    # Check Jellyfin with crash recovery
     if [ -n "${JELLYFIN_PID:-}" ] && ! kill -0 "${JELLYFIN_PID}" 2>/dev/null; then
         JELLYFIN_CRASH_COUNT=$((JELLYFIN_CRASH_COUNT + 1))
-        echo "[Apex] WARNING: Jellyfin exited (rapid crash count: ${JELLYFIN_CRASH_COUNT}) — restarting..."
-
+        echo "[Apex] WARNING: Jellyfin exited (consecutive crash count: ${JELLYFIN_CRASH_COUNT})."
+        prepare_jellyfin_database || true
         if [ "${JELLYFIN_CRASH_COUNT}" -ge 4 ]; then
-            echo "[Apex] FATAL: Jellyfin crashed ${JELLYFIN_CRASH_COUNT} times consecutively. Possible schema or database corruption."
-            TIMESTAMP=$(date +%s)
-            BACKUP_DIR="/data/jellyfin/backups/crash_recovery_${TIMESTAMP}"
-            mkdir -p "${BACKUP_DIR}"
-            echo "[Apex] Backing up corrupted database files to ${BACKUP_DIR} and re-initializing clean database..."
-            mv -f /data/jellyfin/data/jellyfin.db* "${BACKUP_DIR}/" 2>/dev/null || true
+            echo "[Apex] FATAL: Jellyfin crashed ${JELLYFIN_CRASH_COUNT} times consecutively. Forcing clean database recovery."
+            quarantine_jellyfin_database "crash_recovery"
             JELLYFIN_CRASH_COUNT=0
         fi
-
         (
             exec "${JELLYFIN_BIN}" \
                 -d /data/jellyfin/data \
@@ -246,12 +282,8 @@ while true; do
         sleep 2
     else
         JELLYFIN_UPTIME_TICKS=$((JELLYFIN_UPTIME_TICKS + 1))
-        # After 12 ticks (60s) of stable runtime, reset crash counter
-        if [ "${JELLYFIN_UPTIME_TICKS}" -ge 12 ]; then
-            JELLYFIN_CRASH_COUNT=0
-        fi
+        if [ "${JELLYFIN_UPTIME_TICKS}" -ge 12 ]; then JELLYFIN_CRASH_COUNT=0; fi
     fi
-
     # Check Apex Core
     if [ -f "/opt/apex/apex-core" ]; then
         if [ -z "${APEX_CORE_PID:-}" ] || ! kill -0 "${APEX_CORE_PID}" 2>/dev/null; then

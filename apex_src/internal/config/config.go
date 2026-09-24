@@ -59,7 +59,7 @@ func Load() *Config {
 
 	jfAPIKey := getEnv("APEX_JELLYFIN_API_KEY", getEnv("JELLYFIN_API_KEY", ""))
 	if jfAPIKey == "" {
-		log.Println("[Apex] Notice: APEX_JELLYFIN_API_KEY is not set. Complete initial Jellyfin setup at http://<host>:7860 and set APEX_JELLYFIN_API_KEY in environment variables.")
+		log.Println("[Apex] Notice: APEX_JELLYFIN_API_KEY is not set. Complete initial Jellyfin setup, create an API key, and set APEX_JELLYFIN_API_KEY in the environment.")
 	}
 
 	return &Config{

@@ -62,7 +62,7 @@ func main() {
 
 	tmdbClient := metadata.NewClient(cfg.TMDBAPIKey, cfg.MetadataCacheDir)
 	jfWriter := jellyfin.NewWriter(cfg.JellyfinMedia)
-	jfClient := jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey)
+	jfClient := jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey, cfg.JellyfinMedia)
 
 	// Ingestion task queue (non-blocking decouple from Telegram event loop)
 	jobQueue := make(chan *telegram.IngestionTask, 500)
@@ -304,6 +304,10 @@ func processIngestionTask(
 		log.Printf("[Worker #%d] Media already cataloged as '%s' (ID: %s, STRM: %s). Updating file reference...",
 			workerID, existing.CleanTitle, existing.ID, existing.StrmPath)
 		_ = database.UpdateFileReference(existing.ID, doc.FileReference, doc.AccessHash)
+		select {
+		case refreshNotify <- struct{}{}:
+		default:
+		}
 		return
 	}
 
