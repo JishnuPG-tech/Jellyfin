@@ -9,10 +9,7 @@ if [ -f "/health_doctor.py" ]; then
     python3 /health_doctor.py &
 fi
 
-WEBDIR_OPT=""
-if [ -d "/usr/share/jellyfin/web" ]; then
-    WEBDIR_OPT="--webdir /usr/share/jellyfin/web"
-fi
+WEBDIR_OPT="--webdir /usr/share/jellyfin/web"
 
 echo "[HEALTH] Jellyfin starting in background..."
 if command -v jellyfin >/dev/null 2>&1; then
@@ -60,6 +57,9 @@ while true; do
         echo "[CRITICAL] Jellyfin process died! Restarting..."
         if command -v jellyfin >/dev/null 2>&1; then
             jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log  &
+            JELLYFIN_PID=$!
+        elif [ -f "/usr/bin/jellyfin" ]; then
+            /usr/bin/jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log  &
             JELLYFIN_PID=$!
         fi
     fi
