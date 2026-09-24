@@ -13,10 +13,10 @@ WEBDIR_OPT="--webdir /usr/share/jellyfin/web"
 
 echo "[HEALTH] Jellyfin starting in background..."
 if command -v jellyfin >/dev/null 2>&1; then
-    jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log  &
+    jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log $WEBDIR_OPT &
     JELLYFIN_PID=$!
 elif [ -f "/usr/bin/jellyfin" ]; then
-    /usr/bin/jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log  &
+    /usr/bin/jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log $WEBDIR_OPT &
     JELLYFIN_PID=$!
 fi
 
@@ -35,31 +35,31 @@ NGINX_PID=$!
 echo "[BOOT] All services dispatched. Process Supervisor active."
 
 while true; do
-    if [ -n "" ] && ! kill -0  2>/dev/null; then
+    if [ -n "$FASTAPI_PID" ] && ! kill -0 $FASTAPI_PID 2>/dev/null; then
         echo "[CRITICAL] FastAPI Gateway process died! Restarting..."
         python3 -m uvicorn proxy:app --host 127.0.0.1 --port 8000 --workers 2 &
         FASTAPI_PID=$!
     fi
 
-    if [ -n "" ] && ! kill -0  2>/dev/null; then
+    if [ -n "$NGINX_PID" ] && ! kill -0 $NGINX_PID 2>/dev/null; then
         echo "[CRITICAL] Nginx process died! Restarting..."
         nginx -g 'daemon off;' -c /nginx.conf &
         NGINX_PID=$!
     fi
     
-    if [ -n "" ] && ! kill -0  2>/dev/null; then
+    if [ -n "$TG_STREAMER_PID" ] && ! kill -0 $TG_STREAMER_PID 2>/dev/null; then
         echo "[CRITICAL] TG Streamer process died! Restarting..."
         python3 /tg_streamer.py &
         TG_STREAMER_PID=$!
     fi
     
-    if [ -n "" ] && ! kill -0  2>/dev/null; then
+    if [ -n "$JELLYFIN_PID" ] && ! kill -0 $JELLYFIN_PID 2>/dev/null; then
         echo "[CRITICAL] Jellyfin process died! Restarting..."
         if command -v jellyfin >/dev/null 2>&1; then
-            jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log  &
+            jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log $WEBDIR_OPT &
             JELLYFIN_PID=$!
         elif [ -f "/usr/bin/jellyfin" ]; then
-            /usr/bin/jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log  &
+            /usr/bin/jellyfin --datadir /data/jellyfin/data --configdir /data/jellyfin/config --cachedir /data/jellyfin/cache --logdir /data/jellyfin/log $WEBDIR_OPT &
             JELLYFIN_PID=$!
         fi
     fi
