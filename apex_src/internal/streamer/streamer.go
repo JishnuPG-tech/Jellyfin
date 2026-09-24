@@ -203,7 +203,6 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 4. RFC 7233 HTTP Range parsing
 	start := int64(0)
 	end := totalSize - 1
-	statusCode := http.StatusOK
 
 	if rangeHeader != "" {
 		// Reject multi-range requests
