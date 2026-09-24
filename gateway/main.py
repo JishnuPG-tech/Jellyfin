@@ -40,14 +40,15 @@ async def root_portal():
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def route_catch_all(path: str, request: Request):
-    req_path = request.url.path.lower()
+    raw_path = request.url.path
+    req_path = raw_path.lower()
     
     if req_path in ("/", "/index.html"):
         return await root_portal()
     
     if req_path == "/jellyfin" or req_path.startswith("/jellyfin/"):
         logger.info(f"[ROUTER] {req_path} -> Jellyfin ({JELLYFIN_PORT})")
-        sub_p = "/" if req_path == "/jellyfin" else req_path[len("/jellyfin"):]
+        sub_p = "/" if req_path == "/jellyfin" else raw_path[len("/jellyfin"):]
         return await proxy_http_request(f"http://127.0.0.1:{JELLYFIN_PORT}{sub_p}", request, default_prefix="/jellyfin", extra_headers={"X-Forwarded-Prefix": "/jellyfin"})
     
     if req_path in ("/tg-stream", "/tg_stream") or req_path.startswith("/tg-stream/") or req_path.startswith("/tg_stream/"):
@@ -55,9 +56,9 @@ async def route_catch_all(path: str, request: Request):
         if req_path in ("/tg-stream", "/tg_stream"):
             sub_p = "/"
         elif req_path.startswith("/tg-stream/"):
-            sub_p = req_path[len("/tg-stream"):]
+            sub_p = raw_path[len("/tg-stream"):]
         else:
-            sub_p = req_path[len("/tg_stream"):]
+            sub_p = raw_path[len("/tg_stream"):]
         return await proxy_http_request(f"http://127.0.0.1:{TG_PORT}{sub_p}", request, default_prefix="/tg-stream")
     
     if req_path == "/health/live":
