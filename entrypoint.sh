@@ -33,6 +33,44 @@ mkdir -p /data/Stirling/configs \
          /tmp/apex-stream-cache \
          2>/dev/null || true
 
+# Pre-configure Movies and Shows default library structures
+mkdir -p /data/jellyfin/data/root/default/Movies \
+         /data/jellyfin/data/root/default/Shows \
+         /data/jellyfin/media/Movies \
+         /data/jellyfin/media/Shows
+
+if [ ! -f "/data/jellyfin/data/root/default/Movies/options.xml" ]; then
+    cat << 'EOF' > /data/jellyfin/data/root/default/Movies/options.xml
+<?xml version="1.0" encoding="utf-8"?>
+<LibraryOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Enabled>true</Enabled>
+  <EnablePhotos>false</EnablePhotos>
+  <EnableRealtimeMonitor>true</EnableRealtimeMonitor>
+  <PathInfos>
+    <MediaPathInfo>
+      <Path>/data/jellyfin/media/Movies</Path>
+    </MediaPathInfo>
+  </PathInfos>
+</LibraryOptions>
+EOF
+fi
+
+if [ ! -f "/data/jellyfin/data/root/default/Shows/options.xml" ]; then
+    cat << 'EOF' > /data/jellyfin/data/root/default/Shows/options.xml
+<?xml version="1.0" encoding="utf-8"?>
+<LibraryOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Enabled>true</Enabled>
+  <EnablePhotos>false</EnablePhotos>
+  <EnableRealtimeMonitor>true</EnableRealtimeMonitor>
+  <PathInfos>
+    <MediaPathInfo>
+      <Path>/data/jellyfin/media/Shows</Path>
+    </MediaPathInfo>
+  </PathInfos>
+</LibraryOptions>
+EOF
+fi
+
 # Permanently persist ASP.NET Core DataProtection keys in /data
 mkdir -p /data/jellyfin/.aspnet/DataProtection-Keys
 rm -rf /root/.aspnet 2>/dev/null || true
@@ -330,15 +368,11 @@ while true; do
         fi
     fi
 
-    # Periodic SQLite snapshots for Apex Core and Jellyfin (every 180 loops * 5s = 15 minutes)
+    # Periodic SQLite snapshot for Apex Core local database (every 180 loops * 5s = 15 minutes)
     BACKUP_COUNTER=$((BACKUP_COUNTER + 1))
-    if [ $((BACKUP_COUNTER % 6)) -eq 0 ]; then
-        ensure_jellyfin_api_key
-    fi
     if [ "${BACKUP_COUNTER}" -ge 180 ]; then
         BACKUP_COUNTER=0
         backup_sqlite
-        backup_jellyfin_sqlite
     fi
 
     sleep 5
