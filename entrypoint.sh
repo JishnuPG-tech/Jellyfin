@@ -145,13 +145,20 @@ if [ ! -f "${JELLYFIN_BIN}" ] && [ -f "/usr/bin/jellyfin" ]; then
 fi
 
 if [ -f "${JELLYFIN_BIN}" ]; then
-    echo "[Apex] Starting Jellyfin on Port 8096..."
+    echo "[Apex] Locating verified FFmpeg binary..."
     FFMPEG_PATH="/usr/lib/jellyfin-ffmpeg/ffmpeg"
-    [ ! -f "${FFMPEG_PATH}" ] && FFMPEG_PATH="$(command -v ffmpeg || echo 'ffmpeg')"
+    if [ ! -x "${FFMPEG_PATH}" ] || ! "${FFMPEG_PATH}" -version >/dev/null 2>&1; then
+        if [ -x "/usr/local/bin/ffmpeg" ] && /usr/local/bin/ffmpeg -version >/dev/null 2>&1; then
+            FFMPEG_PATH="/usr/local/bin/ffmpeg"
+        elif command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version >/dev/null 2>&1; then
+            FFMPEG_PATH="$(command -v ffmpeg)"
+        fi
+    fi
 
-    WEBDIR="/opt/jellyfin/jellyfin-web"
-    [ ! -d "${WEBDIR}" ] && WEBDIR="/usr/share/jellyfin/web"
+    WEBDIR="/usr/share/jellyfin/web"
+    [ ! -d "${WEBDIR}" ] && WEBDIR="/opt/jellyfin/jellyfin-web"
 
+    echo "[Apex] Starting Jellyfin on Port 8096 (FFmpeg: ${FFMPEG_PATH}, Web: ${WEBDIR})..."
     (
         exec "${JELLYFIN_BIN}" \
             -d /data/jellyfin/data \

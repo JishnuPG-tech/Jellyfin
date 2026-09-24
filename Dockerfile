@@ -13,10 +13,13 @@ RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o apex-co
 # ── Stage 2: Clean Caddy Gateway Binary ────────────────────────────────────────
 FROM caddy:2-alpine AS caddy-source
 
-# ── Stage 3: Official Jellyfin Runtime & Media Tools ───────────────────────────
+# ── Stage 3: Clean Static FFmpeg & FFprobe ─────────────────────────────────────
+FROM mwader/static-ffmpeg:7.1 AS ffmpeg-source
+
+# ── Stage 4: Official Jellyfin Runtime & Media Tools ───────────────────────────
 FROM jellyfin/jellyfin:latest AS jellyfin-source
 
-# ── Stage 4: Main Production Image ────────────────────────────────────────────
+# ── Stage 5: Main Production Image ────────────────────────────────────────────
 FROM stirlingtools/stirling-pdf:latest
 
 USER root
@@ -25,24 +28,31 @@ USER root
 COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
 RUN chmod +x /usr/local/bin/caddy
 
-# 2. Install Official Jellyfin Media Server & FFmpeg (Zero apt dependencies)
-COPY --from=jellyfin-source /jellyfin /opt/jellyfin
-COPY --from=jellyfin-source /usr/lib/jellyfin-ffmpeg /usr/lib/jellyfin-ffmpeg
-RUN ln -sf /opt/jellyfin/jellyfin /usr/local/bin/jellyfin && \
-    ln -sf /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg 2>/dev/null || true
+# 2. Install FFmpeg & FFprobe Static Binaries (Zero dynamic library dependencies)
+COPY --from=ffmpeg-source /ffmpeg /usr/local/bin/ffmpeg
+COPY --from=ffmpeg-source /ffprobe /usr/local/bin/ffprobe
+RUN chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
+    mkdir -p /usr/lib/jellyfin-ffmpeg && \
+    ln -sf /usr/local/bin/ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg && \
+    ln -sf /usr/local/bin/ffprobe /usr/lib/jellyfin-ffmpeg/ffprobe
 
-# 3. Install Apex Go Core Binary (Zero apt dependencies)
+# 3. Install Official Jellyfin Media Server & Jellyfin Web Client
+COPY --from=jellyfin-source /jellyfin /opt/jellyfin
+COPY --from=jellyfin-source /usr/share/jellyfin/web /usr/share/jellyfin/web
+RUN ln -sf /opt/jellyfin/jellyfin /usr/local/bin/jellyfin
+
+# 4. Install Apex Go Core Binary (Zero apt dependencies)
 RUN mkdir -p /opt/apex
 COPY --from=go-builder /app/apex-core /opt/apex/apex-core
 RUN chmod +x /opt/apex/apex-core
 
-# 4. Set up Python environment for PDF Enhancer (FastAPI + React)
+# 5. Set up Python environment for PDF Enhancer (FastAPI + React)
 RUN pip install --no-cache-dir --break-system-packages \
         httpx fastapi uvicorn python-multipart pydantic pymupdf opencv-python-headless numpy pillow 2>/dev/null || \
     python3 -m pip install --no-cache-dir --break-system-packages \
         httpx fastapi uvicorn python-multipart pydantic pymupdf opencv-python-headless numpy pillow 2>/dev/null || true
 
-# 5. Install Services and Gateway Configuration
+# 6. Install Services and Gateway Configuration
 RUN mkdir -p /opt/pdf_enhancer /srv/portal /etc/caddy
 COPY pdf_enhancer/ /opt/pdf_enhancer/
 COPY portal/ /srv/portal/
@@ -50,7 +60,7 @@ COPY Caddyfile /etc/caddy/Caddyfile
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# 6. Pre-create required directory layout
+# 7. Pre-create required directory layout
 RUN mkdir -p /data/Stirling/configs \
              /data/Stirling/logs \
              /data/Stirling/customFiles \
