@@ -155,8 +155,8 @@ if [ -f "${JELLYFIN_BIN}" ]; then
         fi
     fi
 
-    WEBDIR="/usr/share/jellyfin/web"
-    [ ! -d "${WEBDIR}" ] && WEBDIR="/opt/jellyfin/jellyfin-web"
+    WEBDIR="/opt/jellyfin/jellyfin-web"
+    [ ! -d "${WEBDIR}" ] && WEBDIR="/usr/share/jellyfin/web"
 
     echo "[Apex] Starting Jellyfin on Port 8096 (FFmpeg: ${FFMPEG_PATH}, Web: ${WEBDIR})..."
     (

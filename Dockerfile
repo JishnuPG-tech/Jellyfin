@@ -38,7 +38,6 @@ RUN chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
 
 # 3. Install Official Jellyfin Media Server & Jellyfin Web Client
 COPY --from=jellyfin-source /jellyfin /opt/jellyfin
-COPY --from=jellyfin-source /usr/share/jellyfin/web /usr/share/jellyfin/web
 RUN ln -sf /opt/jellyfin/jellyfin /usr/local/bin/jellyfin
 
 # 4. Install Apex Go Core Binary (Zero apt dependencies)
