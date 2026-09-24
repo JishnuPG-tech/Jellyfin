@@ -22,13 +22,20 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 HOST = "127.0.0.1"
-PORT = 8080
+PORT = int(os.environ.get("TG_LISTEN_PORT", os.environ.get("PORT", "8080")))
 
-API_ID = os.environ.get("TG_API_ID")
-API_HASH = os.environ.get("TG_API_HASH")
-BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
-RAW_CHANNEL_ID = os.environ.get("TG_CHANNEL_ID", "")
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
+def get_env(*names, default=None):
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return default
+
+API_ID = get_env("TELEGRAM_API_ID", "TG_API_ID")
+API_HASH = get_env("TELEGRAM_API_HASH", "TG_API_HASH")
+BOT_TOKEN = get_env("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN")
+RAW_CHANNEL_ID = get_env("TELEGRAM_ALLOWED_CHAT_IDS", "TG_CHANNEL_ID", default="")
+TMDB_API_KEY = get_env("TMDB_API_KEY")
 
 DATA_DIR = "/data/jellyfin"
 MOVIES_DIR = os.path.join(DATA_DIR, "media/Movies")
@@ -215,7 +222,7 @@ async def trigger_jellyfin_scan():
                 continue
             logger.warning(f"Could not trigger Jellyfin library refresh after retries: {e}")
 
-WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET")
+WEBHOOK_SECRET = get_env("APEX_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET")
 
 @routes.post("/")
 @routes.post("/telegram-webhook")
@@ -366,8 +373,11 @@ async def stream_file(request):
     return web.Response(status=500, text="Streaming temporarily unavailable.")
 
 async def restore_cached_strm_files():
+    """Removes obsolete Go-era .strm files and restores every cached movie & TV show from disk."""
     logger.info('[MIGRATION] Cleaning up old Go .strm files...')
-    for root, _, files in os.walk(MEDIA_DIR):
+    removed = 0
+    media_dir = os.path.join(DATA_DIR, "media")
+    for root, _, files in os.walk(media_dir):
         for f in files:
             if f.endswith('.strm'):
                 path = os.path.join(root, f)
@@ -377,9 +387,12 @@ async def restore_cached_strm_files():
                     if '8084' in content or 'apx_' in content:
                         os.remove(path)
                         logger.info(f'Removed obsolete Go STRM: {path}')
+                        removed += 1
                 except Exception:
                     pass
-    """Restores all cached movie & TV show .strm files on boot"""
+    if removed:
+        logger.info(f"[MIGRATION] Removed {removed} obsolete Go-era .strm file(s)")
+
     count = 0
     for msg_id, data in FILE_ID_CACHE.items():
         if isinstance(data, dict):

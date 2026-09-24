@@ -3,11 +3,14 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from gateway.utils import get_http_client, proxy_http_request
+from gateway.ops import router as ops_router
 
 logger = logging.getLogger("gateway.main")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="OpenCode Space Gateway", docs_url=None, redoc_url=None)
+
+app.include_router(ops_router)
 
 JELLYFIN_PORT = 8096
 TG_PORT = 8080

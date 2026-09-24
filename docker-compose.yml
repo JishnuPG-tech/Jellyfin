@@ -1,26 +1,26 @@
 version: "3.8"
 
 services:
-  opencode:
+  apex:
     build: .
     ports:
-      - "4096:4096"
+      - "7860:7860"
     environment:
-      # Set your API keys here
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      # Optional: enable HTTP basic auth
-      - OPENCODE_SERVER_USERNAME=${OPENCODE_SERVER_USERNAME:-}
-      - OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD:-}
+      # Configure these in HF Space Settings -> Variables and secrets instead
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID:-}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_ALLOWED_CHAT_IDS=${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      - APEX_SECRET_KEY=${APEX_SECRET_KEY:-}
     volumes:
-      # Mount a directory for projects to persist data
-      - opencode-data:/projects
+      - apex-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4096/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:7860/health"]
       interval: 30s
       timeout: 5s
       retries: 3
 
 volumes:
-  opencode-data:
+  apex-data:

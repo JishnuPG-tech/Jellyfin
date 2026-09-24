@@ -7,29 +7,27 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
-    name: Go Unit & Integration Tests
+  python:
+    name: Python Syntax & Import Validation
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          go-version: '1.22'
-          cache: false
+          python-version: '3.11'
 
-      - name: Run Tests
-        working-directory: apex_src
+      - name: Validate Syntax
         run: |
-          go mod tidy
-          go test -v -race ./...
+          python -m compileall -q gateway proxy.py health_doctor.py tg_streamer.py
+          python -c "import ast,glob,sys; [ast.parse(open(f).read()) for f in glob.glob('**/*.py', recursive=True)]"
 
   docker:
     name: Docker Build Validation
     runs-on: ubuntu-latest
-    needs: test
+    needs: python
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4

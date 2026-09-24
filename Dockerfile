@@ -39,6 +39,6 @@ COPY health_doctor.py /health_doctor.py
 COPY gateway /gateway
 RUN chmod +x /entrypoint.sh /health_doctor.py
 
-EXPOSE 4096
+EXPOSE 7860
 
 ENTRYPOINT ["/entrypoint.sh"]
