@@ -6,25 +6,25 @@ ENV XDG_CACHE_HOME=/root/.cache
 ENV XDG_STATE_HOME=/data/state
 ENV HOME=/root
 
-RUN apt-get update && apt-get install -y --no-install-recommends 
-    curl 
-    ca-certificates 
-    git 
-    python3 
-    python3-pip 
-    nginx 
-    gnupg 
-    sqlite3 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    git \
+    python3 \
+    python3-pip \
+    nginx \
+    gnupg \
+    sqlite3 \
  && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /etc/apt/keyrings 
- && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg 
- && echo "deb [signed-by=/etc/apt/keyrings/jellyfin.gpg arch=amd64] https://repo.jellyfin.org/debian bookworm main" > /etc/apt/sources.list.d/jellyfin.list 
- && apt-get update && apt-get install -y --no-install-recommends jellyfin-server jellyfin-web ffmpeg 
+RUN mkdir -p /etc/apt/keyrings \
+ && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/jellyfin.gpg arch=amd64] https://repo.jellyfin.org/debian bookworm main" > /etc/apt/sources.list.d/jellyfin.list \
+ && apt-get update && apt-get install -y --no-install-recommends jellyfin-server jellyfin-web ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir 
-    aiohttp pyrogram tgcrypto httpx uvicorn fastapi 
+RUN pip3 install --no-cache-dir \
+    aiohttp pyrogram tgcrypto httpx uvicorn fastapi \
     --break-system-packages
 
 RUN mkdir -p /root/.cache /data/cache
