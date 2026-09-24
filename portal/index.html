@@ -3,25 +3,20 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Apex Workspace | Multi-Tool Cloud Suite</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <title>Apex Multi-Tool Suite</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #0b0f19;
-      --card-bg: rgba(22, 30, 49, 0.7);
-      --card-border: rgba(255, 255, 255, 0.08);
+      --bg-dark: #0f172a;
+      --card-bg: rgba(30, 41, 59, 0.6);
+      --card-border: rgba(255, 255, 255, 0.1);
       --card-hover-border: rgba(99, 102, 241, 0.4);
-      --primary: #6366f1;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
       --primary-gradient: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
-      --otter-gradient: linear-gradient(135deg, #e07832 0%, #f59e0b 100%);
-      --emerald-gradient: linear-gradient(135deg, #10b981 0%, #06b6d4 100%);
-      --text: #f3f4f6;
-      --text-muted: #9ca3af;
-      --text-dim: #6b7280;
-      --badge-bg: rgba(99, 102, 241, 0.15);
-      --badge-text: #818cf8;
+      --emerald-gradient: linear-gradient(135deg, #10b981 0%, #3b82f6 100%);
+      --otter-gradient: linear-gradient(135deg, #f59e0b 0%, #ef4444 100%);
       --success: #10b981;
       --glow: rgba(99, 102, 241, 0.15);
     }
@@ -33,38 +28,38 @@
     }
 
     body {
-      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
-      background-color: var(--bg);
-      background-image: 
-        radial-gradient(circle at 15% 15%, rgba(99, 102, 241, 0.12) 0%, transparent 40%),
-        radial-gradient(circle at 85% 85%, rgba(224, 120, 50, 0.1) 0%, transparent 40%),
-        radial-gradient(circle at 50% 50%, rgba(14, 165, 233, 0.05) 0%, transparent 60%);
-      color: var(--text);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-main);
       min-height: 100vh;
       display: flex;
       flex-direction: column;
-      padding: 2.5rem 1.5rem;
+      align-items: center;
+      padding: 4rem 1.5rem;
+      background-image: 
+        radial-gradient(circle at 15% 50%, rgba(99, 102, 241, 0.08), transparent 25%),
+        radial-gradient(circle at 85% 30%, rgba(168, 85, 247, 0.08), transparent 25%);
+      background-attachment: fixed;
     }
 
     .container {
-      max-width: 1200px;
-      margin: 0 auto;
+      max-width: 1000px;
       width: 100%;
-      flex: 1;
     }
 
     header {
       text-align: center;
-      margin-bottom: 3.5rem;
+      margin-bottom: 4rem;
+      position: relative;
     }
 
     .badge-hub {
       display: inline-flex;
       align-items: center;
       gap: 0.5rem;
-      padding: 0.35rem 1rem;
-      background: var(--badge-bg);
-      color: var(--badge-text);
+      padding: 0.4rem 1rem;
+      background: rgba(99, 102, 241, 0.1);
+      color: #818cf8;
       border: 1px solid rgba(99, 102, 241, 0.3);
       border-radius: 9999px;
       font-size: 0.825rem;
@@ -140,10 +135,6 @@
       transition: opacity 0.3s ease;
     }
 
-    .card.card-otter::before {
-      background: var(--otter-gradient);
-    }
-
     .card.card-emerald::before {
       background: var(--emerald-gradient);
     }
@@ -213,7 +204,7 @@
     }
 
     .tag {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: "JetBrains Mono", monospace;
       font-size: 0.75rem;
       padding: 0.2rem 0.55rem;
       border-radius: 6px;
@@ -284,7 +275,7 @@
     }
 
     .spec-value {
-      font-family: 'JetBrains Mono', monospace;
+      font-family: "JetBrains Mono", monospace;
       font-size: 1.05rem;
       font-weight: 600;
       color: #e2e8f0;
@@ -366,32 +357,6 @@
         </a>
       </div>
 
-      <!-- Gemini Web2API App Card -->
-      <div class="card">
-        <div class="card-header">
-          <div class="icon-wrapper" style="background: rgba(14, 165, 233, 0.15); border-color: rgba(14, 165, 233, 0.3);">✨</div>
-          <span class="status-badge">
-            <span class="badge-dot"></span> Active
-          </span>
-        </div>
-        <h2 class="card-title">Gemini Web2API</h2>
-        <p class="card-description">OpenAI-compatible proxy gateway for Google Gemini. Use with Cursor, Cline, NextChat, or any OpenAI-compatible client with zero API cost.</p>
-        
-        <div class="tags">
-          <span class="tag">OpenAI /v1 API</span>
-          <span class="tag">Streaming</span>
-          <span class="tag">Function Calling</span>
-          <span class="tag">Port 8081</span>
-        </div>
-
-        <a href="/v1/models" target="_blank" class="launch-btn" style="background: linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%);">
-          View /v1/models
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M5 12h14M12 5l7 7-7 7"/>
-          </svg>
-        </a>
-      </div>
-
       <!-- PDF Enhancer & Bleed-Through Restorer Card -->
       <div class="card card-emerald">
         <div class="card-header">
@@ -412,32 +377,6 @@
 
         <a href="/enhancer/" class="launch-btn" style="background: linear-gradient(135deg, #d97757 0%, #c2653f 100%);">
           Launch PDF Enhancer
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M5 12h14M12 5l7 7-7 7"/>
-          </svg>
-        </a>
-      </div>
-
-      <!-- God's Eye View 3D Globe Card -->
-      <div class="card card-otter">
-        <div class="card-header">
-          <div class="icon-wrapper" style="background: rgba(224, 120, 50, 0.15); border-color: rgba(224, 120, 50, 0.3);">🌐</div>
-          <span class="status-badge">
-            <span class="badge-dot"></span> Active
-          </span>
-        </div>
-        <h2 class="card-title">God's Eye View</h2>
-        <p class="card-description">Real-time 3D planetary intelligence console. Track live flights, naval vessels, satellites, wild fires, CCTV viewsheds, and tactical HUD on a photorealistic Earth globe.</p>
-        
-        <div class="tags">
-          <span class="tag">Cesium 3D</span>
-          <span class="tag">Live Telemetry</span>
-          <span class="tag">Tactical HUD</span>
-          <span class="tag">Port 8083</span>
-        </div>
-
-        <a href="/gods-eye/" class="launch-btn" style="background: linear-gradient(135deg, #e07832 0%, #f59e0b 100%);">
-          Launch God's Eye View
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M5 12h14M12 5l7 7-7 7"/>
           </svg>

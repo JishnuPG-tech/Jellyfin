@@ -22,35 +22,7 @@
 		}
 	}
 
-	# ── 2. Gemini Web2API (OpenAI-Compatible API on /v1*, /v1beta*, /gemini*) ─
-	handle /v1* {
-		reverse_proxy 127.0.0.1:8081 {
-			transport http {
-				response_header_timeout 300s
-				dial_timeout 30s
-			}
-		}
-	}
-
-	handle /v1beta* {
-		reverse_proxy 127.0.0.1:8081 {
-			transport http {
-				response_header_timeout 300s
-				dial_timeout 30s
-			}
-		}
-	}
-
-	handle_path /gemini* {
-		reverse_proxy 127.0.0.1:8081 {
-			transport http {
-				response_header_timeout 300s
-				dial_timeout 30s
-			}
-		}
-	}
-
-	# ── 3. Lucent — PDF Enhancer & Restorer (FastAPI + React 19 on /enhancer*) ───
+	# ── 2. Lucent — PDF Enhancer & Restorer (FastAPI + React 19 on /enhancer*) ───
 	redir /enhancer /enhancer/
 	handle_path /enhancer* {
 		reverse_proxy 127.0.0.1:8082 {
@@ -61,48 +33,7 @@
 		}
 	}
 
-	# ── 4. God's Eye View — 3D Geospatial Intelligence (Cesium on /gods-eye*) ──
-	redir /gods-eye /gods-eye/
-	handle /gods-eye* {
-		reverse_proxy 127.0.0.1:8083 {
-			transport http {
-				response_header_timeout 600s
-				dial_timeout 30s
-			}
-		}
-	}
-
-	# Forward /api* proxy endpoints to God's Eye View backend
-	handle /api* {
-		reverse_proxy 127.0.0.1:8083 {
-			transport http {
-				response_header_timeout 600s
-				dial_timeout 30s
-			}
-		}
-	}
-
-	# Forward root-level public assets and 3D models requested by God's Eye View
-	handle /logo.svg {
-		reverse_proxy 127.0.0.1:8083
-	}
-	handle /location.svg {
-		reverse_proxy 127.0.0.1:8083
-	}
-	handle /mic.svg {
-		reverse_proxy 127.0.0.1:8083
-	}
-	handle /pin.svg {
-		reverse_proxy 127.0.0.1:8083
-	}
-	handle /visual-presets.svg {
-		reverse_proxy 127.0.0.1:8083
-	}
-	handle /models/* {
-		reverse_proxy 127.0.0.1:8083
-	}
-
-	# ── 5. Apex Portal Hub (Static Web UI) ────────────────────────────────────
+	# ── 3. Apex Portal Hub (Static Web UI) ────────────────────────────────────
 	handle {
 		root * /srv/portal
 		file_server {

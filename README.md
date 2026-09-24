@@ -22,13 +22,10 @@ This Space uses a **Reverse Proxy Gateway (Caddy)** architecture, allowing you t
 | :--- | :--- | :--- | :--- |
 | **Portal Hub** | `/` | `7860` | Interactive dashboard listing all hosted tools. |
 | **Stirling-PDF** | `/stirling/` | `8080` | Full-featured offline & private PDF suite (OCR, merge, split, convert, edit). |
-| **Gemini Web2API** | `/v1/` or `/gemini/` | `8081` | OpenAI-compatible API gateway for Google Gemini (Cursor/Cline ready). |
 | **Lucent — Document Restorer** | `/enhancer/` | `8082` | Laser-clean document whitening & bleed-through remover (FastAPI + React 19). |
-| **God's Eye View** | `/gods-eye/` | `8083` | Real-time 3D planetary intelligence console & tactical globe simulator. |
 
 ---
 
-## 🤖 Using Gemini Web2API with AI Tools
 
 You can connect **Cursor**, **Cline**, **NextChat**, or any OpenAI-compatible tool to this Space:
 
@@ -50,7 +47,6 @@ To use your own Gemini account limits:
 
 ## 💾 Persistent Storage Structure
 
-All Stirling-PDF credentials, configurations, pipelines, and Gemini Web2API settings are automatically preserved across restarts:
 
 ```
 /data/
@@ -62,7 +58,6 @@ All Stirling-PDF credentials, configurations, pipelines, and Gemini Web2API sett
 │   ├── storage/       # File storage
 │   └── tessdata/      # Custom Tesseract OCR language models (.traineddata)
 └── gemini/
-    ├── config.json    # Gemini Web2API configuration & custom API keys
     └── cookies.json   # Saved session cookies (optional)
 ```
 
