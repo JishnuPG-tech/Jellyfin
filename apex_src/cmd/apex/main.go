@@ -124,7 +124,9 @@ func main() {
 				} else {
 					if !hasMovies || !hasShows {
 						log.Printf("[Jellyfin Health] Provisioning missing libraries (Movies: %t, Shows: %t)...", hasMovies, hasShows)
-						jfClient.EnsureDefaultLibraries()
+						if err := jfClient.EnsureDefaultLibraries(); err != nil {
+							log.Printf("[Jellyfin Health] Library repair failed: %v", err)
+						}
 					}
 				}
 			}
@@ -210,7 +212,7 @@ func main() {
 		}
 
 		key := strings.TrimSpace(payload.APIKey)
-		testClient := jellyfin.NewClient(cfg.JellyfinURL, key)
+		testClient := jellyfin.NewClient(cfg.JellyfinURL, key, cfg.JellyfinMedia)
 		checkCtx, checkCancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer checkCancel()
 
