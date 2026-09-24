@@ -68,14 +68,16 @@ RUN mkdir -p /data/Stirling/configs \
              /data/Stirling/tessdata \
              /data/jellyfin/data \
              /data/jellyfin/config \
-             /data/jellyfin/cache \
+             /data/jellyfin/backups \
              /data/jellyfin/log \
              /data/jellyfin/media/Movies \
              /data/jellyfin/media/Shows \
+             /data/jellyfin/.aspnet/DataProtection-Keys \
              /data/apex/backups \
              /data/apex/session \
              /data/apex/metadata-cache \
              /tmp/stirling-pdf \
+             /tmp/jellyfin-cache \
              /tmp/caddy/data \
              /tmp/caddy/config \
              /tmp/apex-db \
@@ -84,6 +86,11 @@ RUN mkdir -p /data/Stirling/configs \
 # Environment Configuration
 ENV PORT="8080" \
     DATA_DIR="/data" \
+    DOTNET_CLI_HOME="/data/jellyfin" \
+    JELLYFIN_DATA_DIR="/data/jellyfin/data" \
+    JELLYFIN_CONFIG_DIR="/data/jellyfin/config" \
+    JELLYFIN_CACHE_DIR="/tmp/jellyfin-cache" \
+    JELLYFIN_LOG_DIR="/data/jellyfin/log" \
     SYSTEM_ROOTURIPATH="/stirling" \
     STIRLING_BASE_PATH="/data/Stirling/" \
     CONFIG_FILE="/data/Stirling/configs/settings.yml" \
