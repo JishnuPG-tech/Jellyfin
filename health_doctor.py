@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import json
+import uuid
 import shutil
 import glob
 import sqlite3
@@ -100,6 +101,139 @@ def _jellyfin_auth_header() -> str:
     return f'MediaBrowser Token="{key}"'
 
 
+def _jellyfin_virtual_folders(auth):
+    """Return (status_code, json) for the library list using the given auth header."""
+    url = "http://127.0.0.1:8096/Library/VirtualFolders"
+    req = urllib.request.Request(url, headers={"Authorization": auth})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+        try:
+            return resp.status, json.loads(raw.decode("utf-8"))
+        except Exception:
+            return resp.status, raw.decode("utf-8", "ignore")
+
+
+def _read_jellyfin_api_keys():
+    """Read every row of Jellyfin's api_keys table (works even when the token is invalid)."""
+    db = "/data/jellyfin/data/data/jellyfin.db"
+    rows = []
+    if not os.path.exists(db):
+        return rows
+    try:
+        with sqlite3.connect(db, timeout=5) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info('api_keys')")
+            columns = [r[1] for r in cur.fetchall()]
+            if not columns:
+                return rows
+            cur.execute("SELECT * FROM 'api_keys'")
+            for row in cur.fetchall():
+                rows.append({c: v for c, v in zip(columns, row)})
+    except Exception as exc:
+        logger.warning(f"[JELLYFIN] Could not read api_keys table: {exc}")
+    return rows
+
+
+def _key_is_active(key_row: dict) -> bool:
+    """Jellyfin stores IsActive as an INTEGER (0/1); treat None as active for new rows."""
+    v = key_row.get("IsActive")
+    tok = str(key_row.get("AccessToken") or "")
+    if not tok:
+        return False
+    if v is None:
+        return True
+    try:
+        return int(v) != 0
+    except Exception:
+        return True
+
+
+def ensure_active_jellyfin_api_key():
+    """Return an auth header backed by a WORKING Jellyfin API key.
+
+    Strategy:
+      1. If APEX_JELLYFIN_API_KEY is set and valid, use it.
+      2. Otherwise scan Jellyfin's api_keys table for an ACTIVE row and verify it.
+      3. As a last resort, try *any* existing row, then insert a fresh active API key
+         directly into the database (no admin login needed).
+    """
+    candidates = []
+
+    env_key = os.environ.get("APEX_JELLYFIN_API_KEY", "").strip().strip('"')
+    if env_key:
+        candidates.append(("env", env_key, True))
+
+    for row in _read_jellyfin_api_keys():
+        tok = str(row.get("AccessToken") or "").strip()
+        if not tok:
+            continue
+        active = _key_is_active(row)
+        candidates.append(("db", tok, active))
+
+    tried = set()
+    for source, tok, _active in candidates:
+        if tok in tried:
+            continue
+        tried.add(tok)
+        auth = f'MediaBrowser Token="{tok}"'
+        try:
+            status, _ = _jellyfin_virtual_folders(auth)
+            if status == 200:
+                logger.info(f"[JELLYFIN] Valid API key found via {source}.")
+                return auth
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                continue  # invalid/expired token
+            logger.warning(f"[JELLYFIN] Key check got HTTP {exc.code} - retrying later.")
+            return ""
+        except Exception as exc:
+            logger.warning(f"[JELLYFIN] Key check error: {exc}")
+            return ""
+
+    auth = _insert_jellyfin_api_key()
+    if auth:
+        logger.info("[JELLYFIN] Created a fresh active API key in the database.")
+    return auth
+
+
+def _insert_jellyfin_api_key():
+    """Insert an ACTIVE API key row directly into Jellyfin's sqlite api_keys table."""
+    db = "/data/jellyfin/data/data/jellyfin.db"
+    if not os.path.exists(db):
+        return ""
+    token = uuid.uuid4().hex
+    try:
+        with sqlite3.connect(db, timeout=10) as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info('api_keys')")
+            columns = [r[1] for r in cur.fetchall()]
+            if not columns:
+                logger.warning("[JELLYFIN] api_keys table missing columns - cannot bootstrap.")
+                return ""
+
+            if "Id" in columns:
+                row_id = uuid.uuid4().hex
+            else:
+                row_id = None
+            payload = {
+                "Id": row_id,
+                "AppName": "ApexOps",
+                "AccessToken": token,
+                "UserId": "00000000000000000000000000000000",
+                "DateCreated": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "IsActive": 1,
+            }
+            cols = [c for c in columns if c in payload]
+            vals = [payload[c] for c in cols]
+            placeholders = ",".join("?" * len(vals))
+            cur.execute(f"INSERT INTO 'api_keys' ({','.join(cols)}) VALUES ({placeholders})", vals)
+            conn.commit()
+        return f'MediaBrowser Token="{token}"'
+    except Exception as exc:
+        logger.warning(f"[JELLYFIN] Could not insert API key: {exc}")
+        return ""
+
+
 def _jellyfin_request(method: str, path: str, auth: str, body=None, timeout: int = 15):
     url = f"http://127.0.0.1:8096{path}"
     headers = {"Content-Type": "application/json"}
@@ -119,12 +253,12 @@ def ensure_jellyfin_libraries():
     """Idempotently create Movies + TV Shows media libraries if they are missing.
 
     Runs on a timer, so it also self-heals after `jellyfin/reset` or a fresh
-    storage volume. Requires APEX_JELLYFIN_API_KEY (admin token) to be set.
+    storage volume. Uses an active API key (env secret or DB-bootstrapped).
     Returns True once all expected libraries exist.
     """
-    auth = _jellyfin_auth_header()
+    auth = ensure_active_jellyfin_api_key()
     if not auth:
-        logger.info("[JELLYFIN] APEX_JELLYFIN_API_KEY not set - skipping library bootstrap.")
+        logger.info("[JELLYFIN] No working API key available - skipping library bootstrap.")
         return False
 
     expected = {

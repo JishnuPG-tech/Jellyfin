@@ -6,6 +6,7 @@ import glob
 import logging
 import asyncio
 import socket
+import urllib.parse
 import aiohttp
 import httpx
 from aiohttp import web
@@ -430,6 +431,39 @@ async def telegram_webhook(request):
 async def webhook_info(request):
     info = await get_telegram_webhook_info()
     return web.json_response(info)
+
+
+@routes.get("/webhook-link")
+async def webhook_link(request):
+    """HTML page with clickable links the user opens in their OWN browser.
+
+    The container itself cannot reach api.telegram.org over HTTP (egress blocked),
+    but the user's browser can. Generate the setWebhook/deleteWebhook URLs server-side
+    (the bot token never leaves the container command output) and let the user click.
+    """
+    qs = urllib.parse.urlencode({
+        "url": f"{PUBLIC_BASE_URL}{WEBHOOK_PATH}",
+        "allowed_updates": '["message","channel_post"]',
+    })
+    set_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?{qs}" if BOT_TOKEN else ""
+    del_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook" if BOT_TOKEN else ""
+    webhook_page = f"""<!DOCTYPE html>
+<html><head><title>Telegram Webhook — One-Click Activation</title></head>
+<body style='font-family:system-ui;background:#0f172a;color:#f8fafc;text-align:center;padding:40px;'>
+<h2>Telegram Bot Webhook Activation</h2>
+<p>Your container cannot reach api.telegram.org directly, so click the button below in YOUR browser to activate the connection.</p>
+<p>Public webhook endpoint: <code>{PUBLIC_BASE_URL}{WEBHOOK_PATH}</code></p>
+<a href='{set_url}' target='_blank'
+   style='display:inline-block;margin:12px;padding:16px 28px;background:#22c55e;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold;'>
+   ✅ Set Webhook (activate connection)
+</a>
+<a href='{del_url}' target='_blank'
+   style='display:inline-block;margin:12px;padding:16px 28px;background:#ef4444;color:#fff;text-decoration:none;border-radius:8px;font-weight:bold;'>
+   🗑️ Delete Webhook (reset)
+</a>
+<p style='margin-top:24px;color:#94a3b8;'>After clicking "Set Webhook" you'll see <code>{{"ok":true}}</code> from Telegram. Then send a video/file to <b>@tgfiledrivebot</b> or post it in the configured channel.</p>
+</body></html>"""
+    return web.Response(text=webhook_page, content_type="text/html")
 
 
 @routes.post("/register-webhook")
