@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,6 +37,7 @@ func (w *Writer) WriteSTRM(relPath, apxID string) (string, error) {
 }
 
 type Client struct {
+	mu         sync.RWMutex
 	baseURL    string
 	apiKey     string
 	httpClient *http.Client
@@ -49,6 +51,18 @@ func NewClient(baseURL, apiKey string) *Client {
 			Timeout: 10 * time.Second,
 		},
 	}
+}
+
+func (c *Client) SetAPIKey(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.apiKey = key
+}
+
+func (c *Client) GetAPIKey() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.apiKey
 }
 
 type VirtualFolder struct {
@@ -71,7 +85,8 @@ func (c *Client) VerifyIntegration(ctx context.Context) (reachable bool, authVal
 	respPublic.Body.Close()
 	reachable = true
 
-	if c.apiKey == "" {
+	apiKey := c.GetAPIKey()
+	if apiKey == "" {
 		return reachable, false, false, false, fmt.Errorf("APEX_JELLYFIN_API_KEY is not set")
 	}
 
@@ -81,8 +96,8 @@ func (c *Client) VerifyIntegration(ctx context.Context) (reachable bool, authVal
 	if err != nil {
 		return reachable, false, false, false, err
 	}
-	reqFolders.Header.Set("X-Emby-Token", c.apiKey)
-	reqFolders.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", c.apiKey))
+	reqFolders.Header.Set("X-Emby-Token", apiKey)
+	reqFolders.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", apiKey))
 
 	respFolders, err := c.httpClient.Do(reqFolders)
 	if err != nil {
@@ -116,7 +131,8 @@ func (c *Client) VerifyIntegration(ctx context.Context) (reachable bool, authVal
 }
 
 func (c *Client) EnsureDefaultLibraries() {
-	if c.apiKey == "" {
+	apiKey := c.GetAPIKey()
+	if apiKey == "" {
 		log.Println("[Jellyfin] Notice: APEX_JELLYFIN_API_KEY is not configured. Library auto-provisioning skipped.")
 		return
 	}
@@ -126,8 +142,8 @@ func (c *Client) EnsureDefaultLibraries() {
 	if err != nil {
 		return
 	}
-	req.Header.Set("X-Emby-Token", c.apiKey)
-	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", c.apiKey))
+	req.Header.Set("X-Emby-Token", apiKey)
+	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", apiKey))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -170,6 +186,11 @@ func (c *Client) EnsureDefaultLibraries() {
 }
 
 func (c *Client) addVirtualFolder(name, collectionType, path string) {
+	apiKey := c.GetAPIKey()
+	if apiKey == "" {
+		return
+	}
+
 	u := fmt.Sprintf("%s/Library/VirtualFolders?name=%s&collectionType=%s&paths=%s&refreshLibrary=true",
 		c.baseURL, url.QueryEscape(name), url.QueryEscape(collectionType), url.QueryEscape(path))
 
@@ -177,8 +198,8 @@ func (c *Client) addVirtualFolder(name, collectionType, path string) {
 	if err != nil {
 		return
 	}
-	req.Header.Set("X-Emby-Token", c.apiKey)
-	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", c.apiKey))
+	req.Header.Set("X-Emby-Token", apiKey)
+	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", apiKey))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -195,7 +216,8 @@ func (c *Client) addVirtualFolder(name, collectionType, path string) {
 }
 
 func (c *Client) RefreshLibrary() error {
-	if c.apiKey == "" {
+	apiKey := c.GetAPIKey()
+	if apiKey == "" {
 		return fmt.Errorf("APEX_JELLYFIN_API_KEY is not configured")
 	}
 
@@ -207,8 +229,8 @@ func (c *Client) RefreshLibrary() error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Emby-Token", c.apiKey)
-	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", c.apiKey))
+	req.Header.Set("X-Emby-Token", apiKey)
+	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", apiKey))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

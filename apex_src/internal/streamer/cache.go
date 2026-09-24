@@ -148,13 +148,17 @@ func (c *LRUCache) Put(key string, data []byte) {
 	diskFilename := fmt.Sprintf("%s.chunk", hex.EncodeToString(h[:16]))
 	diskPath := filepath.Join(c.diskDir, diskFilename)
 
+	// Persist to disk atomically BEFORE acquiring LRU lock to guarantee
+	// the file exists on disk prior to any potential eviction check.
+	writeDiskAtomic(diskPath, data)
+
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if el, ok := c.items[key]; ok {
 		c.evictList.MoveToFront(el)
 		item := el.Value.(*CacheItem)
 		item.data = data
-		c.mu.Unlock()
-		go writeDiskAtomic(diskPath, data)
 		return
 	}
 
@@ -197,10 +201,6 @@ func (c *LRUCache) Put(key string, data []byte) {
 		c.evictList.Remove(oldest)
 		delete(c.items, oldItem.key)
 	}
-	c.mu.Unlock()
-
-	// Persist to disk asynchronously using atomic write
-	go writeDiskAtomic(diskPath, data)
 }
 
 func writeDiskAtomic(finalPath string, data []byte) {

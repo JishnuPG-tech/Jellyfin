@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -48,6 +49,17 @@ func main() {
 	gateway := streamer.NewGateway(database, cache, tgManager)
 
 	// 3. Initialize Metadata & Jellyfin Services
+	apiKeyFile := filepath.Join(filepath.Dir(cfg.SessionFilePath), "jellyfin_api_key.txt")
+	if cfg.JellyfinAPIKey == "" {
+		if data, err := os.ReadFile(apiKeyFile); err == nil {
+			savedKey := strings.TrimSpace(string(data))
+			if savedKey != "" {
+				log.Println("[Apex] Loaded persisted APEX_JELLYFIN_API_KEY from storage.")
+				cfg.JellyfinAPIKey = savedKey
+			}
+		}
+	}
+
 	tmdbClient := metadata.NewClient(cfg.TMDBAPIKey)
 	jfWriter := jellyfin.NewWriter(cfg.JellyfinMedia)
 	jfClient := jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey)
@@ -104,8 +116,8 @@ func main() {
 				if !reachable {
 					log.Printf("[Jellyfin Health] Service at %s not yet responding: %v", cfg.JellyfinURL, err)
 				} else if !authValid {
-					if cfg.JellyfinAPIKey == "" {
-						log.Printf("[Jellyfin Health] Jellyfin is up. APEX_JELLYFIN_API_KEY is not configured yet. Complete wizard and set key.")
+					if jfClient.GetAPIKey() == "" {
+						log.Printf("[Jellyfin Health] Jellyfin is up. APEX_JELLYFIN_API_KEY is not configured yet. Complete wizard and set key via /apex/api-key.")
 					} else {
 						log.Printf("[Jellyfin Health] Warning: APEX_JELLYFIN_API_KEY was rejected by Jellyfin: %v", err)
 					}
@@ -149,7 +161,66 @@ func main() {
 
 	mux.HandleFunc("/apex/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","time":"%s"}`, time.Now().Format(time.RFC3339))
+		checkCtx, checkCancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer checkCancel()
+
+		reachable, authValid, hasMovies, hasShows, _ := jfClient.VerifyIntegration(checkCtx)
+		status := map[string]interface{}{
+			"status": "ok",
+			"time":   time.Now().Format(time.RFC3339),
+			"jellyfin": map[string]interface{}{
+				"reachable":      reachable,
+				"authenticated":  authValid,
+				"movies_library": hasMovies,
+				"shows_library":  hasShows,
+			},
+		}
+		_ = json.NewEncoder(w).Encode(status)
+	})
+
+	// Bootstrap API key endpoint
+	mux.HandleFunc("/apex/api-key", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed. Use POST with JSON: {\"api_key\":\"...\"}", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var payload struct {
+			APIKey string `json:"api_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.APIKey == "" {
+			payload.APIKey = r.URL.Query().Get("key")
+		}
+
+		if strings.TrimSpace(payload.APIKey) == "" {
+			http.Error(w, `{"error":"api_key is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		key := strings.TrimSpace(payload.APIKey)
+		testClient := jellyfin.NewClient(cfg.JellyfinURL, key)
+		checkCtx, checkCancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer checkCancel()
+
+		reachable, authValid, hasMovies, hasShows, err := testClient.VerifyIntegration(checkCtx)
+		if !reachable {
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprintf(w, `{"error":"jellyfin server unreachable: %v"}`, err)
+			return
+		}
+		if !authValid {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprintf(w, `{"error":"API key rejected by Jellyfin: %v"}`, err)
+			return
+		}
+
+		// Save and apply key
+		jfClient.SetAPIKey(key)
+		_ = os.WriteFile(apiKeyFile, []byte(key), 0600)
+		jfClient.EnsureDefaultLibraries()
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"ok","message":"API key verified and saved","movies_library":%t,"shows_library":%t}`, hasMovies, hasShows)
 	})
 
 	server := &http.Server{
@@ -289,6 +360,8 @@ func processIngestionTask(
 	}
 
 	// 6. Build Virtual Filesystem Layout & NFO Metadata
+	var primaryStrmPath string
+
 	if parsed.MediaType == "series" {
 		showDir := filepath.Join(cfg.JellyfinMedia, "Shows", parsed.CleanTitle)
 		seasonDir := filepath.Join(showDir, fmt.Sprintf("Season %02d", parsed.Season))
@@ -300,22 +373,6 @@ func processIngestionTask(
 		endEp := parsed.EndEpisode
 		if endEp < startEp {
 			endEp = startEp
-		}
-
-		var strmRelPath string
-		if endEp > startEp {
-			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s S%02dE%02d-E%02d.strm", parsed.CleanTitle, parsed.Season, startEp, endEp))
-		} else {
-			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s S%02dE%02d.strm", parsed.CleanTitle, parsed.Season, startEp))
-		}
-
-		fullStrmPath, err := jfWriter.WriteSTRM(strmRelPath, opaqueID)
-		if err != nil {
-			log.Printf("[Worker #%d] Error writing .strm: %v", workerID, err)
-			job.Status = "failed"
-			job.Error = err.Error()
-			_ = database.SaveJob(job)
-			return
 		}
 
 		// Show NFO & Artwork
@@ -360,8 +417,19 @@ func processIngestionTask(
 			log.Printf("[Worker #%d] Error saving season: %v", workerID, err)
 		}
 
-		// Process each episode in the range (multi-episode or single)
+		// Write individual .strm and NFO for each episode in the range.
+		// In Jellyfin, discrete .strm files allow independent episode display, metadata, and watch progress.
 		for epNum := startEp; epNum <= endEp; epNum++ {
+			epStrmRelPath := filepath.Join(relDir, fmt.Sprintf("%s S%02dE%02d.strm", parsed.CleanTitle, parsed.Season, epNum))
+			epStrmPath, err := jfWriter.WriteSTRM(epStrmRelPath, opaqueID)
+			if err != nil {
+				log.Printf("[Worker #%d] Error writing .strm for ep %d: %v", workerID, epNum, err)
+				continue
+			}
+			if primaryStrmPath == "" {
+				primaryStrmPath = epStrmPath
+			}
+
 			epTitle := fmt.Sprintf("Episode %d", epNum)
 			epPlot := plot
 			epRating := rating
@@ -405,7 +473,7 @@ func processIngestionTask(
 				AirDate:       epAirDate,
 				Rating:        epRating,
 				StillPath:     epStillPath,
-				StrmPath:      fullStrmPath,
+				StrmPath:      epStrmPath,
 			}
 			if err := database.SaveEpisode(epObj); err != nil {
 				log.Printf("[Worker #%d] Error saving episode %d: %v", workerID, epNum, err)
@@ -433,6 +501,7 @@ func processIngestionTask(
 			_ = database.SaveJob(job)
 			return
 		}
+		primaryStrmPath = fullStrmPath
 
 		// Movie NFO & Artwork
 		nfoPath := filepath.Join(movieDir, "movie.nfo")
@@ -462,8 +531,7 @@ func processIngestionTask(
 		}
 	}
 
-	// 7. Persist MediaItem lookup index
-	strmPath := filepath.Join(cfg.JellyfinMedia, "Movies", fmt.Sprintf("%s.strm", parsed.CleanTitle))
+	// 7. Persist MediaItem lookup index with actual verified primary .strm path
 	item := &db.MediaItem{
 		ID:           opaqueID,
 		SourceChatID: task.ChatID,
@@ -480,7 +548,7 @@ func processIngestionTask(
 		Season:       parsed.Season,
 		Episode:      parsed.Episode,
 		TMDBID:       tmdbID,
-		StrmPath:     strmPath,
+		StrmPath:     primaryStrmPath,
 	}
 	_ = database.SaveMediaItem(item)
 
@@ -498,7 +566,8 @@ func processIngestionTask(
 	job.Status = "completed"
 	_ = database.SaveJob(job)
 
-	log.Printf("[Worker #%d] Successfully cataloged: %s (ID: %s)", workerID, parsed.CleanTitle, opaqueID)
+	log.Printf("[Worker #%d] Successfully cataloged: %s (ID: %s, STRM: %s)",
+		workerID, parsed.CleanTitle, opaqueID, primaryStrmPath)
 
 	// 10. Enqueue debounced Jellyfin refresh
 	select {
