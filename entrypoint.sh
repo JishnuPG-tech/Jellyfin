@@ -28,7 +28,7 @@ restore_jellyfin_local() {
     # Restore durable data/config snapshot from the persistent volume if present.
     if [ -f "/data/jellyfin/data/data/jellyfin.db" ]; then
         echo "[JELLYFIN] Restoring database + metadata from persistent volume..."
-        cp -a -f /data/jellyfin/data/. "$LOCAL_ROOT/data/"
+        cp -a -f /data/jellyfin/data/. "$LOCAL_ROOT/data/" 2>/dev/null || true
     fi
     if [ -d "/data/jellyfin/config" ]; then
         cp -a -f /data/jellyfin/config/. "$LOCAL_ROOT/config/" 2>/dev/null || true
