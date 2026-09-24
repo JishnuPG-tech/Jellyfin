@@ -86,7 +86,17 @@ func (c *Client) getCache(key string) ([]byte, bool) {
 	if c.cacheDir == "" {
 		return nil, false
 	}
-	data, err := os.ReadFile(filepath.Join(c.cacheDir, key+".json"))
+	cacheFile := filepath.Join(c.cacheDir, key+".json")
+	fi, err := os.Stat(cacheFile)
+	if err != nil {
+		return nil, false
+	}
+	// Expire disk cache older than 7 days
+	if time.Since(fi.ModTime()) > 7*24*time.Hour {
+		_ = os.Remove(cacheFile)
+		return nil, false
+	}
+	data, err := os.ReadFile(cacheFile)
 	if err == nil {
 		c.mu.Lock()
 		c.memCache[key] = data
@@ -101,7 +111,12 @@ func (c *Client) setCache(key string, data []byte) {
 	c.memCache[key] = data
 	c.mu.Unlock()
 	if c.cacheDir != "" {
-		_ = os.WriteFile(filepath.Join(c.cacheDir, key+".json"), data, 0644)
+		_ = os.MkdirAll(c.cacheDir, 0755)
+		dest := filepath.Join(c.cacheDir, key+".json")
+		tmp := fmt.Sprintf("%s.tmp.%d", dest, time.Now().UnixNano())
+		if err := os.WriteFile(tmp, data, 0644); err == nil {
+			_ = os.Rename(tmp, dest)
+		}
 	}
 }
 
@@ -477,13 +492,25 @@ func (c *Client) DownloadImage(imagePath, targetFile string) error {
 		return err
 	}
 
-	out, err := os.Create(targetFile)
+	tmpFile := fmt.Sprintf("%s.tmp.%d", targetFile, time.Now().UnixNano())
+	out, err := os.OpenFile(tmpFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
-	if _, err = io.Copy(out, resp.Body); err != nil {
+	_, copyErr := io.Copy(out, resp.Body)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmpFile)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpFile)
+		return closeErr
+	}
+
+	if err := os.Rename(tmpFile, targetFile); err != nil {
+		_ = os.Remove(tmpFile)
 		return err
 	}
 
@@ -504,14 +531,28 @@ func copyFile(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
-	out, err := os.Create(dst)
+	tmpDst := fmt.Sprintf("%s.tmp.%d", dst, time.Now().UnixNano())
+	out, err := os.OpenFile(tmpDst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
-	_, err = io.Copy(out, in)
-	return err
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmpDst)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpDst)
+		return closeErr
+	}
+
+	if err := os.Rename(tmpDst, dst); err != nil {
+		_ = os.Remove(tmpDst)
+		return err
+	}
+	return nil
 }
 
 // XML-escaped NFO Data Structures
@@ -672,13 +713,29 @@ func GenerateRichShowNFO(title, plot string, year int, rating float64, tmdbID in
 	return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" + string(data)
 }
 
-func GenerateEpisodeNFO(title string, season, episode int, plot, airDate string, rating float64, tmdbID int) string {
+func GenerateEpisodeNFO(title string, season, episode int, plot, airDate string, rating float64, tmdbEpisodeID int) string {
+	return GenerateRichEpisodeNFO(title, season, episode, plot, airDate, rating, tmdbEpisodeID, 0, "")
+}
+
+func GenerateRichEpisodeNFO(title string, season, episode int, plot, airDate string, rating float64, tmdbEpisodeID int, seriesTMDBID int, imdbID string) string {
 	uids := []UniqueID{}
-	if tmdbID > 0 {
+	if tmdbEpisodeID > 0 {
 		uids = append(uids, UniqueID{
 			Type:    "tmdb",
 			Default: "true",
-			Value:   strconv.Itoa(tmdbID),
+			Value:   strconv.Itoa(tmdbEpisodeID),
+		})
+	}
+	if seriesTMDBID > 0 {
+		uids = append(uids, UniqueID{
+			Type:  "tmdb_series",
+			Value: strconv.Itoa(seriesTMDBID),
+		})
+	}
+	if imdbID != "" {
+		uids = append(uids, UniqueID{
+			Type:  "imdb",
+			Value: imdbID,
 		})
 	}
 	nfo := EpisodeDetailsNFO{
@@ -689,6 +746,8 @@ func GenerateEpisodeNFO(title string, season, episode int, plot, airDate string,
 		Aired:    airDate,
 		Rating:   rating,
 		UniqueID: uids,
+		IMDbID:   imdbID,
+		ID:       imdbID,
 	}
 	data, err := xml.MarshalIndent(nfo, "", "    ")
 	if err != nil {

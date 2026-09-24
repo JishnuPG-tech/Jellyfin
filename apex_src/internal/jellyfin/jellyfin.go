@@ -36,6 +36,62 @@ func (w *Writer) WriteSTRM(relPath, apxID string) (string, error) {
 	return fullPath, nil
 }
 
+// ClaimAndWriteSTRM atomically creates a new STRM file using O_CREATE|O_EXCL.
+// If the target file already exists, it returns os.ErrExist to allow race-free collision handling.
+func (w *Writer) ClaimAndWriteSTRM(relPath, apxID string) (string, error) {
+	fullPath := filepath.Join(w.baseDir, relPath)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return "", err
+	}
+
+	f, err := os.OpenFile(fullPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	streamURL := fmt.Sprintf("http://127.0.0.1:8084/stream/%s", apxID)
+	if _, err := f.WriteString(streamURL); err != nil {
+		return "", err
+	}
+	return fullPath, nil
+}
+
+// WriteVersionedSTRM atomically claims a unique STRM filename in relDir following Jellyfin conventions:
+// 1. Primary: "<base>.strm"
+// 2. Secondary: "<base> - <edition>.strm"
+// 3. Collision: "<base> - <edition> [<opaqueID>].strm"
+func (w *Writer) WriteVersionedSTRM(relDir, baseTitle, edition, opaqueID string) (fileName string, fullPath string, err error) {
+	tag := strings.TrimSpace(edition)
+	if tag == "" {
+		tag = opaqueID
+	}
+
+	candidates := []string{
+		baseTitle + ".strm",
+		fmt.Sprintf("%s - %s.strm", baseTitle, tag),
+		fmt.Sprintf("%s - %s [%s].strm", baseTitle, tag, opaqueID),
+	}
+
+	for _, name := range candidates {
+		relPath := filepath.Join(relDir, name)
+		fp, err := w.ClaimAndWriteSTRM(relPath, opaqueID)
+		if err == nil {
+			return name, fp, nil
+		}
+		if os.IsExist(err) {
+			continue
+		}
+		return "", "", err
+	}
+
+	// Microsecond fallback to guarantee collision immunity under extreme worker concurrency
+	fallback := fmt.Sprintf("%s - %s [%s_%d].strm", baseTitle, tag, opaqueID, time.Now().UnixNano()%100000)
+	relPath := filepath.Join(relDir, fallback)
+	fp, err := w.ClaimAndWriteSTRM(relPath, opaqueID)
+	return fallback, fp, err
+}
+
 type Client struct {
 	mu         sync.RWMutex
 	baseURL    string

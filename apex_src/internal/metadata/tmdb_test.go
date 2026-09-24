@@ -44,6 +44,31 @@ func TestNFOEscaping(t *testing.T) {
 	if parsedEp.Season != 2 || parsedEp.Episode != 5 {
 		t.Errorf("Parsed S/E = %d/%d, want 2/5", parsedEp.Season, parsedEp.Episode)
 	}
+	if len(parsedEp.UniqueID) == 0 || parsedEp.UniqueID[0].Value != "54321" {
+		t.Errorf("Parsed UniqueID TMDB = %+v, want 54321", parsedEp.UniqueID)
+	}
+
+	richEpXML := GenerateRichEpisodeNFO("Rich Ep", 1, 1, "Plot", "2021-01-01", 9.0, 1001, 2002, "tt9999999")
+	var parsedRichEp EpisodeDetailsNFO
+	if err := xml.Unmarshal([]byte(richEpXML), &parsedRichEp); err != nil {
+		t.Fatalf("Failed to parse rich episode NFO: %v", err)
+	}
+	if parsedRichEp.IMDbID != "tt9999999" {
+		t.Errorf("Parsed IMDbID = %q, want 'tt9999999'", parsedRichEp.IMDbID)
+	}
+	hasEpTMDB := false
+	hasSeriesTMDB := false
+	for _, uid := range parsedRichEp.UniqueID {
+		if uid.Type == "tmdb" && uid.Value == "1001" {
+			hasEpTMDB = true
+		}
+		if uid.Type == "tmdb_series" && uid.Value == "2002" {
+			hasSeriesTMDB = true
+		}
+	}
+	if !hasEpTMDB || !hasSeriesTMDB {
+		t.Errorf("Missing expected unique IDs in rich episode NFO: %+v", parsedRichEp.UniqueID)
+	}
 
 	// 3. Rich Movie NFO (Genres, Cast, Tagline, IMDb ID)
 	richDetails := &DetailedMetadata{

@@ -262,29 +262,6 @@ func main() {
 	log.Println("[Apex] Shutdown complete.")
 }
 
-// generateVersionedStrmFileName generates a collision-free STRM file name
-// following Jellyfin multi-version convention:
-// 1. Primary: "<base>.strm"
-// 2. Secondary: "<base> - <edition>.strm"
-// 3. Collision: "<base> - <edition> [<opaqueID>].strm"
-func generateVersionedStrmFileName(targetDir, baseTitle, edition, opaqueID string) string {
-	primary := baseTitle + ".strm"
-	if _, err := os.Stat(filepath.Join(targetDir, primary)); os.IsNotExist(err) {
-		return primary
-	}
-
-	tag := strings.TrimSpace(edition)
-	if tag == "" {
-		tag = opaqueID
-	}
-	secondary := fmt.Sprintf("%s - %s.strm", baseTitle, tag)
-	if _, err := os.Stat(filepath.Join(targetDir, secondary)); os.IsNotExist(err) {
-		return secondary
-	}
-
-	return fmt.Sprintf("%s - %s [%s].strm", baseTitle, tag, opaqueID)
-}
-
 func processIngestionTask(
 	ctx context.Context,
 	workerID int,
@@ -480,9 +457,7 @@ func processIngestionTask(
 		if endEp > startEp {
 			// Multi-episode file: Jellyfin native multi-episode convention "Show S01E01-E03.strm"
 			baseTitle := fmt.Sprintf("%s S%02dE%02d-E%02d", parsed.CleanTitle, parsed.Season, startEp, endEp)
-			strmFileName := generateVersionedStrmFileName(seasonDir, baseTitle, parsed.Resolution, opaqueID)
-			epStrmRelPath := filepath.Join(relDir, strmFileName)
-			epStrmPath, err := jfWriter.WriteSTRM(epStrmRelPath, opaqueID)
+			strmFileName, epStrmPath, err := jfWriter.WriteVersionedSTRM(relDir, baseTitle, parsed.Resolution, opaqueID)
 			if err != nil {
 				log.Printf("[Worker #%d] Error writing multi-ep .strm: %v", workerID, err)
 				job.Status = "failed"
@@ -499,9 +474,13 @@ func processIngestionTask(
 				epRating := rating
 				epStillPath := ""
 				epAirDate := ""
+				epTMDBID := 0
 
 				if tmdbID > 0 {
 					if epMeta, err := tmdbClient.GetEpisodeDetails(tmdbID, parsed.Season, epNum); err == nil && epMeta != nil {
+						if epMeta.ID > 0 {
+							epTMDBID = epMeta.ID
+						}
 						if epMeta.Name != "" {
 							epTitle = epMeta.Name
 						}
@@ -516,16 +495,22 @@ func processIngestionTask(
 					}
 				}
 
+				epUIDs := []metadata.UniqueID{}
+				if epTMDBID > 0 {
+					epUIDs = append(epUIDs, metadata.UniqueID{Type: "tmdb", Default: "true", Value: strconv.Itoa(epTMDBID)})
+				}
+				if tmdbID > 0 {
+					epUIDs = append(epUIDs, metadata.UniqueID{Type: "tmdb_series", Value: strconv.Itoa(tmdbID)})
+				}
+
 				epNFOs = append(epNFOs, metadata.EpisodeDetailsNFO{
-					Title:   epTitle,
-					Season:  parsed.Season,
-					Episode: epNum,
-					Plot:    epPlot,
-					Aired:   epAirDate,
-					Rating:  epRating,
-					UniqueID: []metadata.UniqueID{
-						{Type: "tmdb", Default: "true", Value: strconv.Itoa(tmdbID)},
-					},
+					Title:    epTitle,
+					Season:   parsed.Season,
+					Episode:  epNum,
+					Plot:     epPlot,
+					Aired:    epAirDate,
+					Rating:   epRating,
+					UniqueID: epUIDs,
 				})
 
 				if epStillPath != "" {
@@ -539,6 +524,7 @@ func processIngestionTask(
 					SeasonID:      seasonObj.ID,
 					SeasonNumber:  parsed.Season,
 					EpisodeNumber: epNum,
+					TMDBEpisodeID: epTMDBID,
 					Title:         epTitle,
 					Overview:      epPlot,
 					AirDate:       epAirDate,
@@ -549,6 +535,20 @@ func processIngestionTask(
 				if err := database.SaveEpisode(epObj); err != nil {
 					log.Printf("[Worker #%d] Warning: failed to save episode %s: %v", workerID, epObj.ID, err)
 				}
+
+				// Record media version
+				isDefault := (strmFileName == baseTitle+".strm")
+				ver := &db.MediaVersion{
+					ID:          fmt.Sprintf("ver_%s_%d", opaqueID, epNum),
+					MediaItemID: opaqueID,
+					MediaType:   "episode",
+					ParentID:    epObj.ID,
+					Edition:     parsed.Resolution,
+					FileSize:    doc.Size,
+					StrmPath:    epStrmPath,
+					IsDefault:   isDefault,
+				}
+				_ = database.SaveMediaVersion(ver)
 			}
 
 			// Write multi-episode NFO matching the STRM file
@@ -563,10 +563,7 @@ func processIngestionTask(
 		} else {
 			// Single episode
 			baseTitle := fmt.Sprintf("%s S%02dE%02d", parsed.CleanTitle, parsed.Season, startEp)
-			strmFileName := generateVersionedStrmFileName(seasonDir, baseTitle, parsed.Resolution, opaqueID)
-
-			epStrmRelPath := filepath.Join(relDir, strmFileName)
-			epStrmPath, err := jfWriter.WriteSTRM(epStrmRelPath, opaqueID)
+			strmFileName, epStrmPath, err := jfWriter.WriteVersionedSTRM(relDir, baseTitle, parsed.Resolution, opaqueID)
 			if err != nil {
 				log.Printf("[Worker #%d] Error writing episode .strm: %v", workerID, err)
 				job.Status = "failed"
@@ -581,9 +578,13 @@ func processIngestionTask(
 			epRating := rating
 			epStillPath := ""
 			epAirDate := ""
+			epTMDBID := 0
 
 			if tmdbID > 0 {
 				if epMeta, err := tmdbClient.GetEpisodeDetails(tmdbID, parsed.Season, startEp); err == nil && epMeta != nil {
+					if epMeta.ID > 0 {
+						epTMDBID = epMeta.ID
+					}
 					if epMeta.Name != "" {
 						epTitle = epMeta.Name
 					}
@@ -600,7 +601,7 @@ func processIngestionTask(
 
 			epNfoPath := filepath.Join(seasonDir, fmt.Sprintf("%s.nfo", strings.TrimSuffix(strmFileName, ".strm")))
 			if _, err := os.Stat(epNfoPath); os.IsNotExist(err) {
-				epNfoContent := metadata.GenerateEpisodeNFO(epTitle, parsed.Season, startEp, epPlot, epAirDate, epRating, tmdbID)
+				epNfoContent := metadata.GenerateRichEpisodeNFO(epTitle, parsed.Season, startEp, epPlot, epAirDate, epRating, epTMDBID, tmdbID, "")
 				if err := os.WriteFile(epNfoPath, []byte(epNfoContent), 0644); err != nil {
 					log.Printf("[Worker #%d] Warning: failed to write episode NFO: %v", workerID, err)
 				}
@@ -618,6 +619,7 @@ func processIngestionTask(
 				SeasonID:      seasonObj.ID,
 				SeasonNumber:  parsed.Season,
 				EpisodeNumber: startEp,
+				TMDBEpisodeID: epTMDBID,
 				Title:         epTitle,
 				Overview:      epPlot,
 				AirDate:       epAirDate,
@@ -628,6 +630,20 @@ func processIngestionTask(
 			if err := database.SaveEpisode(epObj); err != nil {
 				log.Printf("[Worker #%d] Warning: failed to save episode %s: %v", workerID, epObj.ID, err)
 			}
+
+			// Record media version
+			isDefault := (strmFileName == baseTitle+".strm")
+			ver := &db.MediaVersion{
+				ID:          fmt.Sprintf("ver_%s", opaqueID),
+				MediaItemID: opaqueID,
+				MediaType:   "episode",
+				ParentID:    epObj.ID,
+				Edition:     parsed.Resolution,
+				FileSize:    doc.Size,
+				StrmPath:    epStrmPath,
+				IsDefault:   isDefault,
+			}
+			_ = database.SaveMediaVersion(ver)
 		}
 	} else {
 		// Movie
@@ -639,10 +655,7 @@ func processIngestionTask(
 		movieDir := filepath.Join(cfg.JellyfinMedia, relDir)
 		_ = os.MkdirAll(movieDir, 0755)
 
-		strmFileName := generateVersionedStrmFileName(movieDir, baseName, parsed.Resolution, opaqueID)
-
-		strmRelPath := filepath.Join(relDir, strmFileName)
-		fullStrmPath, err := jfWriter.WriteSTRM(strmRelPath, opaqueID)
+		strmFileName, fullStrmPath, err := jfWriter.WriteVersionedSTRM(relDir, baseName, parsed.Resolution, opaqueID)
 		if err != nil {
 			log.Printf("[Worker #%d] Error writing .strm: %v", workerID, err)
 			job.Status = "failed"
@@ -688,6 +701,20 @@ func processIngestionTask(
 		if err := database.SaveMovie(movieObj); err != nil {
 			log.Printf("[Worker #%d] Warning: failed to save movie %s: %v", workerID, movieObj.ID, err)
 		}
+
+		// Record media version
+		isDefault := (strmFileName == baseName+".strm")
+		ver := &db.MediaVersion{
+			ID:          fmt.Sprintf("ver_%s", opaqueID),
+			MediaItemID: opaqueID,
+			MediaType:   "movie",
+			ParentID:    movieObj.ID,
+			Edition:     parsed.Resolution,
+			FileSize:    doc.Size,
+			StrmPath:    fullStrmPath,
+			IsDefault:   isDefault,
+		}
+		_ = database.SaveMediaVersion(ver)
 	}
 
 	// 8. Persist MediaItem lookup index with actual verified primary .strm path

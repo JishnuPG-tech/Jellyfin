@@ -67,6 +67,7 @@ type Episode struct {
 	SeasonID      string
 	SeasonNumber  int
 	EpisodeNumber int
+	TMDBEpisodeID int
 	Title         string
 	Overview      string
 	AirDate       string
@@ -74,6 +75,18 @@ type Episode struct {
 	StillPath     string
 	StrmPath      string
 	CreatedAt     time.Time
+}
+
+type MediaVersion struct {
+	ID          string    `json:"id"`
+	MediaItemID string    `json:"media_item_id"`
+	MediaType   string    `json:"media_type"` // "movie" or "episode"
+	ParentID    string    `json:"parent_id"`  // Movie.ID or Episode.ID
+	Edition     string    `json:"edition"`    // e.g. "1080p", "720p", "Extended"
+	FileSize    int64     `json:"file_size"`
+	StrmPath    string    `json:"strm_path"`
+	IsDefault   bool      `json:"is_default"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type MediaItem struct {
@@ -271,9 +284,30 @@ func (d *Database) migrate() error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
+
+	CREATE TABLE IF NOT EXISTS media_versions (
+		id TEXT PRIMARY KEY,
+		media_item_id TEXT NOT NULL,
+		media_type TEXT NOT NULL,
+		parent_id TEXT NOT NULL,
+		edition TEXT,
+		file_size INTEGER,
+		strm_path TEXT NOT NULL,
+		is_default BOOLEAN DEFAULT 1,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (media_item_id) REFERENCES media_items(id) ON DELETE CASCADE
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_media_versions_parent ON media_versions(parent_id);
+	CREATE INDEX IF NOT EXISTS idx_media_versions_item ON media_versions(media_item_id);
 	`
-	_, err := d.conn.Exec(query)
-	return err
+	if _, err := d.conn.Exec(query); err != nil {
+		return err
+	}
+
+	// Dynamic safe migration for existing installations
+	_, _ = d.conn.Exec("ALTER TABLE episodes ADD COLUMN tmdb_episode_id INTEGER DEFAULT 0;")
+	return nil
 }
 
 func (d *Database) SaveMovie(m *Movie) error {
@@ -321,17 +355,38 @@ func (d *Database) SaveSeason(s *Season) error {
 
 func (d *Database) SaveEpisode(ep *Episode) error {
 	query := `
-	INSERT INTO episodes (id, series_id, season_id, season_number, episode_number, title, overview, air_date, rating, still_path, strm_path)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	INSERT INTO episodes (id, series_id, season_id, season_number, episode_number, tmdb_episode_id, title, overview, air_date, rating, still_path, strm_path)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(series_id, season_number, episode_number) DO UPDATE SET
+		tmdb_episode_id=excluded.tmdb_episode_id,
 		title=excluded.title,
 		overview=excluded.overview,
 		rating=excluded.rating,
 		still_path=excluded.still_path,
 		strm_path=excluded.strm_path;
 	`
-	_, err := d.conn.Exec(query, ep.ID, ep.SeriesID, ep.SeasonID, ep.SeasonNumber, ep.EpisodeNumber, ep.Title, ep.Overview, ep.AirDate, ep.Rating, ep.StillPath, ep.StrmPath)
+	_, err := d.conn.Exec(query, ep.ID, ep.SeriesID, ep.SeasonID, ep.SeasonNumber, ep.EpisodeNumber, ep.TMDBEpisodeID, ep.Title, ep.Overview, ep.AirDate, ep.Rating, ep.StillPath, ep.StrmPath)
 	return err
+}
+
+func (d *Database) GetEpisode(seriesID string, season, epNum int) (*Episode, error) {
+	query := `
+	SELECT id, series_id, season_id, season_number, episode_number, tmdb_episode_id,
+	       title, overview, air_date, rating, still_path, strm_path, created_at
+	FROM episodes
+	WHERE series_id = ? AND season_number = ? AND episode_number = ?
+	LIMIT 1
+	`
+	row := d.conn.QueryRow(query, seriesID, season, epNum)
+	var ep Episode
+	err := row.Scan(
+		&ep.ID, &ep.SeriesID, &ep.SeasonID, &ep.SeasonNumber, &ep.EpisodeNumber, &ep.TMDBEpisodeID,
+		&ep.Title, &ep.Overview, &ep.AirDate, &ep.Rating, &ep.StillPath, &ep.StrmPath, &ep.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &ep, nil
 }
 
 func (d *Database) SaveMediaItem(item *MediaItem) error {
@@ -403,6 +458,76 @@ func (d *Database) UpdateFileReference(id string, newRef []byte, accessHash int6
 	_, err := d.conn.Exec(query, newRef, accessHash, id)
 	return err
 }
+
+func (d *Database) GetMediaItemByChatAndFileID(chatID int64, fileID string) (*MediaItem, error) {
+	query := `
+	SELECT id, source_chat_id, message_id, file_id, file_unique_id, file_reference,
+		   access_hash, file_size, mime_type, clean_title, media_type, year, season,
+		   episode, tmdb_id, strm_path, created_at
+	FROM media_items WHERE source_chat_id = ? AND file_id = ? LIMIT 1
+	`
+	row := d.conn.QueryRow(query, chatID, fileID)
+
+	var item MediaItem
+	err := row.Scan(
+		&item.ID, &item.SourceChatID, &item.MessageID, &item.FileID, &item.FileUniqueID,
+		&item.FileRef, &item.AccessHash, &item.FileSize, &item.MimeType, &item.CleanTitle,
+		&item.MediaType, &item.Year, &item.Season, &item.Episode, &item.TMDBID,
+		&item.StrmPath, &item.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (d *Database) SaveMediaVersion(v *MediaVersion) error {
+	query := `
+	INSERT INTO media_versions (
+		id, media_item_id, media_type, parent_id, edition,
+		file_size, strm_path, is_default, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(id) DO UPDATE SET
+		edition=excluded.edition,
+		file_size=excluded.file_size,
+		strm_path=excluded.strm_path,
+		is_default=excluded.is_default;
+	`
+	_, err := d.conn.Exec(query,
+		v.ID, v.MediaItemID, v.MediaType, v.ParentID, v.Edition,
+		v.FileSize, v.StrmPath, v.IsDefault,
+	)
+	return err
+}
+
+func (d *Database) GetMediaVersionsByParentID(parentID string) ([]MediaVersion, error) {
+	query := `
+	SELECT id, media_item_id, media_type, parent_id, edition,
+	       file_size, strm_path, is_default, created_at
+	FROM media_versions
+	WHERE parent_id = ?
+	ORDER BY is_default DESC, created_at ASC
+	`
+	rows, err := d.conn.Query(query, parentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var versions []MediaVersion
+	for rows.Next() {
+		var v MediaVersion
+		if err := rows.Scan(
+			&v.ID, &v.MediaItemID, &v.MediaType, &v.ParentID, &v.Edition,
+			&v.FileSize, &v.StrmPath, &v.IsDefault, &v.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		versions = append(versions, v)
+	}
+	return versions, rows.Err()
+}
+
 
 func (d *Database) SaveCapabilities(cap *MediaCapability) error {
 	query := `
