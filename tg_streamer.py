@@ -38,6 +38,10 @@ BOT_TOKEN = get_env("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN")
 RAW_CHANNEL_ID = get_env("TELEGRAM_ALLOWED_CHAT_IDS", "TG_CHANNEL_ID", default="")
 TMDB_API_KEY = get_env("TMDB_API_KEY")
 
+# Public URL Telegram must deliver bot updates to (through the Apex gateway).
+PUBLIC_BASE_URL = get_env("PUBLIC_BASE_URL", "PUBLIC_URL", default="https://jishnupg-apex.hf.space")
+WEBHOOK_PATH = "/tg-stream/telegram-webhook"
+
 DATA_DIR = "/data/jellyfin"
 MOVIES_DIR = os.path.join(DATA_DIR, "media/Movies")
 SHOWS_DIR = os.path.join(DATA_DIR, "media/TV Shows")
@@ -89,6 +93,10 @@ def index_media(msg_id, chat_id, file_id, file_size, file_name):
     """Core ingestion: cache the file and create a .strm for Jellyfin."""
     if not file_id or not msg_id:
         return False
+
+    cached = FILE_ID_CACHE.get(str(msg_id))
+    if isinstance(cached, dict) and cached.get("file_id") == file_id:
+        return cached.get("title") or True
 
     is_tv, title, show_name, season, episode = parse_media_type(file_name)
 
@@ -301,6 +309,50 @@ async def trigger_jellyfin_scan():
 
 WEBHOOK_SECRET = get_env("APEX_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET")
 
+async def telegram_api_call(method: str, **params):
+    """Call the Telegram Bot API synchronously via aiohttp."""
+    if not BOT_TOKEN:
+        return None
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=params, timeout=15) as resp:
+            try:
+                return await resp.json()
+            except Exception:
+                return {"ok": False, "description": f"HTTP {resp.status}"}
+
+
+async def register_telegram_webhook():
+    """Register the streamer URL as this bot's webhook so Telegram delivers updates here.
+
+    Telegram delivers bot updates ONLY to a registered webhook or via getUpdates
+    (long-polling). Pyrogram MTProto also needs the webhook absent/consistent, so we
+    explicitly set the webhook to our public /tg-stream/telegram-webhook endpoint.
+    """
+    webhook_url = f"{PUBLIC_BASE_URL}{WEBHOOK_PATH}"
+    params = {"url": webhook_url}
+    if WEBHOOK_SECRET:
+        params["secret_token"] = WEBHOOK_SECRET
+    params["allowed_updates"] = ["message", "channel_post"]
+    try:
+        result = await telegram_api_call("setWebhook", **params)
+        ok = bool(result and result.get("ok"))
+        desc = (result or {}).get("description", "no response")
+        logger.info(f"[WEBHOOK] setWebhook -> {webhook_url} ok={ok} {desc}")
+        return ok, webhook_url, desc
+    except Exception as e:
+        logger.error(f"[WEBHOOK] setWebhook failed: {e}")
+        return False, webhook_url, str(e)
+
+
+async def get_telegram_webhook_info():
+    """Return current webhook registration state for this bot."""
+    try:
+        result = await telegram_api_call("getWebhookInfo")
+        return result or {"ok": False, "description": "no response"}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
 @routes.post("/")
 @routes.post("/telegram-webhook")
 @routes.post("/webhook")
@@ -331,6 +383,9 @@ async def telegram_webhook(request):
         is_tv, title, show_name, season, episode = parse_media_type(file_name)
 
         if file_id and msg_id:
+            if FILE_ID_CACHE.get(str(msg_id)):
+                return web.json_response({"ok": True, "dedup": True})
+
             FILE_ID_CACHE[str(msg_id)] = {
                 "file_id": file_id,
                 "chat_id": chat_id,
@@ -351,6 +406,19 @@ async def telegram_webhook(request):
     except Exception as e:
         logger.error(f"[WEBHOOK] Error processing webhook payload: {e}")
         return web.json_response({"ok": True})
+
+@routes.get("/webhook-info")
+async def webhook_info(request):
+    info = await get_telegram_webhook_info()
+    return web.json_response(info)
+
+
+@routes.post("/register-webhook")
+@routes.get("/register-webhook")
+async def register_webhook_route(request):
+    ok, url, desc = await register_telegram_webhook()
+    return web.json_response({"ok": ok, "url": url, "description": desc, "purpose": "activate bot connection"})
+
 
 @routes.get("/stream_file")
 @routes.get("/stream/{message_id}")
@@ -499,6 +567,8 @@ async def start_pyrogram():
     await tg_app.start()
     me = await tg_app.get_me()
     logger.info(f"[PYROGRAM] Pyrogram Client started successfully! Bot: @{getattr(me, 'username', '?')} (id={getattr(me, 'id', '?')})")
+
+    await register_telegram_webhook()
 
 async def stop_pyrogram():
     if tg_app and tg_app.is_connected:
