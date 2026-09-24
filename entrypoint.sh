@@ -184,6 +184,7 @@ fi
 
 # ── 7. Start Caddy Gateway on Port 7860 ───────────────────────────────────────
 echo "[Apex] Starting Caddy Gateway on Port 7860..."
+caddy fmt --overwrite /etc/caddy/Caddyfile 2>/dev/null || true
 caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
 CADDY_PID=$!
 
