@@ -185,14 +185,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if downloadName == "" || downloadName == "." || !strings.Contains(downloadName, ".") {
 		downloadName = "video.mp4"
 	}
-	downloadName = strings.ReplaceAll(downloadName, """, "")
+	downloadName = strings.ReplaceAll(downloadName, "\"", "")
 
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename="%s"", downloadName))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", downloadName))
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	// 3. Python-compatible HTTP streaming.
