@@ -36,21 +36,13 @@ if [ -f "/data/apex/session/session.json" ]; then
     chmod 600 /data/apex/session/session.json 2>/dev/null || true
 fi
 
-# ── 2. Mandatory Secret Key Generation / Loading ──────────────────────────────
-SECRET_FILE="/data/apex/session/secret.key"
+# ── 2. Mandatory Secret Key Validation ─────────────────────────────────────────
 if [ -z "${APEX_SECRET_KEY:-}" ]; then
-    if [ -f "${SECRET_FILE}" ]; then
-        export APEX_SECRET_KEY="$(cat "${SECRET_FILE}" | tr -d '\r\n ')"
-        echo "[Apex] Loaded persistent APEX_SECRET_KEY from storage."
-    else
-        echo "[Apex] Generating secure random 32-byte secret key..."
-        NEW_KEY="$(head -c 32 /dev/urandom | xxd -p -c 32 2>/dev/null || od -A n -N 32 -t x1 /dev/urandom | tr -d ' \n')"
-        echo "${NEW_KEY}" > "${SECRET_FILE}"
-        chmod 600 "${SECRET_FILE}"
-        export APEX_SECRET_KEY="${NEW_KEY}"
-        echo "[Apex] Persistent APEX_SECRET_KEY generated and saved."
-    fi
+    echo "[Apex] FATAL: APEX_SECRET_KEY environment variable is required but missing."
+    echo "[Apex] Please configure APEX_SECRET_KEY in Hugging Face Space Secrets or container environment."
+    exit 1
 fi
+echo "[Apex] APEX_SECRET_KEY verified."
 
 # ── 3. SQLite Snapshot Restoration for Apex Core ──────────────────────────────
 if [ -f "/data/apex/backups/apex_latest.db" ]; then

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -62,6 +63,9 @@ func GenerateVLCToken(mediaID string, expiry time.Time, secretKey string) string
 
 // ValidateVLCToken verifies HMAC signature and expiration
 func ValidateVLCToken(token, secretKey string) (string, bool) {
+	if secretKey == "" {
+		return "", false
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return "", false
@@ -98,8 +102,13 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 1. Authorization check
 	if prefix == "vlc" {
-		// VLC endpoint expects HMAC token
-		validID, ok := ValidateVLCToken(target, g.cfg.ApexSecretKey)
+		// Strip extension if present: token.mp4 -> token
+		cleanToken := target
+		if dotIdx := strings.LastIndex(cleanToken, "."); dotIdx > 0 {
+			cleanToken = cleanToken[:dotIdx]
+		}
+
+		validID, ok := ValidateVLCToken(cleanToken, g.cfg.ApexSecretKey)
 		if !ok {
 			http.Error(w, "invalid or expired stream token", http.StatusUnauthorized)
 			return
@@ -114,22 +123,37 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			mediaID = rawMediaID
 		}
 
-		// Verify internal or authorized external access
+		// Distinguish internal requests from Jellyfin server vs external ingress
 		clientIP := r.RemoteAddr
-		isLocal := strings.HasPrefix(clientIP, "127.0.0.1") ||
+		isLoopback := strings.HasPrefix(clientIP, "127.0.0.1") ||
+			strings.HasPrefix(clientIP, "[::1]") ||
 			strings.HasPrefix(clientIP, "::1") ||
-			strings.HasPrefix(clientIP, "localhost") ||
-			r.Header.Get("X-Forwarded-For") == ""
+			strings.HasPrefix(clientIP, "localhost")
 
-		if !isLocal {
-			// Require HMAC token if accessed externally
+		hasProxyHeaders := r.Header.Get("X-Forwarded-For") != "" ||
+			r.Header.Get("X-Real-IP") != ""
+
+		isInternal := isLoopback && !hasProxyHeaders
+
+		if !isInternal {
+			// External request: MUST provide a valid HMAC token
 			token := r.URL.Query().Get("token")
-			if token != "" {
-				validID, ok := ValidateVLCToken(token, g.cfg.ApexSecretKey)
-				if !ok || validID != mediaID {
-					http.Error(w, "unauthorized stream access", http.StatusUnauthorized)
-					return
+			if token == "" {
+				authHeader := r.Header.Get("Authorization")
+				if strings.HasPrefix(authHeader, "Bearer ") {
+					token = strings.TrimPrefix(authHeader, "Bearer ")
 				}
+			}
+
+			if token == "" {
+				http.Error(w, "missing stream authentication token", http.StatusUnauthorized)
+				return
+			}
+
+			validID, ok := ValidateVLCToken(token, g.cfg.ApexSecretKey)
+			if !ok || validID != mediaID {
+				http.Error(w, "invalid or expired stream token", http.StatusUnauthorized)
+				return
 			}
 		}
 	}
@@ -239,20 +263,19 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}
 
-	// 5. Seek-aware prefetch context setup
+	// 5. Unique stream session setup
 	streamCtx, streamCancel := context.WithCancel(r.Context())
 	defer streamCancel()
 
+	sessionID := fmt.Sprintf("%s:%d:%d", mediaID, time.Now().UnixNano(), rand.Int63())
+
 	g.activeMu.Lock()
-	if oldCancel, exists := g.activeMap[mediaID]; exists {
-		oldCancel() // Cancel any ongoing prefetch for this stream
-	}
-	g.activeMap[mediaID] = streamCancel
+	g.activeMap[sessionID] = streamCancel
 	g.activeMu.Unlock()
 
 	defer func() {
 		g.activeMu.Lock()
-		delete(g.activeMap, mediaID)
+		delete(g.activeMap, sessionID)
 		g.activeMu.Unlock()
 	}()
 
@@ -261,7 +284,47 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		prefetchWindow = 16
 	}
 
-	// 6. Stream chunk delivery with request coalescing & adaptive prefetch
+	// 6. Dedicated bounded prefetch worker per stream session
+	prefetchCh := make(chan int64, 1)
+
+	go func() {
+		for {
+			select {
+			case <-streamCtx.Done():
+				return
+			case anchorChunk, ok := <-prefetchCh:
+				if !ok {
+					return
+				}
+				for i := 1; i <= prefetchWindow; i++ {
+					select {
+					case <-streamCtx.Done():
+						return
+					default:
+					}
+
+					nextChunk := anchorChunk + int64(i)
+					nextBaseOffset := nextChunk * ChunkSize
+					if nextBaseOffset >= totalSize {
+						break
+					}
+					nextKey := fmt.Sprintf("%s:%d", mediaID, nextChunk)
+
+					// Skip if already in cache
+					if _, hit := g.cache.Get(nextKey); hit {
+						continue
+					}
+
+					// Fetch subsequent chunk in background
+					_, _ = g.cache.FetchCoalesced(nextKey, func() ([]byte, error) {
+						return g.fetcher.FetchChunk(streamCtx, item, nextBaseOffset, ChunkSize)
+					})
+				}
+			}
+		}
+	}()
+
+	// 7. Stream chunk delivery with request coalescing & bounded prefetch
 	currentOffset := start
 	for currentOffset <= end {
 		select {
@@ -284,27 +347,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Trigger proactive background prefetch for subsequent chunks
-		go func(anchorChunk int64) {
-			for i := 1; i <= prefetchWindow; i++ {
-				nextChunk := anchorChunk + int64(i)
-				nextBaseOffset := nextChunk * ChunkSize
-				if nextBaseOffset >= totalSize {
-					break
-				}
-				nextKey := fmt.Sprintf("%s:%d", mediaID, nextChunk)
-
-				// Skip if already in cache
-				if _, hit := g.cache.Get(nextKey); hit {
-					continue
-				}
-
-				// Prefetch chunk in background
-				_, _ = g.cache.FetchCoalesced(nextKey, func() ([]byte, error) {
-					return g.fetcher.FetchChunk(streamCtx, item, nextBaseOffset, ChunkSize)
-				})
-			}
-		}(chunkIndex)
+		// Trigger bounded prefetch worker for upcoming chunks
+		select {
+		case prefetchCh <- chunkIndex:
+		default:
+		}
 
 		// Slice requested byte range from the 1 MB block
 		sliceStart := currentOffset - chunkBaseOffset

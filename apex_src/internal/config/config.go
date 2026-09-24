@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -50,13 +51,23 @@ func Load() *Config {
 		}
 	}
 
+	secretKey := getEnv("APEX_SECRET_KEY", "")
+	if secretKey == "" {
+		log.Fatalf("[Apex] Fatal: APEX_SECRET_KEY environment variable is required but missing.")
+	}
+
+	jfAPIKey := getEnv("APEX_JELLYFIN_API_KEY", getEnv("JELLYFIN_API_KEY", ""))
+	if jfAPIKey == "" {
+		log.Println("[Apex] Notice: APEX_JELLYFIN_API_KEY is not set. Complete initial Jellyfin setup at http://<host>:7860 and set APEX_JELLYFIN_API_KEY in environment variables.")
+	}
+
 	return &Config{
 		TelegramAPIID:        apiID,
 		TelegramAPIHash:      getEnv("TELEGRAM_API_HASH", ""),
 		TelegramBotToken:     getEnv("TELEGRAM_BOT_TOKEN", ""),
 		TelegramAllowedChats: allowedChats,
 		TMDBAPIKey:           getEnv("TMDB_API_KEY", ""),
-		ApexSecretKey:        getEnv("APEX_SECRET_KEY", "apex_default_secret_key_change_me"),
+		ApexSecretKey:        secretKey,
 
 		MemoryCacheMB: memMB,
 		DiskCacheMB:   diskMB,
@@ -70,7 +81,7 @@ func Load() *Config {
 		SessionFilePath: getEnv("APEX_SESSION_FILE", "/data/apex/session/session.json"),
 		ServerPort:      getEnv("APEX_CORE_PORT", "8084"),
 		JellyfinURL:     getEnv("JELLYFIN_URL", "http://127.0.0.1:8096"),
-		JellyfinAPIKey:  getEnv("APEX_JELLYFIN_API_KEY", getEnv("JELLYFIN_API_KEY", "apex_internal_key_default")),
+		JellyfinAPIKey:  jfAPIKey,
 	}
 }
 

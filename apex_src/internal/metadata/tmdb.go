@@ -2,8 +2,10 @@ package metadata
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,7 +33,7 @@ type TMDBResult struct {
 	FirstAirDate  string  `json:"first_air_date"`
 	VoteAverage   float64 `json:"vote_average"`
 	Popularity    float64 `json:"popularity"`
-	Confidence    float64 `json:"confidence"`
+	Confidence    float64 `json:"confidence"` // Normalized between 0.0 and 1.0
 }
 
 type TMDBSearchResponse struct {
@@ -108,9 +110,9 @@ func (c *Client) searchInternal(title string, year int, mediaType string) (*TMDB
 		return nil, fmt.Errorf("no metadata found for %s", title)
 	}
 
-	// Select best match based on confidence scoring
+	// Select best match based on normalized confidence scoring (0.0 to 1.0)
 	bestIdx := 0
-	highestScore := -1.0
+	highestScore := 0.0
 
 	normQuery := strings.ToLower(strings.TrimSpace(title))
 
@@ -121,14 +123,25 @@ func (c *Client) searchInternal(title string, year int, mediaType string) (*TMDB
 			candidateTitle = strings.ToLower(candidate.Name)
 		}
 
-		// Exact match bonus
+		// 1. Title match (max 0.50)
 		if candidateTitle == normQuery {
-			score += 50.0
+			score += 0.50
 		} else if strings.Contains(candidateTitle, normQuery) || strings.Contains(normQuery, candidateTitle) {
-			score += 30.0
+			score += 0.35
+		} else {
+			queryTokens := strings.Fields(normQuery)
+			matches := 0
+			for _, tok := range queryTokens {
+				if strings.Contains(candidateTitle, tok) {
+					matches++
+				}
+			}
+			if len(queryTokens) > 0 {
+				score += (float64(matches) / float64(len(queryTokens))) * 0.25
+			}
 		}
 
-		// Year match
+		// 2. Year match (max 0.30)
 		candYear := 0
 		if len(candidate.ReleaseDate) >= 4 {
 			candYear, _ = strconv.Atoi(candidate.ReleaseDate[:4])
@@ -138,15 +151,23 @@ func (c *Client) searchInternal(title string, year int, mediaType string) (*TMDB
 
 		if year > 0 && candYear > 0 {
 			if candYear == year {
-				score += 30.0
+				score += 0.30
 			} else if candYear == year-1 || candYear == year+1 {
-				score += 15.0
+				score += 0.15
 			}
+		} else if year == 0 {
+			score += 0.15
 		}
 
-		// Popularity and votes
-		score += candidate.Popularity * 0.1
-		score += candidate.VoteAverage * 2.0
+		// 3. Popularity & Vote quality (max 0.20)
+		score += math.Min(candidate.Popularity/50.0, 1.0) * 0.10
+		if candidate.VoteAverage > 0 {
+			score += (math.Min(candidate.VoteAverage, 10.0) / 10.0) * 0.10
+		}
+
+		if score > 1.0 {
+			score = 1.0
+		}
 
 		if score > highestScore {
 			highestScore = score
@@ -215,37 +236,97 @@ func (c *Client) DownloadImage(imagePath, targetFile string) error {
 	return err
 }
 
+// XML-escaped NFO Data Structures
+type UniqueID struct {
+	Type    string `xml:"type,attr"`
+	Default string `xml:"default,attr"`
+	Value   int    `xml:",chardata"`
+}
+
+type MovieNFO struct {
+	XMLName  xml.Name `xml:"movie"`
+	Title    string   `xml:"title"`
+	Plot     string   `xml:"plot"`
+	Year     int      `xml:"year,omitempty"`
+	Rating   float64  `xml:"rating,omitempty"`
+	UniqueID UniqueID `xml:"uniqueid"`
+}
+
+type TVShowNFO struct {
+	XMLName  xml.Name `xml:"tvshow"`
+	Title    string   `xml:"title"`
+	Plot     string   `xml:"plot"`
+	Year     int      `xml:"year,omitempty"`
+	Rating   float64  `xml:"rating,omitempty"`
+	UniqueID UniqueID `xml:"uniqueid"`
+}
+
+type EpisodeDetailsNFO struct {
+	XMLName  xml.Name `xml:"episodedetails"`
+	Title    string   `xml:"title"`
+	Season   int      `xml:"season"`
+	Episode  int      `xml:"episode"`
+	Plot     string   `xml:"plot"`
+	Aired    string   `xml:"aired,omitempty"`
+	Rating   float64  `xml:"rating,omitempty"`
+	UniqueID UniqueID `xml:"uniqueid"`
+}
+
 func GenerateMovieNFO(title, plot string, year int, rating float64, tmdbID int) string {
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
-<movie>
-    <title>%s</title>
-    <plot>%s</plot>
-    <year>%d</year>
-    <rating>%.1f</rating>
-    <uniqueid type="tmdb" default="true">%d</uniqueid>
-</movie>`, title, plot, year, rating, tmdbID)
+	nfo := MovieNFO{
+		Title:  title,
+		Plot:   plot,
+		Year:   year,
+		Rating: rating,
+		UniqueID: UniqueID{
+			Type:    "tmdb",
+			Default: "true",
+			Value:   tmdbID,
+		},
+	}
+	data, err := xml.MarshalIndent(nfo, "", "    ")
+	if err != nil {
+		return ""
+	}
+	return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" + string(data)
 }
 
 func GenerateShowNFO(title, plot string, year int, rating float64, tmdbID int) string {
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
-<tvshow>
-    <title>%s</title>
-    <plot>%s</plot>
-    <year>%d</year>
-    <rating>%.1f</rating>
-    <uniqueid type="tmdb" default="true">%d</uniqueid>
-</tvshow>`, title, plot, year, rating, tmdbID)
+	nfo := TVShowNFO{
+		Title:  title,
+		Plot:   plot,
+		Year:   year,
+		Rating: rating,
+		UniqueID: UniqueID{
+			Type:    "tmdb",
+			Default: "true",
+			Value:   tmdbID,
+		},
+	}
+	data, err := xml.MarshalIndent(nfo, "", "    ")
+	if err != nil {
+		return ""
+	}
+	return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" + string(data)
 }
 
 func GenerateEpisodeNFO(title string, season, episode int, plot, airDate string, rating float64, tmdbID int) string {
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
-<episodedetails>
-    <title>%s</title>
-    <season>%d</season>
-    <episode>%d</episode>
-    <plot>%s</plot>
-    <aired>%s</aired>
-    <rating>%.1f</rating>
-    <uniqueid type="tmdb" default="true">%d</uniqueid>
-</episodedetails>`, title, season, episode, plot, airDate, rating, tmdbID)
+	nfo := EpisodeDetailsNFO{
+		Title:   title,
+		Season:  season,
+		Episode: episode,
+		Plot:    plot,
+		Aired:   airDate,
+		Rating:  rating,
+		UniqueID: UniqueID{
+			Type:    "tmdb",
+			Default: "true",
+			Value:   tmdbID,
+		},
+	}
+	data, err := xml.MarshalIndent(nfo, "", "    ")
+	if err != nil {
+		return ""
+	}
+	return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" + string(data)
 }

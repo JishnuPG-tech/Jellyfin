@@ -86,16 +86,35 @@ func main() {
 		}
 	}()
 
-	// Background Library Auto-provisioning: ensure default Movies and Shows libraries
+	// Background Jellyfin Integration Health Monitor
 	go func() {
-		time.Sleep(12 * time.Second) // wait for Jellyfin to start listening
-		for i := 0; i < 5; i++ {
+		time.Sleep(8 * time.Second) // wait for Jellyfin service to initialize
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
 			select {
 			case <-ctx.Done():
 				return
-			default:
-				jfClient.EnsureDefaultLibraries()
-				time.Sleep(30 * time.Second)
+			case <-ticker.C:
+				checkCtx, checkCancel := context.WithTimeout(ctx, 6*time.Second)
+				reachable, authValid, hasMovies, hasShows, err := jfClient.VerifyIntegration(checkCtx)
+				checkCancel()
+
+				if !reachable {
+					log.Printf("[Jellyfin Health] Service at %s not yet responding: %v", cfg.JellyfinURL, err)
+				} else if !authValid {
+					if cfg.JellyfinAPIKey == "" {
+						log.Printf("[Jellyfin Health] Jellyfin is up. APEX_JELLYFIN_API_KEY is not configured yet. Complete wizard and set key.")
+					} else {
+						log.Printf("[Jellyfin Health] Warning: APEX_JELLYFIN_API_KEY was rejected by Jellyfin: %v", err)
+					}
+				} else {
+					if !hasMovies || !hasShows {
+						log.Printf("[Jellyfin Health] Provisioning missing libraries (Movies: %t, Shows: %t)...", hasMovies, hasShows)
+						jfClient.EnsureDefaultLibraries()
+					}
+				}
 			}
 		}
 	}()
@@ -232,73 +251,77 @@ func processIngestionTask(
 		}
 	}
 
-	// 5. Query TMDB Metadata
+	// 5. Query TMDB Metadata with Normalized Confidence Scoring
 	var tmdbID int
 	var plot string
 	var rating float64
 	var posterPath, backdropPath string
-	var stillPath, epAirDate string
-	var epTitle string
 
 	tmdbMeta, err := tmdbClient.Search(parsed.CleanTitle, parsed.Year, parsed.MediaType)
 	if err == nil && tmdbMeta != nil {
-		tmdbID = tmdbMeta.ID
-		plot = tmdbMeta.Overview
-		rating = tmdbMeta.VoteAverage
-		posterPath = tmdbMeta.PosterPath
-		backdropPath = tmdbMeta.BackdropPath
-		if parsed.Year == 0 {
-			if parsed.MediaType == "series" && len(tmdbMeta.FirstAirDate) >= 4 {
-				parsed.Year, _ = strconv.Atoi(tmdbMeta.FirstAirDate[:4])
-			} else if len(tmdbMeta.ReleaseDate) >= 4 {
-				parsed.Year, _ = strconv.Atoi(tmdbMeta.ReleaseDate[:4])
+		if tmdbMeta.Confidence >= 0.85 {
+			log.Printf("[Worker #%d] TMDB auto-accepted (confidence: %.2f) for %s", workerID, tmdbMeta.Confidence, parsed.CleanTitle)
+			tmdbID = tmdbMeta.ID
+			plot = tmdbMeta.Overview
+			rating = tmdbMeta.VoteAverage
+			posterPath = tmdbMeta.PosterPath
+			backdropPath = tmdbMeta.BackdropPath
+			if canonical := tmdbMeta.Title; canonical != "" {
+				parsed.CleanTitle = canonical
+			} else if tmdbMeta.Name != "" {
+				parsed.CleanTitle = tmdbMeta.Name
 			}
-		}
-		canonicalTitle := tmdbMeta.Title
-		if canonicalTitle == "" {
-			canonicalTitle = tmdbMeta.Name
-		}
-		if canonicalTitle != "" {
-			parsed.CleanTitle = canonicalTitle
+		} else if tmdbMeta.Confidence >= 0.70 {
+			log.Printf("[Worker #%d] TMDB accepted with verification (confidence: %.2f) for %s", workerID, tmdbMeta.Confidence, parsed.CleanTitle)
+			tmdbID = tmdbMeta.ID
+			plot = tmdbMeta.Overview
+			rating = tmdbMeta.VoteAverage
+			posterPath = tmdbMeta.PosterPath
+			backdropPath = tmdbMeta.BackdropPath
+			if canonical := tmdbMeta.Title; canonical != "" {
+				parsed.CleanTitle = canonical
+			} else if tmdbMeta.Name != "" {
+				parsed.CleanTitle = tmdbMeta.Name
+			}
+		} else {
+			log.Printf("[Worker #%d] TMDB low confidence (%.2f < 0.70) for %s. Keeping original parsed title.", workerID, tmdbMeta.Confidence, parsed.CleanTitle)
 		}
 	}
 
-	// Series episode metadata
-	if parsed.MediaType == "series" && tmdbID > 0 {
-		if epMeta, err := tmdbClient.GetEpisodeDetails(tmdbID, parsed.Season, parsed.Episode); err == nil && epMeta != nil {
-			epTitle = epMeta.Name
-			if epMeta.Overview != "" {
-				plot = epMeta.Overview
-			}
-			if epMeta.VoteAverage > 0 {
-				rating = epMeta.VoteAverage
-			}
-			stillPath = epMeta.StillPath
-			epAirDate = epMeta.AirDate
-		}
-	}
-	if epTitle == "" {
-		epTitle = fmt.Sprintf("Episode %d", parsed.Episode)
-	}
-
-	// 6. Build Virtual Filesystem Layout
-	var relDir string
-	var strmRelPath string
-	var nfoPath string
-	var nfoContent string
-
+	// 6. Build Virtual Filesystem Layout & NFO Metadata
 	if parsed.MediaType == "series" {
 		showDir := filepath.Join(cfg.JellyfinMedia, "Shows", parsed.CleanTitle)
 		seasonDir := filepath.Join(showDir, fmt.Sprintf("Season %02d", parsed.Season))
 		_ = os.MkdirAll(seasonDir, 0755)
 
-		relDir = filepath.Join("Shows", parsed.CleanTitle, fmt.Sprintf("Season %02d", parsed.Season))
-		strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s S%02dE%02d.strm", parsed.CleanTitle, parsed.Season, parsed.Episode))
+		relDir := filepath.Join("Shows", parsed.CleanTitle, fmt.Sprintf("Season %02d", parsed.Season))
+
+		startEp := parsed.Episode
+		endEp := parsed.EndEpisode
+		if endEp < startEp {
+			endEp = startEp
+		}
+
+		var strmRelPath string
+		if endEp > startEp {
+			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s S%02dE%02d-E%02d.strm", parsed.CleanTitle, parsed.Season, startEp, endEp))
+		} else {
+			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s S%02dE%02d.strm", parsed.CleanTitle, parsed.Season, startEp))
+		}
+
+		fullStrmPath, err := jfWriter.WriteSTRM(strmRelPath, opaqueID)
+		if err != nil {
+			log.Printf("[Worker #%d] Error writing .strm: %v", workerID, err)
+			job.Status = "failed"
+			job.Error = err.Error()
+			_ = database.SaveJob(job)
+			return
+		}
 
 		// Show NFO & Artwork
 		showNfoPath := filepath.Join(showDir, "tvshow.nfo")
 		if _, err := os.Stat(showNfoPath); os.IsNotExist(err) {
-			_ = os.WriteFile(showNfoPath, []byte(metadata.GenerateShowNFO(parsed.CleanTitle, tmdbMeta.Overview, parsed.Year, rating, tmdbID)), 0644)
+			_ = os.WriteFile(showNfoPath, []byte(metadata.GenerateShowNFO(parsed.CleanTitle, plot, parsed.Year, rating, tmdbID)), 0644)
 		}
 		if posterPath != "" {
 			_ = tmdbClient.DownloadImage(posterPath, filepath.Join(showDir, "poster.jpg"))
@@ -307,50 +330,7 @@ func processIngestionTask(
 			_ = tmdbClient.DownloadImage(backdropPath, filepath.Join(showDir, "backdrop.jpg"))
 		}
 
-		// Episode NFO & Still
-		nfoPath = filepath.Join(seasonDir, fmt.Sprintf("%s S%02dE%02d.nfo", parsed.CleanTitle, parsed.Season, parsed.Episode))
-		nfoContent = metadata.GenerateEpisodeNFO(epTitle, parsed.Season, parsed.Episode, plot, epAirDate, rating, tmdbID)
-		if stillPath != "" {
-			_ = tmdbClient.DownloadImage(stillPath, filepath.Join(seasonDir, fmt.Sprintf("%s S%02dE%02d-thumb.jpg", parsed.CleanTitle, parsed.Season, parsed.Episode)))
-		}
-	} else {
-		if parsed.Year > 0 {
-			relDir = filepath.Join("Movies", fmt.Sprintf("%s (%d)", parsed.CleanTitle, parsed.Year))
-			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s (%d).strm", parsed.CleanTitle, parsed.Year))
-		} else {
-			relDir = filepath.Join("Movies", parsed.CleanTitle)
-			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s.strm", parsed.CleanTitle))
-		}
-		movieDir := filepath.Join(cfg.JellyfinMedia, relDir)
-		_ = os.MkdirAll(movieDir, 0755)
-
-		// Movie NFO & Artwork
-		nfoPath = filepath.Join(movieDir, "movie.nfo")
-		nfoContent = metadata.GenerateMovieNFO(parsed.CleanTitle, plot, parsed.Year, rating, tmdbID)
-		if posterPath != "" {
-			_ = tmdbClient.DownloadImage(posterPath, filepath.Join(movieDir, "poster.jpg"))
-		}
-		if backdropPath != "" {
-			_ = tmdbClient.DownloadImage(backdropPath, filepath.Join(movieDir, "backdrop.jpg"))
-		}
-	}
-
-	// 7. Write .strm virtual file pointer
-	fullStrmPath, err := jfWriter.WriteSTRM(strmRelPath, opaqueID)
-	if err != nil {
-		log.Printf("[Worker #%d] Error writing .strm: %v", workerID, err)
-		job.Status = "failed"
-		job.Error = err.Error()
-		_ = database.SaveJob(job)
-		return
-	}
-
-	if nfoPath != "" && nfoContent != "" {
-		_ = os.WriteFile(nfoPath, []byte(nfoContent), 0644)
-	}
-
-	// 8. Persist Normalized Database Records
-	if parsed.MediaType == "series" {
+		// Persist Series row
 		seriesIDStr := fmt.Sprintf("series_%d", tmdbID)
 		if tmdbID == 0 {
 			seriesIDStr = fmt.Sprintf("series_%s", opaqueID)
@@ -365,23 +345,107 @@ func processIngestionTask(
 			PosterPath:   posterPath,
 			BackdropPath: backdropPath,
 		}
-		_ = database.SaveSeries(seriesObj)
-
-		epObj := &db.Episode{
-			ID:            fmt.Sprintf("ep_%s", opaqueID),
-			SeriesID:      seriesObj.ID,
-			SeasonID:      fmt.Sprintf("%s_s%02d", seriesObj.ID, parsed.Season),
-			SeasonNumber:  parsed.Season,
-			EpisodeNumber: parsed.Episode,
-			Title:         epTitle,
-			Overview:      plot,
-			AirDate:       epAirDate,
-			Rating:        rating,
-			StillPath:     stillPath,
-			StrmPath:      fullStrmPath,
+		if err := database.SaveSeries(seriesObj); err != nil {
+			log.Printf("[Worker #%d] Error saving series: %v", workerID, err)
 		}
-		_ = database.SaveEpisode(epObj)
+
+		// Persist Season row (FOREIGN KEY requirement for episodes)
+		seasonObj := &db.Season{
+			ID:           fmt.Sprintf("%s_s%02d", seriesObj.ID, parsed.Season),
+			SeriesID:     seriesObj.ID,
+			SeasonNumber: parsed.Season,
+			Title:        fmt.Sprintf("Season %02d", parsed.Season),
+		}
+		if err := database.SaveSeason(seasonObj); err != nil {
+			log.Printf("[Worker #%d] Error saving season: %v", workerID, err)
+		}
+
+		// Process each episode in the range (multi-episode or single)
+		for epNum := startEp; epNum <= endEp; epNum++ {
+			epTitle := fmt.Sprintf("Episode %d", epNum)
+			epPlot := plot
+			epRating := rating
+			epStillPath := ""
+			epAirDate := ""
+
+			if tmdbID > 0 {
+				if epMeta, err := tmdbClient.GetEpisodeDetails(tmdbID, parsed.Season, epNum); err == nil && epMeta != nil {
+					if epMeta.Name != "" {
+						epTitle = epMeta.Name
+					}
+					if epMeta.Overview != "" {
+						epPlot = epMeta.Overview
+					}
+					if epMeta.VoteAverage > 0 {
+						epRating = epMeta.VoteAverage
+					}
+					epStillPath = epMeta.StillPath
+					epAirDate = epMeta.AirDate
+				}
+			}
+
+			// Episode NFO & Still
+			epNfoContent := metadata.GenerateEpisodeNFO(epTitle, parsed.Season, epNum, epPlot, epAirDate, epRating, tmdbID)
+			epNfoPath := filepath.Join(seasonDir, fmt.Sprintf("%s S%02dE%02d.nfo", parsed.CleanTitle, parsed.Season, epNum))
+			_ = os.WriteFile(epNfoPath, []byte(epNfoContent), 0644)
+
+			if epStillPath != "" {
+				_ = tmdbClient.DownloadImage(epStillPath, filepath.Join(seasonDir, fmt.Sprintf("%s S%02dE%02d-thumb.jpg", parsed.CleanTitle, parsed.Season, epNum)))
+			}
+
+			// Persist Episode row
+			epObj := &db.Episode{
+				ID:            fmt.Sprintf("ep_%s_%d", opaqueID, epNum),
+				SeriesID:      seriesObj.ID,
+				SeasonID:      seasonObj.ID,
+				SeasonNumber:  parsed.Season,
+				EpisodeNumber: epNum,
+				Title:         epTitle,
+				Overview:      epPlot,
+				AirDate:       epAirDate,
+				Rating:        epRating,
+				StillPath:     epStillPath,
+				StrmPath:      fullStrmPath,
+			}
+			if err := database.SaveEpisode(epObj); err != nil {
+				log.Printf("[Worker #%d] Error saving episode %d: %v", workerID, epNum, err)
+			}
+		}
 	} else {
+		// Movie
+		var relDir string
+		var strmRelPath string
+		if parsed.Year > 0 {
+			relDir = filepath.Join("Movies", fmt.Sprintf("%s (%d)", parsed.CleanTitle, parsed.Year))
+			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s (%d).strm", parsed.CleanTitle, parsed.Year))
+		} else {
+			relDir = filepath.Join("Movies", parsed.CleanTitle)
+			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s.strm", parsed.CleanTitle))
+		}
+		movieDir := filepath.Join(cfg.JellyfinMedia, relDir)
+		_ = os.MkdirAll(movieDir, 0755)
+
+		fullStrmPath, err := jfWriter.WriteSTRM(strmRelPath, opaqueID)
+		if err != nil {
+			log.Printf("[Worker #%d] Error writing .strm: %v", workerID, err)
+			job.Status = "failed"
+			job.Error = err.Error()
+			_ = database.SaveJob(job)
+			return
+		}
+
+		// Movie NFO & Artwork
+		nfoPath := filepath.Join(movieDir, "movie.nfo")
+		nfoContent := metadata.GenerateMovieNFO(parsed.CleanTitle, plot, parsed.Year, rating, tmdbID)
+		_ = os.WriteFile(nfoPath, []byte(nfoContent), 0644)
+
+		if posterPath != "" {
+			_ = tmdbClient.DownloadImage(posterPath, filepath.Join(movieDir, "poster.jpg"))
+		}
+		if backdropPath != "" {
+			_ = tmdbClient.DownloadImage(backdropPath, filepath.Join(movieDir, "backdrop.jpg"))
+		}
+
 		movieObj := &db.Movie{
 			ID:           fmt.Sprintf("movie_%s", opaqueID),
 			Title:        parsed.CleanTitle,
@@ -393,9 +457,13 @@ func processIngestionTask(
 			BackdropPath: backdropPath,
 			StrmPath:     fullStrmPath,
 		}
-		_ = database.SaveMovie(movieObj)
+		if err := database.SaveMovie(movieObj); err != nil {
+			log.Printf("[Worker #%d] Error saving movie: %v", workerID, err)
+		}
 	}
 
+	// 7. Persist MediaItem lookup index
+	strmPath := filepath.Join(cfg.JellyfinMedia, "Movies", fmt.Sprintf("%s.strm", parsed.CleanTitle))
 	item := &db.MediaItem{
 		ID:           opaqueID,
 		SourceChatID: task.ChatID,
@@ -412,11 +480,11 @@ func processIngestionTask(
 		Season:       parsed.Season,
 		Episode:      parsed.Episode,
 		TMDBID:       tmdbID,
-		StrmPath:     fullStrmPath,
+		StrmPath:     strmPath,
 	}
 	_ = database.SaveMediaItem(item)
 
-	// 9. Media Capability Probe Analysis
+	// 8. Media Capability Probe Analysis
 	streamURL := fmt.Sprintf("http://127.0.0.1:%s/stream/%s", cfg.ServerPort, opaqueID)
 	cap, probeErr := probe.Analyze(ctx, streamURL, opaqueID, filename)
 	if probeErr != nil {
@@ -426,14 +494,13 @@ func processIngestionTask(
 		_ = database.SaveCapabilities(cap)
 	}
 
-	// 10. Mark Job Completed
+	// 9. Mark Job Completed
 	job.Status = "completed"
 	_ = database.SaveJob(job)
 
-	log.Printf("[Worker #%d] Successfully cataloged: %s (ID: %s, STRM: %s)",
-		workerID, parsed.CleanTitle, opaqueID, fullStrmPath)
+	log.Printf("[Worker #%d] Successfully cataloged: %s (ID: %s)", workerID, parsed.CleanTitle, opaqueID)
 
-	// 11. Enqueue debounced Jellyfin refresh
+	// 10. Enqueue debounced Jellyfin refresh
 	select {
 	case refreshNotify <- struct{}{}:
 	default:

@@ -305,6 +305,19 @@ func (d *Database) SaveSeries(s *Series) error {
 	return err
 }
 
+func (d *Database) SaveSeason(s *Season) error {
+	query := `
+	INSERT INTO seasons (id, series_id, season_number, title, overview, poster_path)
+	VALUES (?, ?, ?, ?, ?, ?)
+	ON CONFLICT(series_id, season_number) DO UPDATE SET
+		title=excluded.title,
+		overview=excluded.overview,
+		poster_path=excluded.poster_path;
+	`
+	_, err := d.conn.Exec(query, s.ID, s.SeriesID, s.SeasonNumber, s.Title, s.Overview, s.PosterPath)
+	return err
+}
+
 func (d *Database) SaveEpisode(ep *Episode) error {
 	query := `
 	INSERT INTO episodes (id, series_id, season_id, season_number, episode_number, title, overview, air_date, rating, still_path, strm_path)

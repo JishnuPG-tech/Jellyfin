@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -67,6 +69,31 @@ type LRUCache struct {
 
 func NewLRUCache(memoryMB, diskMB int, diskDir string) *LRUCache {
 	_ = os.MkdirAll(diskDir, 0755)
+
+	// Startup corruption & temporary file cleanup
+	if entries, err := os.ReadDir(diskDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			fullPath := filepath.Join(diskDir, name)
+
+			// Remove leftover temporary files from aborted writes
+			if strings.Contains(name, ".tmp") {
+				_ = os.Remove(fullPath)
+				continue
+			}
+
+			// Check file integrity: remove 0-byte or corrupted chunks
+			if info, err := e.Info(); err == nil {
+				if info.Size() == 0 {
+					_ = os.Remove(fullPath)
+				}
+			}
+		}
+	}
+
 	return &LRUCache{
 		maxMemory: int64(memoryMB) * 1024 * 1024,
 		maxDisk:   int64(diskMB) * 1024 * 1024,
@@ -127,10 +154,7 @@ func (c *LRUCache) Put(key string, data []byte) {
 		item := el.Value.(*CacheItem)
 		item.data = data
 		c.mu.Unlock()
-		// Async write to disk
-		go func(path string, d []byte) {
-			_ = os.WriteFile(path, d, 0644)
-		}(diskPath, data)
+		go writeDiskAtomic(diskPath, data)
 		return
 	}
 
@@ -175,10 +199,35 @@ func (c *LRUCache) Put(key string, data []byte) {
 	}
 	c.mu.Unlock()
 
-	// Persist to disk asynchronously
-	go func(path string, d []byte) {
-		_ = os.WriteFile(path, d, 0644)
-	}(diskPath, data)
+	// Persist to disk asynchronously using atomic write
+	go writeDiskAtomic(diskPath, data)
+}
+
+func writeDiskAtomic(finalPath string, data []byte) {
+	dir := filepath.Dir(finalPath)
+	tmpFile, err := os.CreateTemp(dir, "chunk_*.tmp")
+	if err != nil {
+		log.Printf("[Cache] Warning: Failed to create temp cache file: %v", err)
+		return
+	}
+	tmpName := tmpFile.Name()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpName)
+		log.Printf("[Cache] Warning: Failed to write cache data: %v", err)
+		return
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+
+	if err := os.Rename(tmpName, finalPath); err != nil {
+		_ = os.Remove(tmpName)
+		log.Printf("[Cache] Warning: Failed to commit cache chunk: %v", err)
+	}
 }
 
 func (c *LRUCache) FetchCoalesced(key string, fetcher func() ([]byte, error)) ([]byte, error) {

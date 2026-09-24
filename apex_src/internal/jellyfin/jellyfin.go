@@ -1,6 +1,7 @@
 package jellyfin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -50,12 +51,76 @@ func NewClient(baseURL, apiKey string) *Client {
 	}
 }
 
+type VirtualFolder struct {
+	Name      string   `json:"Name"`
+	Locations []string `json:"Locations"`
+}
+
+// VerifyIntegration checks: (1) server reachability, (2) API key validity, (3) Movies library, (4) Shows library
+func (c *Client) VerifyIntegration(ctx context.Context) (reachable bool, authValid bool, hasMovies bool, hasShows bool, err error) {
+	// 1. Check reachability
+	publicURL := fmt.Sprintf("%s/System/Info/Public", c.baseURL)
+	reqPublic, err := http.NewRequestWithContext(ctx, http.MethodGet, publicURL, nil)
+	if err != nil {
+		return false, false, false, false, err
+	}
+	respPublic, err := c.httpClient.Do(reqPublic)
+	if err != nil {
+		return false, false, false, false, fmt.Errorf("jellyfin server unreachable: %w", err)
+	}
+	respPublic.Body.Close()
+	reachable = true
+
+	if c.apiKey == "" {
+		return reachable, false, false, false, fmt.Errorf("APEX_JELLYFIN_API_KEY is not set")
+	}
+
+	// 2. Check API key validity & virtual folders
+	foldersURL := fmt.Sprintf("%s/Library/VirtualFolders", c.baseURL)
+	reqFolders, err := http.NewRequestWithContext(ctx, http.MethodGet, foldersURL, nil)
+	if err != nil {
+		return reachable, false, false, false, err
+	}
+	reqFolders.Header.Set("X-Emby-Token", c.apiKey)
+	reqFolders.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", c.apiKey))
+
+	respFolders, err := c.httpClient.Do(reqFolders)
+	if err != nil {
+		return reachable, false, false, false, fmt.Errorf("error querying libraries: %w", err)
+	}
+	defer respFolders.Body.Close()
+
+	if respFolders.StatusCode == http.StatusUnauthorized || respFolders.StatusCode == http.StatusForbidden {
+		return reachable, false, false, false, fmt.Errorf("APEX_JELLYFIN_API_KEY is unauthorized or expired (HTTP %d)", respFolders.StatusCode)
+	}
+	if respFolders.StatusCode != http.StatusOK {
+		return reachable, false, false, false, fmt.Errorf("unexpected status %d from library query", respFolders.StatusCode)
+	}
+	authValid = true
+
+	var folders []VirtualFolder
+	if err := json.NewDecoder(respFolders.Body).Decode(&folders); err != nil {
+		return reachable, authValid, false, false, fmt.Errorf("error decoding libraries: %w", err)
+	}
+
+	for _, f := range folders {
+		if strings.EqualFold(f.Name, "Movies") {
+			hasMovies = true
+		}
+		if strings.EqualFold(f.Name, "Shows") || strings.EqualFold(f.Name, "TV Shows") || strings.EqualFold(f.Name, "Series") {
+			hasShows = true
+		}
+	}
+
+	return reachable, authValid, hasMovies, hasShows, nil
+}
+
 func (c *Client) EnsureDefaultLibraries() {
 	if c.apiKey == "" {
+		log.Println("[Jellyfin] Notice: APEX_JELLYFIN_API_KEY is not configured. Library auto-provisioning skipped.")
 		return
 	}
 
-	// 1. Fetch current virtual folders from Jellyfin
 	u := fmt.Sprintf("%s/Library/VirtualFolders", c.baseURL)
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
@@ -66,17 +131,18 @@ func (c *Client) EnsureDefaultLibraries() {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		log.Printf("[Jellyfin] Failed to query virtual folders: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		log.Printf("[Jellyfin] Warning: Configured APEX_JELLYFIN_API_KEY was rejected by Jellyfin (HTTP %d).", resp.StatusCode)
 		return
 	}
-
-	type VirtualFolder struct {
-		Name      string   `json:"Name"`
-		Locations []string `json:"Locations"`
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[Jellyfin] VirtualFolders query returned HTTP %d", resp.StatusCode)
+		return
 	}
 
 	var folders []VirtualFolder
@@ -115,14 +181,25 @@ func (c *Client) addVirtualFolder(name, collectionType, path string) {
 	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", c.apiKey))
 
 	resp, err := c.httpClient.Do(req)
-	if err == nil {
-		resp.Body.Close()
+	if err != nil {
+		log.Printf("[Jellyfin] Error creating library '%s': %v", name, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		log.Printf("[Jellyfin] Auto-created '%s' library pointing to %s (Status: %d)", name, path, resp.StatusCode)
+	} else {
+		log.Printf("[Jellyfin] Failed creating library '%s' (Status: %d)", name, resp.StatusCode)
 	}
 }
 
 func (c *Client) RefreshLibrary() error {
-	// Auto-provision Movies and Shows libraries if not already registered
+	if c.apiKey == "" {
+		return fmt.Errorf("APEX_JELLYFIN_API_KEY is not configured")
+	}
+
+	// Ensure default libraries exist
 	c.EnsureDefaultLibraries()
 
 	u := fmt.Sprintf("%s/Library/Refresh", c.baseURL)
@@ -130,10 +207,8 @@ func (c *Client) RefreshLibrary() error {
 	if err != nil {
 		return err
 	}
-	if c.apiKey != "" {
-		req.Header.Set("X-Emby-Token", c.apiKey)
-		req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", c.apiKey))
-	}
+	req.Header.Set("X-Emby-Token", c.apiKey)
+	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=\"%s\"", c.apiKey))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
