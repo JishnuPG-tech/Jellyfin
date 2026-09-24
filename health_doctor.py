@@ -9,10 +9,13 @@ monitors persistent disk volume usage, and purges expired database backups.
 import os
 import sys
 import time
+import json
 import shutil
 import glob
 import sqlite3
 import logging
+import urllib.request
+import urllib.error
 
 logger = logging.getLogger("HealthDoctor")
 if not logger.handlers:
@@ -89,6 +92,90 @@ def purge_old_backups(backup_dir: str = BACKUP_DIR, max_age_days: int = RETENTIO
         logger.warning(f"Error purging old backups: {exc}")
 
 
+def _jellyfin_auth_header() -> str:
+    """Build a Jellyfin API auth header from the APEX_JELLYFIN_API_KEY secret (if present)."""
+    key = os.environ.get("APEX_JELLYFIN_API_KEY", "").strip().strip('"')
+    if not key:
+        return ""
+    return f'MediaBrowser Token="{key}"'
+
+
+def _jellyfin_request(method: str, path: str, auth: str, body=None, timeout: int = 15):
+    url = f"http://127.0.0.1:8096{path}"
+    headers = {"Content-Type": "application/json"}
+    if auth:
+        headers["Authorization"] = auth
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        try:
+            return resp.status, json.loads(raw.decode("utf-8"))
+        except Exception:
+            return resp.status, raw.decode("utf-8", "ignore")
+
+
+def ensure_jellyfin_libraries():
+    """Idempotently create Movies + TV Shows media libraries if they are missing.
+
+    Runs on a timer, so it also self-heals after `jellyfin/reset` or a fresh
+    storage volume. Requires APEX_JELLYFIN_API_KEY (admin token) to be set.
+    Returns True once all expected libraries exist.
+    """
+    auth = _jellyfin_auth_header()
+    if not auth:
+        logger.info("[JELLYFIN] APEX_JELLYFIN_API_KEY not set - skipping library bootstrap.")
+        return False
+
+    expected = {
+        "movies": "/data/jellyfin/media/Movies",
+        "tvshows": "/data/jellyfin/media/TV Shows",
+    }
+
+    try:
+        status, folders = _jellyfin_request("GET", "/Library/VirtualFolders", auth)
+    except urllib.error.HTTPError as exc:
+        logger.warning(f"[JELLYFIN] Library bootstrap check failed ({exc.code}); Jellyfin may still be booting.")
+        return False
+    except Exception as exc:
+        logger.warning(f"[JELLYFIN] Library bootstrap check error: {exc}")
+        return False
+
+    if status != 200 or not isinstance(folders, list):
+        logger.warning(f"[JELLYFIN] Library bootstrap unexpected response (status={status}).")
+        return False
+
+    existing = {f.get("Name"): f for f in folders if isinstance(f, dict) and f.get("Name")}
+    present = set(existing.keys())
+    all_present = True
+
+    for collection_type, lib_path in expected.items():
+        name = "Movies" if collection_type == "movies" else "TV Shows"
+        if name in present:
+            continue
+        all_present = False
+
+        # Path must exist on disk first, else Jellyfin will reject the location.
+        os.makedirs(lib_path, exist_ok=True)
+
+        params = {
+            "name": name,
+            "collectionType": collection_type,
+            "refreshLibrary": "true",
+            "paths": lib_path,
+        }
+        qs = "&".join(f"{k}={urllib.request.quote(str(v))}" for k, v in params.items())
+        try:
+            status, _ = _jellyfin_request("POST", f"/Library/VirtualFolders?{qs}", auth, body={})
+            logger.info(f"[JELLYFIN] Created '{name}' library at {lib_path} (status={status}).")
+        except urllib.error.HTTPError as exc:
+            logger.warning(f"[JELLYFIN] Could not create '{name}' library ({exc.code}): {exc.read().decode('utf-8', 'ignore')[:200]}")
+        except Exception as exc:
+            logger.warning(f"[JELLYFIN] Error creating '{name}' library: {exc}")
+
+    return all_present
+
+
 def run_health_check_cycle():
     logger.info("Starting health & database integrity diagnostic cycle...")
     
@@ -101,6 +188,7 @@ def run_health_check_cycle():
 
     check_disk_space()
     purge_old_backups()
+    ensure_jellyfin_libraries()
     try:
         from gateway.credentials_sync import sync_sqlite_credentials_to_vault
         sync_sqlite_credentials_to_vault("/root/.omniroute/storage.sqlite")
@@ -114,6 +202,17 @@ def main():
         return
 
     logger.info("Health Doctor daemon initialized. Running checks every 5 minutes...")
+
+    # Boot phase: ensure Jellyfin media libraries exist as soon as the server is up.
+    boot_deadline = time.time() + 180
+    while time.time() < boot_deadline:
+        try:
+            if ensure_jellyfin_libraries():
+                break
+        except Exception as exc:
+            logger.error(f"Error in boot library bootstrap: {exc}")
+        time.sleep(10)
+
     while True:
         try:
             run_health_check_cycle()

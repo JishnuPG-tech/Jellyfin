@@ -113,13 +113,15 @@ def media_file_name(message, media):
     return getattr(media, "file_name", None) or message.caption or f"Telegram_Media_{message.id}"
 
 
-def allowed_chat(chat_id) -> bool:
+def allowed_chat(chat) -> bool:
     if not RAW_CHANNEL_ID:
         return True
     allowed = [a.strip() for a in RAW_CHANNEL_ID.split(",") if a.strip()]
     if not allowed:
         return True
-    return str(chat_id) in allowed
+    if chat and chat.type == ChatType.PRIVATE:
+        return True
+    return str(chat.id) in allowed
 
 
 async def process_telegram_media(message, is_channel_post):
@@ -130,7 +132,8 @@ async def process_telegram_media(message, is_channel_post):
             return
         chat = message.chat
         chat_id = chat.id if chat else None
-        if chat_id is None or not allowed_chat(chat_id):
+        if chat_id is None or not allowed_chat(chat):
+            logger.info(f"[PYROGRAM] Skipped media from chat {chat_id} (type={getattr(chat, 'type', '?')}) - not in allowed list")
             return
 
         if is_channel_post:
@@ -494,7 +497,8 @@ async def start_pyrogram():
 
     logger.info("[PYROGRAM] Starting Pyrogram MTProto Client...")
     await tg_app.start()
-    logger.info("[PYROGRAM] Pyrogram Client started successfully!")
+    me = await tg_app.get_me()
+    logger.info(f"[PYROGRAM] Pyrogram Client started successfully! Bot: @{getattr(me, 'username', '?')} (id={getattr(me, 'id', '?')})")
 
 async def stop_pyrogram():
     if tg_app and tg_app.is_connected:
