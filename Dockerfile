@@ -7,10 +7,8 @@
 FROM golang:1.22-bookworm AS go-builder
 
 WORKDIR /app
-COPY apex_src/go.mod apex_src/go.sum* ./
-RUN go mod download 2>/dev/null || true
 COPY apex_src/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o apex-core ./cmd/apex
+RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o apex-core ./cmd/apex
 
 # ── Stage 2: Main Production Image ────────────────────────────────────────────
 FROM stirlingtools/stirling-pdf:latest

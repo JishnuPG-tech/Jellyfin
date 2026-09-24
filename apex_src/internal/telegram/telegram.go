@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +16,6 @@ import (
 	"apex/internal/db"
 
 	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 )
@@ -140,12 +140,14 @@ func (m *Manager) getTransferClient() *telegram.Client {
 }
 
 func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int64, limit int) ([]byte, error) {
+	docID, _ := strconv.ParseInt(item.FileID, 10, 64)
+
 	for attempt := 0; attempt < 3; attempt++ {
 		client := m.getTransferClient()
 		raw := client.API()
 
 		location := &tg.InputDocumentFileLocation{
-			ID:            item.AccessHash,
+			ID:            docID,
 			AccessHash:    item.AccessHash,
 			FileReference: item.FileRef,
 		}
@@ -202,9 +204,6 @@ func (m *Manager) refreshFileReference(ctx context.Context, item *db.MediaItem) 
 		ChannelID:  item.SourceChatID,
 		AccessHash: 0,
 	}
-
-	sender := message.NewSender(m.rawAPI)
-	_ = sender
 
 	messages, err := m.rawAPI.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
 		Channel: channel,
