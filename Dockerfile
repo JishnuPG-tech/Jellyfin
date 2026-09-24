@@ -59,6 +59,7 @@ ENV DATA_DIR="/data" \
     JELLYFIN_CONFIG_DIR="/data/jellyfin/config" \
     JELLYFIN_CACHE_DIR="/tmp/jellyfin-cache" \
     JELLYFIN_LOG_DIR="/data/jellyfin/log" \
+    JELLYFIN_DB_PATH="/data/jellyfin/data/data/jellyfin.db" \
     JELLYFIN_PORT="8096" \
     APEX_CORE_PORT="8084" \
     APEX_MEMORY_CACHE_MB="128" \
