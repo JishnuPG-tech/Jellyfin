@@ -11,6 +11,7 @@ from aiohttp import web
 
 # Pyrogram imports for MTProto direct chunk streaming
 from pyrogram import Client, filters
+from pyrogram.enums import ChatType
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, RPCError
 
@@ -169,11 +170,8 @@ if API_ID and API_HASH and BOT_TOKEN:
 if tg_app:
     @tg_app.on_message(filters.video | filters.document | filters.audio | filters.animation)
     async def on_media_message(client, message):
-        await process_telegram_media(message, False)
-
-    @tg_app.on_channel_post(filters.video | filters.document | filters.audio | filters.animation)
-    async def on_media_channel_post(client, message):
-        await process_telegram_media(message, True)
+        is_channel_post = bool(message.chat and message.chat.type == ChatType.CHANNEL)
+        await process_telegram_media(message, is_channel_post)
     logger.info("[PYROGRAM] Message & channel-post media handlers registered.")
 
 routes = web.RouteTableDef()
