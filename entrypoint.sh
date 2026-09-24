@@ -95,6 +95,8 @@ if os.path.exists(db_path):
     except Exception as e:
         print(f'[Apex] Account unlock check notice: {e}')
 " 2>/dev/null || true
+}
+
 ensure_jellyfin_api_key() {
     ${PYTHON_BIN} -c "
 import os, sqlite3, datetime
