@@ -20,6 +20,7 @@ import (
 	"apex/internal/jellyfin"
 	"apex/internal/metadata"
 	"apex/internal/parser"
+	"apex/internal/probe"
 	"apex/internal/streamer"
 	"apex/internal/telegram"
 
@@ -33,7 +34,7 @@ func main() {
 
 	cfg := config.Load()
 
-	// 1. Open live SQLite database
+	// 1. Open SQLite database
 	database, err := db.Open(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("[Apex] Fatal: Failed to initialize database: %v", err)
@@ -51,176 +52,78 @@ func main() {
 	jfWriter := jellyfin.NewWriter(cfg.JellyfinMedia)
 	jfClient := jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey)
 
-	// 4. Background Telegram Media Ingestion Handler
+	// Ingestion task queue (non-blocking decouple from Telegram event loop)
+	jobQueue := make(chan *telegram.IngestionTask, 100)
+
+	// Debounced Jellyfin Library Refresh Channel
+	refreshNotify := make(chan struct{}, 20)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	onNewMedia := func(ctx context.Context, doc *tg.Document, chatID int64, msgID int, caption string) {
-		// Extract filename
-		filename := fmt.Sprintf("media_%d.mp4", doc.ID)
-		for _, attr := range doc.Attributes {
-			if fileAttr, ok := attr.(*tg.DocumentAttributeFilename); ok {
-				filename = fileAttr.FileName
-				break
-			}
-		}
+	// Start Debounced Jellyfin Refresh Worker
+	go func() {
+		var debounceTimer *time.Timer
+		debounceDuration := 8 * time.Second
 
-		// Security: Validate allowed chat IDs if configured
-		if len(cfg.TelegramAllowedChats) > 0 {
-			allowed := false
-			for _, allowedID := range cfg.TelegramAllowedChats {
-				if allowedID == chatID || allowedID == -chatID || allowedID == (-1000000000000 - chatID) {
-					allowed = true
-					break
-				}
-			}
-			if !allowed {
-				log.Printf("[Apex] Ignored media from unauthorized chat ID: %d (Allowed: %v)", chatID, cfg.TelegramAllowedChats)
+		for {
+			select {
+			case <-ctx.Done():
 				return
+			case <-refreshNotify:
+				if debounceTimer != nil {
+					debounceTimer.Stop()
+				}
+				debounceTimer = time.AfterFunc(debounceDuration, func() {
+					log.Println("[Apex] Debounce window elapsed. Requesting Jellyfin library scan...")
+					if err := jfClient.RefreshLibrary(); err != nil {
+						log.Printf("[Apex] Jellyfin library refresh notice: %v", err)
+					} else {
+						log.Println("[Apex] Jellyfin library refresh triggered successfully.")
+					}
+				})
 			}
 		}
+	}()
 
-		log.Printf("[Apex] Ingesting media: %s (Chat: %d, Message: %d, Caption: %q)", filename, chatID, msgID, caption)
-
-		// Parse metadata
-		titleToParse := filename
-		if strings.TrimSpace(caption) != "" {
-			cleanFn := filepath.Base(filename)
-			if strings.HasPrefix(cleanFn, "media_") || strings.HasPrefix(cleanFn, "video_") || strings.HasPrefix(cleanFn, "file_") || len(cleanFn) < 8 {
-				titleToParse = caption
+	// Background Library Auto-provisioning: ensure default Movies and Shows libraries
+	go func() {
+		time.Sleep(12 * time.Second) // wait for Jellyfin to start listening
+		for i := 0; i < 5; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				jfClient.EnsureDefaultLibraries()
+				time.Sleep(30 * time.Second)
 			}
 		}
+	}()
 
-		parsed := parser.Parse(titleToParse)
-		if parsed.CleanTitle == "" {
-			parsed.CleanTitle = strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
-			if parsed.CleanTitle == "" {
-				parsed.CleanTitle = fmt.Sprintf("Media_%d", doc.ID)
-			}
-		}
-
-		// Generate stable opaque ID: apx_<sha256[:12]>
-		hasher := sha256.New()
-		hasher.Write([]byte(fmt.Sprintf("%d:%d:%d", chatID, msgID, doc.ID)))
-		opaqueID := fmt.Sprintf("apx_%s", hex.EncodeToString(hasher.Sum(nil))[:12])
-
-		// Query TMDB
-		var tmdbID int
-		var plot string
-		var rating float64
-		var posterPath, backdropPath string
-
-		tmdbMeta, err := tmdbClient.Search(parsed.CleanTitle, parsed.Year, parsed.MediaType)
-		if err == nil && tmdbMeta != nil {
-			tmdbID = tmdbMeta.ID
-			plot = tmdbMeta.Overview
-			rating = tmdbMeta.VoteAverage
-			posterPath = tmdbMeta.PosterPath
-			backdropPath = tmdbMeta.BackdropPath
-			if parsed.Year == 0 {
-				if parsed.MediaType == "series" && len(tmdbMeta.FirstAirDate) >= 4 {
-					parsed.Year, _ = strconv.Atoi(tmdbMeta.FirstAirDate[:4])
-				} else if len(tmdbMeta.ReleaseDate) >= 4 {
-					parsed.Year, _ = strconv.Atoi(tmdbMeta.ReleaseDate[:4])
+	// Start Ingestion Worker Pool (2 concurrent workers)
+	numWorkers := 2
+	for w := 1; w <= numWorkers; w++ {
+		go func(workerID int) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case task, ok := <-jobQueue:
+					if !ok {
+						return
+					}
+					processIngestionTask(ctx, workerID, task, cfg, database, tmdbClient, jfWriter, refreshNotify)
 				}
 			}
-			canonicalTitle := tmdbMeta.Title
-			if canonicalTitle == "" {
-				canonicalTitle = tmdbMeta.Name
-			}
-			if canonicalTitle != "" {
-				parsed.CleanTitle = canonicalTitle
-			}
-		}
-
-		// Structure filesystem layout
-		var relDir string
-		var strmRelPath string
-
-		if parsed.MediaType == "series" {
-			relDir = filepath.Join("Shows", parsed.CleanTitle, fmt.Sprintf("Season %02d", parsed.Season))
-			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s S%02dE%02d.strm", parsed.CleanTitle, parsed.Season, parsed.Episode))
-		} else {
-			if parsed.Year > 0 {
-				relDir = filepath.Join("Movies", fmt.Sprintf("%s (%d)", parsed.CleanTitle, parsed.Year))
-				strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s (%d).strm", parsed.CleanTitle, parsed.Year))
-			} else {
-				relDir = filepath.Join("Movies", parsed.CleanTitle)
-				strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s.strm", parsed.CleanTitle))
-			}
-		}
-
-		// Write .strm pointer
-		fullStrmPath, err := jfWriter.WriteSTRM(strmRelPath, opaqueID)
-		if err != nil {
-			log.Printf("[Apex] Error writing .strm: %v", err)
-			return
-		}
-
-		targetBase := filepath.Dir(fullStrmPath)
-
-		// Download artwork if available
-		if posterPath != "" {
-			_ = tmdbClient.DownloadImage(posterPath, filepath.Join(targetBase, "poster.jpg"))
-		}
-		if backdropPath != "" {
-			_ = tmdbClient.DownloadImage(backdropPath, filepath.Join(targetBase, "backdrop.jpg"))
-		}
-
-		// Write .nfo metadata
-		nfoContent := metadata.GenerateNFO(parsed.CleanTitle, plot, parsed.Year, rating, tmdbID, parsed.MediaType)
-		nfoPath := filepath.Join(targetBase, "movie.nfo")
-		if parsed.MediaType == "series" {
-			nfoPath = filepath.Join(targetBase, "tvshow.nfo")
-		}
-		_ = os.WriteFile(nfoPath, []byte(nfoContent), 0644)
-
-		// Persist in SQLite
-		item := &db.MediaItem{
-			ID:           opaqueID,
-			SourceChatID: chatID,
-			MessageID:    msgID,
-			FileID:       fmt.Sprintf("%d", doc.ID),
-			FileUniqueID: fmt.Sprintf("%d", doc.ID),
-			FileRef:      doc.FileReference,
-			AccessHash:   doc.AccessHash,
-			FileSize:     doc.Size,
-			MimeType:     doc.MimeType,
-			CleanTitle:   parsed.CleanTitle,
-			MediaType:    parsed.MediaType,
-			Year:         parsed.Year,
-			Season:       parsed.Season,
-			Episode:      parsed.Episode,
-			TMDBID:       tmdbID,
-			StrmPath:     fullStrmPath,
-		}
-
-		_ = database.SaveMediaItem(item)
-
-		// Direct Play Capability Profile
-		cap := &db.MediaCapability{
-			MediaID:        opaqueID,
-			Container:      filepath.Ext(filename),
-			DirectPlaySafe: true,
-		}
-		_ = database.SaveCapabilities(cap)
-
-		log.Printf("[Apex] Successfully cataloged: %s (ID: %s, STRM: %s)", parsed.CleanTitle, opaqueID, fullStrmPath)
-
-		// Trigger Jellyfin Library Refresh
-		if err := jfClient.RefreshLibrary(); err != nil {
-			log.Printf("[Apex] Notice: Jellyfin library refresh request: %v", err)
-		} else {
-			log.Printf("[Apex] Jellyfin library refresh triggered successfully.")
-		}
+		}(w)
 	}
 
-	// 5. Start Telegram Connection Manager
-	if err := tgManager.Start(ctx, onNewMedia); err != nil {
+	// 4. Start Telegram Connection Manager
+	if err := tgManager.Start(ctx, jobQueue); err != nil {
 		log.Printf("[Apex] Warning starting Telegram: %v", err)
 	}
 
-	// 6. HTTP Router
+	// 5. HTTP Router
 	mux := http.NewServeMux()
 	mux.Handle("/stream/", gateway)
 	mux.Handle("/vlc/", gateway)
@@ -242,7 +145,7 @@ func main() {
 		}
 	}()
 
-	// 7. Signal Handling
+	// 6. Signal Handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
@@ -255,4 +158,284 @@ func main() {
 	_ = server.Shutdown(shutdownCtx)
 
 	log.Println("[Apex] Shutdown complete.")
+}
+
+func processIngestionTask(
+	ctx context.Context,
+	workerID int,
+	task *telegram.IngestionTask,
+	cfg *config.Config,
+	database *db.Database,
+	tmdbClient *metadata.Client,
+	jfWriter *jellyfin.Writer,
+	refreshNotify chan<- struct{},
+) {
+	doc := task.Doc
+
+	// 1. Extract filename from document attributes
+	filename := fmt.Sprintf("media_%d.mp4", doc.ID)
+	for _, attr := range doc.Attributes {
+		if fileAttr, ok := attr.(*tg.DocumentAttributeFilename); ok {
+			filename = fileAttr.FileName
+			break
+		}
+	}
+
+	// 2. Validate allowed chat IDs if configured
+	if len(cfg.TelegramAllowedChats) > 0 {
+		allowed := false
+		for _, allowedID := range cfg.TelegramAllowedChats {
+			if allowedID == task.ChatID || allowedID == -task.ChatID || allowedID == (-1000000000000 - task.ChatID) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			log.Printf("[Worker #%d] Ignored media from unauthorized chat ID: %d", workerID, task.ChatID)
+			return
+		}
+	}
+
+	// 3. Generate stable opaque ID: apx_<sha256[:12]>
+	hasher := sha256.New()
+	hasher.Write([]byte(fmt.Sprintf("%d:%d:%d", task.ChatID, task.MsgID, doc.ID)))
+	opaqueID := fmt.Sprintf("apx_%s", hex.EncodeToString(hasher.Sum(nil))[:12])
+
+	// Record job status in DB
+	job := &db.ProcessingJob{
+		ID:        opaqueID,
+		ChatID:    task.ChatID,
+		MessageID: task.MsgID,
+		Filename:  filename,
+		Caption:   task.Caption,
+		Status:    "processing",
+	}
+	_ = database.SaveJob(job)
+
+	log.Printf("[Worker #%d] Processing media: %s (ID: %s, Size: %d MB)",
+		workerID, filename, opaqueID, doc.Size/(1024*1024))
+
+	// 4. Parse Title / Season / Episode
+	titleToParse := filename
+	if strings.TrimSpace(task.Caption) != "" {
+		cleanFn := filepath.Base(filename)
+		if strings.HasPrefix(cleanFn, "media_") || strings.HasPrefix(cleanFn, "video_") || strings.HasPrefix(cleanFn, "file_") || len(cleanFn) < 8 {
+			titleToParse = task.Caption
+		}
+	}
+
+	parsed := parser.Parse(titleToParse)
+	if parsed.CleanTitle == "" {
+		parsed.CleanTitle = strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+		if parsed.CleanTitle == "" {
+			parsed.CleanTitle = fmt.Sprintf("Media_%d", doc.ID)
+		}
+	}
+
+	// 5. Query TMDB Metadata
+	var tmdbID int
+	var plot string
+	var rating float64
+	var posterPath, backdropPath string
+	var stillPath, epAirDate string
+	var epTitle string
+
+	tmdbMeta, err := tmdbClient.Search(parsed.CleanTitle, parsed.Year, parsed.MediaType)
+	if err == nil && tmdbMeta != nil {
+		tmdbID = tmdbMeta.ID
+		plot = tmdbMeta.Overview
+		rating = tmdbMeta.VoteAverage
+		posterPath = tmdbMeta.PosterPath
+		backdropPath = tmdbMeta.BackdropPath
+		if parsed.Year == 0 {
+			if parsed.MediaType == "series" && len(tmdbMeta.FirstAirDate) >= 4 {
+				parsed.Year, _ = strconv.Atoi(tmdbMeta.FirstAirDate[:4])
+			} else if len(tmdbMeta.ReleaseDate) >= 4 {
+				parsed.Year, _ = strconv.Atoi(tmdbMeta.ReleaseDate[:4])
+			}
+		}
+		canonicalTitle := tmdbMeta.Title
+		if canonicalTitle == "" {
+			canonicalTitle = tmdbMeta.Name
+		}
+		if canonicalTitle != "" {
+			parsed.CleanTitle = canonicalTitle
+		}
+	}
+
+	// Series episode metadata
+	if parsed.MediaType == "series" && tmdbID > 0 {
+		if epMeta, err := tmdbClient.GetEpisodeDetails(tmdbID, parsed.Season, parsed.Episode); err == nil && epMeta != nil {
+			epTitle = epMeta.Name
+			if epMeta.Overview != "" {
+				plot = epMeta.Overview
+			}
+			if epMeta.VoteAverage > 0 {
+				rating = epMeta.VoteAverage
+			}
+			stillPath = epMeta.StillPath
+			epAirDate = epMeta.AirDate
+		}
+	}
+	if epTitle == "" {
+		epTitle = fmt.Sprintf("Episode %d", parsed.Episode)
+	}
+
+	// 6. Build Virtual Filesystem Layout
+	var relDir string
+	var strmRelPath string
+	var nfoPath string
+	var nfoContent string
+
+	if parsed.MediaType == "series" {
+		showDir := filepath.Join(cfg.JellyfinMedia, "Shows", parsed.CleanTitle)
+		seasonDir := filepath.Join(showDir, fmt.Sprintf("Season %02d", parsed.Season))
+		_ = os.MkdirAll(seasonDir, 0755)
+
+		relDir = filepath.Join("Shows", parsed.CleanTitle, fmt.Sprintf("Season %02d", parsed.Season))
+		strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s S%02dE%02d.strm", parsed.CleanTitle, parsed.Season, parsed.Episode))
+
+		// Show NFO & Artwork
+		showNfoPath := filepath.Join(showDir, "tvshow.nfo")
+		if _, err := os.Stat(showNfoPath); os.IsNotExist(err) {
+			_ = os.WriteFile(showNfoPath, []byte(metadata.GenerateShowNFO(parsed.CleanTitle, tmdbMeta.Overview, parsed.Year, rating, tmdbID)), 0644)
+		}
+		if posterPath != "" {
+			_ = tmdbClient.DownloadImage(posterPath, filepath.Join(showDir, "poster.jpg"))
+		}
+		if backdropPath != "" {
+			_ = tmdbClient.DownloadImage(backdropPath, filepath.Join(showDir, "backdrop.jpg"))
+		}
+
+		// Episode NFO & Still
+		nfoPath = filepath.Join(seasonDir, fmt.Sprintf("%s S%02dE%02d.nfo", parsed.CleanTitle, parsed.Season, parsed.Episode))
+		nfoContent = metadata.GenerateEpisodeNFO(epTitle, parsed.Season, parsed.Episode, plot, epAirDate, rating, tmdbID)
+		if stillPath != "" {
+			_ = tmdbClient.DownloadImage(stillPath, filepath.Join(seasonDir, fmt.Sprintf("%s S%02dE%02d-thumb.jpg", parsed.CleanTitle, parsed.Season, parsed.Episode)))
+		}
+	} else {
+		if parsed.Year > 0 {
+			relDir = filepath.Join("Movies", fmt.Sprintf("%s (%d)", parsed.CleanTitle, parsed.Year))
+			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s (%d).strm", parsed.CleanTitle, parsed.Year))
+		} else {
+			relDir = filepath.Join("Movies", parsed.CleanTitle)
+			strmRelPath = filepath.Join(relDir, fmt.Sprintf("%s.strm", parsed.CleanTitle))
+		}
+		movieDir := filepath.Join(cfg.JellyfinMedia, relDir)
+		_ = os.MkdirAll(movieDir, 0755)
+
+		// Movie NFO & Artwork
+		nfoPath = filepath.Join(movieDir, "movie.nfo")
+		nfoContent = metadata.GenerateMovieNFO(parsed.CleanTitle, plot, parsed.Year, rating, tmdbID)
+		if posterPath != "" {
+			_ = tmdbClient.DownloadImage(posterPath, filepath.Join(movieDir, "poster.jpg"))
+		}
+		if backdropPath != "" {
+			_ = tmdbClient.DownloadImage(backdropPath, filepath.Join(movieDir, "backdrop.jpg"))
+		}
+	}
+
+	// 7. Write .strm virtual file pointer
+	fullStrmPath, err := jfWriter.WriteSTRM(strmRelPath, opaqueID)
+	if err != nil {
+		log.Printf("[Worker #%d] Error writing .strm: %v", workerID, err)
+		job.Status = "failed"
+		job.Error = err.Error()
+		_ = database.SaveJob(job)
+		return
+	}
+
+	if nfoPath != "" && nfoContent != "" {
+		_ = os.WriteFile(nfoPath, []byte(nfoContent), 0644)
+	}
+
+	// 8. Persist Normalized Database Records
+	if parsed.MediaType == "series" {
+		seriesIDStr := fmt.Sprintf("series_%d", tmdbID)
+		if tmdbID == 0 {
+			seriesIDStr = fmt.Sprintf("series_%s", opaqueID)
+		}
+		seriesObj := &db.Series{
+			ID:           seriesIDStr,
+			Title:        parsed.CleanTitle,
+			Year:         parsed.Year,
+			TMDBID:       tmdbID,
+			Overview:     plot,
+			Rating:       rating,
+			PosterPath:   posterPath,
+			BackdropPath: backdropPath,
+		}
+		_ = database.SaveSeries(seriesObj)
+
+		epObj := &db.Episode{
+			ID:            fmt.Sprintf("ep_%s", opaqueID),
+			SeriesID:      seriesObj.ID,
+			SeasonID:      fmt.Sprintf("%s_s%02d", seriesObj.ID, parsed.Season),
+			SeasonNumber:  parsed.Season,
+			EpisodeNumber: parsed.Episode,
+			Title:         epTitle,
+			Overview:      plot,
+			AirDate:       epAirDate,
+			Rating:        rating,
+			StillPath:     stillPath,
+			StrmPath:      fullStrmPath,
+		}
+		_ = database.SaveEpisode(epObj)
+	} else {
+		movieObj := &db.Movie{
+			ID:           fmt.Sprintf("movie_%s", opaqueID),
+			Title:        parsed.CleanTitle,
+			Year:         parsed.Year,
+			TMDBID:       tmdbID,
+			Overview:     plot,
+			Rating:       rating,
+			PosterPath:   posterPath,
+			BackdropPath: backdropPath,
+			StrmPath:     fullStrmPath,
+		}
+		_ = database.SaveMovie(movieObj)
+	}
+
+	item := &db.MediaItem{
+		ID:           opaqueID,
+		SourceChatID: task.ChatID,
+		MessageID:    task.MsgID,
+		FileID:       fmt.Sprintf("%d", doc.ID),
+		FileUniqueID: fmt.Sprintf("%d", doc.ID),
+		FileRef:      doc.FileReference,
+		AccessHash:   doc.AccessHash,
+		FileSize:     doc.Size,
+		MimeType:     doc.MimeType,
+		CleanTitle:   parsed.CleanTitle,
+		MediaType:    parsed.MediaType,
+		Year:         parsed.Year,
+		Season:       parsed.Season,
+		Episode:      parsed.Episode,
+		TMDBID:       tmdbID,
+		StrmPath:     fullStrmPath,
+	}
+	_ = database.SaveMediaItem(item)
+
+	// 9. Media Capability Probe Analysis
+	streamURL := fmt.Sprintf("http://127.0.0.1:%s/stream/%s", cfg.ServerPort, opaqueID)
+	cap, probeErr := probe.Analyze(ctx, streamURL, opaqueID, filename)
+	if probeErr != nil {
+		log.Printf("[Worker #%d] Probe inspection note on %s: %v", workerID, opaqueID, probeErr)
+	}
+	if cap != nil {
+		_ = database.SaveCapabilities(cap)
+	}
+
+	// 10. Mark Job Completed
+	job.Status = "completed"
+	_ = database.SaveJob(job)
+
+	log.Printf("[Worker #%d] Successfully cataloged: %s (ID: %s, STRM: %s)",
+		workerID, parsed.CleanTitle, opaqueID, fullStrmPath)
+
+	// 11. Enqueue debounced Jellyfin refresh
+	select {
+	case refreshNotify <- struct{}{}:
+	default:
+	}
 }

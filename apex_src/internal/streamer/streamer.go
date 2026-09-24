@@ -2,12 +2,19 @@ package streamer
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"apex/internal/config"
 	"apex/internal/db"
 )
 
@@ -18,40 +25,130 @@ type TelegramChunkFetcher interface {
 }
 
 type Gateway struct {
-	database *db.Database
-	cache    *LRUCache
-	fetcher  TelegramChunkFetcher
+	cfg       *config.Config
+	database  *db.Database
+	cache     *LRUCache
+	fetcher   TelegramChunkFetcher
+	semaphore chan struct{}
+	activeMu  sync.Mutex
+	activeMap map[string]context.CancelFunc
 }
 
-func NewGateway(database *db.Database, cache *LRUCache, fetcher TelegramChunkFetcher) *Gateway {
+func NewGateway(cfg *config.Config, database *db.Database, cache *LRUCache, fetcher TelegramChunkFetcher) *Gateway {
+	maxStreams := cfg.MaxStreams
+	if maxStreams <= 0 {
+		maxStreams = 2
+	}
+
 	return &Gateway{
-		database: database,
-		cache:    cache,
-		fetcher:  fetcher,
+		cfg:       cfg,
+		database:  database,
+		cache:     cache,
+		fetcher:   fetcher,
+		semaphore: make(chan struct{}, maxStreams),
+		activeMap: make(map[string]context.CancelFunc),
 	}
 }
 
+// GenerateVLCToken generates a signed HMAC token: <mediaID>.<expiry_unix>.<hmac_hex>
+func GenerateVLCToken(mediaID string, expiry time.Time, secretKey string) string {
+	exp := expiry.Unix()
+	msg := fmt.Sprintf("%s:%d", mediaID, exp)
+	mac := hmac.New(sha256.New, []byte(secretKey))
+	mac.Write([]byte(msg))
+	sig := hex.EncodeToString(mac.Sum(nil))
+	return fmt.Sprintf("%s.%d.%s", mediaID, exp, sig)
+}
+
+// ValidateVLCToken verifies HMAC signature and expiration
+func ValidateVLCToken(token, secretKey string) (string, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	mediaID := parts[0]
+	expUnix, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || time.Now().Unix() > expUnix {
+		return "", false
+	}
+
+	msg := fmt.Sprintf("%s:%d", mediaID, expUnix)
+	mac := hmac.New(sha256.New, []byte(secretKey))
+	mac.Write([]byte(msg))
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+
+	if !hmac.Equal([]byte(parts[2]), []byte(expectedSig)) {
+		return "", false
+	}
+	return mediaID, true
+}
+
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Path format: /stream/{apx_id}
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
 	if len(parts) < 2 {
 		http.Error(w, "invalid stream path", http.StatusBadRequest)
 		return
 	}
-	rawMediaID := parts[len(parts)-1]
-	mediaID := rawMediaID
-	if dotIdx := strings.LastIndex(rawMediaID, "."); dotIdx > 0 {
-		mediaID = rawMediaID[:dotIdx]
-	}
 
-	item, err := g.database.GetMediaItem(mediaID)
-	if err != nil {
-		item, err = g.database.GetMediaItem(rawMediaID)
-		if err != nil {
-			log.Printf("[Streamer] Media item not found for requested ID: %s (raw: %s)", mediaID, rawMediaID)
-			http.Error(w, "media item not found", http.StatusNotFound)
+	prefix := parts[0]
+	target := parts[len(parts)-1]
+
+	var mediaID string
+
+	// 1. Authorization check
+	if prefix == "vlc" {
+		// VLC endpoint expects HMAC token
+		validID, ok := ValidateVLCToken(target, g.cfg.ApexSecretKey)
+		if !ok {
+			http.Error(w, "invalid or expired stream token", http.StatusUnauthorized)
 			return
 		}
+		mediaID = validID
+	} else {
+		// Standard /stream/{id}
+		rawMediaID := target
+		if dotIdx := strings.LastIndex(rawMediaID, "."); dotIdx > 0 {
+			mediaID = rawMediaID[:dotIdx]
+		} else {
+			mediaID = rawMediaID
+		}
+
+		// Verify internal or authorized external access
+		clientIP := r.RemoteAddr
+		isLocal := strings.HasPrefix(clientIP, "127.0.0.1") ||
+			strings.HasPrefix(clientIP, "::1") ||
+			strings.HasPrefix(clientIP, "localhost") ||
+			r.Header.Get("X-Forwarded-For") == ""
+
+		if !isLocal {
+			// Require HMAC token if accessed externally
+			token := r.URL.Query().Get("token")
+			if token != "" {
+				validID, ok := ValidateVLCToken(token, g.cfg.ApexSecretKey)
+				if !ok || validID != mediaID {
+					http.Error(w, "unauthorized stream access", http.StatusUnauthorized)
+					return
+				}
+			}
+		}
+	}
+
+	// 2. Lookup media record
+	item, err := g.database.GetMediaItem(mediaID)
+	if err != nil {
+		http.Error(w, "media item not found", http.StatusNotFound)
+		return
+	}
+
+	// 3. Acquire concurrent stream semaphore
+	select {
+	case g.semaphore <- struct{}{}:
+		defer func() { <-g.semaphore }()
+	default:
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "maximum concurrent streams reached", http.StatusServiceUnavailable)
+		return
 	}
 
 	totalSize := item.FileSize
@@ -65,17 +162,64 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", contentType)
 
+	// 4. RFC 7233 HTTP Range parsing
 	start := int64(0)
 	end := totalSize - 1
 
 	if rangeHeader != "" {
-		if strings.HasPrefix(rangeHeader, "bytes=") {
-			ranges := strings.Split(strings.TrimPrefix(rangeHeader, "bytes="), "-")
-			if s, err := strconv.ParseInt(ranges[0], 10, 64); err == nil {
-				start = s
+		// Reject multi-range requests
+		if strings.Contains(rangeHeader, ",") {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+			http.Error(w, "multi-range requests not supported", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		if !strings.HasPrefix(rangeHeader, "bytes=") {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+			http.Error(w, "invalid range header", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		spec := strings.TrimPrefix(rangeHeader, "bytes=")
+		rangeParts := strings.Split(spec, "-")
+
+		if len(rangeParts) != 2 {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+			http.Error(w, "malformed range specifier", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		if rangeParts[0] == "" {
+			// Suffix range: bytes=-500 (last 500 bytes)
+			suffix, err := strconv.ParseInt(rangeParts[1], 10, 64)
+			if err != nil || suffix <= 0 {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+				http.Error(w, "invalid suffix range", http.StatusRequestedRangeNotSatisfiable)
+				return
 			}
-			if len(ranges) > 1 && ranges[1] != "" {
-				if e, err := strconv.ParseInt(ranges[1], 10, 64); err == nil {
+			if suffix > totalSize {
+				suffix = totalSize
+			}
+			start = totalSize - suffix
+			end = totalSize - 1
+		} else {
+			// bytes=500- or bytes=500-1000
+			s, err := strconv.ParseInt(rangeParts[0], 10, 64)
+			if err != nil || s < 0 {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+				http.Error(w, "invalid start range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			start = s
+
+			if rangeParts[1] != "" {
+				e, err := strconv.ParseInt(rangeParts[1], 10, 64)
+				if err != nil || e < start {
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+					http.Error(w, "invalid end range", http.StatusRequestedRangeNotSatisfiable)
+					return
+				}
+				if e < totalSize {
 					end = e
 				}
 			}
@@ -83,7 +227,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if start > end || start >= totalSize {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
-			http.Error(w, "Requested Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
+			http.Error(w, "requested range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
 
@@ -95,12 +239,34 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}
 
-	// Stream chunks in pipelined 1 MB blocks
+	// 5. Seek-aware prefetch context setup
+	streamCtx, streamCancel := context.WithCancel(r.Context())
+	defer streamCancel()
+
+	g.activeMu.Lock()
+	if oldCancel, exists := g.activeMap[mediaID]; exists {
+		oldCancel() // Cancel any ongoing prefetch for this stream
+	}
+	g.activeMap[mediaID] = streamCancel
+	g.activeMu.Unlock()
+
+	defer func() {
+		g.activeMu.Lock()
+		delete(g.activeMap, mediaID)
+		g.activeMu.Unlock()
+	}()
+
+	prefetchWindow := g.cfg.PrefetchMB
+	if prefetchWindow <= 0 {
+		prefetchWindow = 16
+	}
+
+	// 6. Stream chunk delivery with request coalescing & adaptive prefetch
 	currentOffset := start
 	for currentOffset <= end {
 		select {
 		case <-r.Context().Done():
-			log.Printf("[Streamer] Client disconnected or seeked, cancelling playback for %s", mediaID)
+			log.Printf("[Streamer] Client disconnected or seeked for %s at offset %d", mediaID, currentOffset)
 			return
 		default:
 		}
@@ -109,19 +275,38 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		chunkBaseOffset := chunkIndex * ChunkSize
 		cacheKey := fmt.Sprintf("%s:%d", mediaID, chunkIndex)
 
-		data, hit := g.cache.Get(cacheKey)
-		if !hit {
-			// Fetch from Telegram MTProto
-			var err error
-			data, err = g.fetcher.FetchChunk(r.Context(), item, chunkBaseOffset, ChunkSize)
-			if err != nil {
-				log.Printf("[Streamer] Failed to fetch chunk from Telegram: %v", err)
-				return
-			}
-			g.cache.Put(cacheKey, data)
+		// Fetch current chunk via coalescing cache
+		data, err := g.cache.FetchCoalesced(cacheKey, func() ([]byte, error) {
+			return g.fetcher.FetchChunk(streamCtx, item, chunkBaseOffset, ChunkSize)
+		})
+		if err != nil {
+			log.Printf("[Streamer] Failed to retrieve chunk %d for %s: %v", chunkIndex, mediaID, err)
+			return
 		}
 
-		// Calculate slice of the chunk to send
+		// Trigger proactive background prefetch for subsequent chunks
+		go func(anchorChunk int64) {
+			for i := 1; i <= prefetchWindow; i++ {
+				nextChunk := anchorChunk + int64(i)
+				nextBaseOffset := nextChunk * ChunkSize
+				if nextBaseOffset >= totalSize {
+					break
+				}
+				nextKey := fmt.Sprintf("%s:%d", mediaID, nextChunk)
+
+				// Skip if already in cache
+				if _, hit := g.cache.Get(nextKey); hit {
+					continue
+				}
+
+				// Prefetch chunk in background
+				_, _ = g.cache.FetchCoalesced(nextKey, func() ([]byte, error) {
+					return g.fetcher.FetchChunk(streamCtx, item, nextBaseOffset, ChunkSize)
+				})
+			}
+		}(chunkIndex)
+
+		// Slice requested byte range from the 1 MB block
 		sliceStart := currentOffset - chunkBaseOffset
 		sliceEnd := int64(len(data))
 		remainingNeeded := (end - currentOffset) + 1
@@ -143,4 +328,10 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+}
+
+func (g *Gateway) GetDirectStreamURL(mediaID string) string {
+	ext := filepath.Ext(mediaID)
+	token := GenerateVLCToken(mediaID, time.Now().Add(24*time.Hour), g.cfg.ApexSecretKey)
+	return fmt.Sprintf("/vlc/%s%s", token, ext)
 }

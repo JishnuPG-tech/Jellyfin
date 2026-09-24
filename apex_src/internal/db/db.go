@@ -25,6 +25,57 @@ type TelegramSource struct {
 	UpdatedAt     time.Time
 }
 
+type Movie struct {
+	ID            string
+	Title         string
+	OriginalTitle string
+	Year          int
+	TMDBID        int
+	Overview      string
+	Rating        float64
+	PosterPath    string
+	BackdropPath  string
+	StrmPath      string
+	CreatedAt     time.Time
+}
+
+type Series struct {
+	ID            string
+	Title         string
+	OriginalTitle string
+	Year          int
+	TMDBID        int
+	Overview      string
+	Rating        float64
+	PosterPath    string
+	BackdropPath  string
+	CreatedAt     time.Time
+}
+
+type Season struct {
+	ID           string
+	SeriesID     string
+	SeasonNumber int
+	Title        string
+	Overview     string
+	PosterPath   string
+}
+
+type Episode struct {
+	ID            string
+	SeriesID      string
+	SeasonID      string
+	SeasonNumber  int
+	EpisodeNumber int
+	Title         string
+	Overview      string
+	AirDate       string
+	Rating        float64
+	StillPath     string
+	StrmPath      string
+	CreatedAt     time.Time
+}
+
 type MediaItem struct {
 	ID           string
 	SourceChatID int64
@@ -36,7 +87,7 @@ type MediaItem struct {
 	FileSize     int64
 	MimeType     string
 	CleanTitle   string
-	MediaType    string
+	MediaType    string // "movie" or "series"
 	Year         int
 	Season       int
 	Episode      int
@@ -46,21 +97,33 @@ type MediaItem struct {
 }
 
 type MediaCapability struct {
-	MediaID          string
-	Container        string
-	VideoCodec       string
-	VideoProfile     string
-	Width            int
-	Height           int
-	FPS              float64
-	BitDepth         int
-	HDR              string
-	AudioCodec       string
-	AudioChannels    int
-	SubtitleTypes    string
-	Bitrate          int
-	DirectPlaySafe   bool
-	TranscodeReason  string
+	MediaID         string
+	Container       string
+	VideoCodec      string
+	VideoProfile    string
+	Width           int
+	Height          int
+	FPS             float64
+	BitDepth        int
+	HDR             string
+	AudioCodec      string
+	AudioChannels   int
+	SubtitleTypes   string
+	Bitrate         int
+	DirectPlaySafe  bool
+	TranscodeReason string
+}
+
+type ProcessingJob struct {
+	ID        string
+	ChatID    int64
+	MessageID int
+	Filename  string
+	Caption   string
+	Status    string // "queued", "processing", "completed", "failed"
+	Error     string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 func Open(dbPath string) (*Database, error) {
@@ -97,6 +160,62 @@ func (d *Database) migrate() error {
 		last_message_id INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS movies (
+		id TEXT PRIMARY KEY,
+		title TEXT NOT NULL,
+		original_title TEXT,
+		year INTEGER,
+		tmdb_id INTEGER,
+		overview TEXT,
+		rating REAL,
+		poster_path TEXT,
+		backdrop_path TEXT,
+		strm_path TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS series (
+		id TEXT PRIMARY KEY,
+		title TEXT NOT NULL,
+		original_title TEXT,
+		year INTEGER,
+		tmdb_id INTEGER,
+		overview TEXT,
+		rating REAL,
+		poster_path TEXT,
+		backdrop_path TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS seasons (
+		id TEXT PRIMARY KEY,
+		series_id TEXT NOT NULL,
+		season_number INTEGER NOT NULL,
+		title TEXT,
+		overview TEXT,
+		poster_path TEXT,
+		FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE,
+		UNIQUE(series_id, season_number)
+	);
+
+	CREATE TABLE IF NOT EXISTS episodes (
+		id TEXT PRIMARY KEY,
+		series_id TEXT NOT NULL,
+		season_id TEXT NOT NULL,
+		season_number INTEGER NOT NULL,
+		episode_number INTEGER NOT NULL,
+		title TEXT,
+		overview TEXT,
+		air_date TEXT,
+		rating REAL,
+		still_path TEXT,
+		strm_path TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE,
+		FOREIGN KEY (season_id) REFERENCES seasons(id) ON DELETE CASCADE,
+		UNIQUE(series_id, season_number, episode_number)
 	);
 
 	CREATE TABLE IF NOT EXISTS media_items (
@@ -139,36 +258,66 @@ func (d *Database) migrate() error {
 		transcode_reason TEXT,
 		FOREIGN KEY (media_id) REFERENCES media_items(id) ON DELETE CASCADE
 	);
+
+	CREATE TABLE IF NOT EXISTS processing_jobs (
+		id TEXT PRIMARY KEY,
+		chat_id INTEGER NOT NULL,
+		message_id INTEGER NOT NULL,
+		filename TEXT NOT NULL,
+		caption TEXT,
+		status TEXT NOT NULL,
+		error TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 	_, err := d.conn.Exec(query)
 	return err
 }
 
-func (d *Database) SaveSource(src *TelegramSource) error {
+func (d *Database) SaveMovie(m *Movie) error {
 	query := `
-	INSERT INTO telegram_sources (id, chat_id, title, category, enabled, last_message_id, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-	ON CONFLICT(chat_id) DO UPDATE SET
+	INSERT INTO movies (id, title, original_title, year, tmdb_id, overview, rating, poster_path, backdrop_path, strm_path)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET
 		title=excluded.title,
-		category=excluded.category,
-		enabled=excluded.enabled,
-		last_message_id=excluded.last_message_id,
-		updated_at=CURRENT_TIMESTAMP;
+		overview=excluded.overview,
+		rating=excluded.rating,
+		poster_path=excluded.poster_path,
+		backdrop_path=excluded.backdrop_path;
 	`
-	_, err := d.conn.Exec(query, src.ID, src.ChatID, src.Title, src.Category, src.Enabled, src.LastMessageID)
+	_, err := d.conn.Exec(query, m.ID, m.Title, m.OriginalTitle, m.Year, m.TMDBID, m.Overview, m.Rating, m.PosterPath, m.BackdropPath, m.StrmPath)
 	return err
 }
 
-func (d *Database) GetSourceByChatID(chatID int64) (*TelegramSource, error) {
-	query := `SELECT id, chat_id, title, category, enabled, last_message_id, created_at, updated_at FROM telegram_sources WHERE chat_id = ?`
-	row := d.conn.QueryRow(query, chatID)
+func (d *Database) SaveSeries(s *Series) error {
+	query := `
+	INSERT INTO series (id, title, original_title, year, tmdb_id, overview, rating, poster_path, backdrop_path)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET
+		title=excluded.title,
+		overview=excluded.overview,
+		rating=excluded.rating,
+		poster_path=excluded.poster_path,
+		backdrop_path=excluded.backdrop_path;
+	`
+	_, err := d.conn.Exec(query, s.ID, s.Title, s.OriginalTitle, s.Year, s.TMDBID, s.Overview, s.Rating, s.PosterPath, s.BackdropPath)
+	return err
+}
 
-	var s TelegramSource
-	err := row.Scan(&s.ID, &s.ChatID, &s.Title, &s.Category, &s.Enabled, &s.LastMessageID, &s.CreatedAt, &s.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return &s, nil
+func (d *Database) SaveEpisode(ep *Episode) error {
+	query := `
+	INSERT INTO episodes (id, series_id, season_id, season_number, episode_number, title, overview, air_date, rating, still_path, strm_path)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(series_id, season_number, episode_number) DO UPDATE SET
+		title=excluded.title,
+		overview=excluded.overview,
+		rating=excluded.rating,
+		still_path=excluded.still_path,
+		strm_path=excluded.strm_path;
+	`
+	_, err := d.conn.Exec(query, ep.ID, ep.SeriesID, ep.SeasonID, ep.SeasonNumber, ep.EpisodeNumber, ep.Title, ep.Overview, ep.AirDate, ep.Rating, ep.StillPath, ep.StrmPath)
+	return err
 }
 
 func (d *Database) SaveMediaItem(item *MediaItem) error {
@@ -229,6 +378,16 @@ func (d *Database) SaveCapabilities(cap *MediaCapability) error {
 	ON CONFLICT(media_id) DO UPDATE SET
 		container=excluded.container,
 		video_codec=excluded.video_codec,
+		video_profile=excluded.video_profile,
+		width=excluded.width,
+		height=excluded.height,
+		fps=excluded.fps,
+		bit_depth=excluded.bit_depth,
+		hdr=excluded.hdr,
+		audio_codec=excluded.audio_codec,
+		audio_channels=excluded.audio_channels,
+		subtitle_types=excluded.subtitle_types,
+		bitrate=excluded.bitrate,
 		direct_play_safe=excluded.direct_play_safe,
 		transcode_reason=excluded.transcode_reason;
 	`
@@ -237,5 +396,18 @@ func (d *Database) SaveCapabilities(cap *MediaCapability) error {
 		cap.FPS, cap.BitDepth, cap.HDR, cap.AudioCodec, cap.AudioChannels, cap.SubtitleTypes,
 		cap.Bitrate, cap.DirectPlaySafe, cap.TranscodeReason,
 	)
+	return err
+}
+
+func (d *Database) SaveJob(job *ProcessingJob) error {
+	query := `
+	INSERT INTO processing_jobs (id, chat_id, message_id, filename, caption, status, error, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(id) DO UPDATE SET
+		status=excluded.status,
+		error=excluded.error,
+		updated_at=CURRENT_TIMESTAMP;
+	`
+	_, err := d.conn.Exec(query, job.ID, job.ChatID, job.MessageID, job.Filename, job.Caption, job.Status, job.Error)
 	return err
 }

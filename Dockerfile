@@ -1,72 +1,43 @@
 # ==============================================================================
-# Apex Media Platform - Production Multi-Stage Dockerfile (v2.1)
-# Architecture: Caddy Gateway + Jellyfin + Apex Go Core + Stirling-PDF + Enhancer
+# Apex Media Platform - Production Dockerfile (v2.0 Architecture)
+# Stack: Jellyfin 10.9.11 + Apex Go Core + Nginx Gateway (Port 7860)
 # ==============================================================================
 
-# ── Stage 1: Build Apex Go Core ────────────────────────────────────────────────
+# ── Stage 1: Build Apex Go Core Daemon ─────────────────────────────────────────
 FROM golang:1.22-bookworm AS go-builder
 
 WORKDIR /app
 COPY apex_src/ ./
 RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o apex-core ./cmd/apex
 
-# ── Stage 2: Clean Caddy Gateway Binary ────────────────────────────────────────
-FROM caddy:2-alpine AS caddy-source
-
-# ── Stage 3: Clean Static FFmpeg & FFprobe ─────────────────────────────────────
-FROM mwader/static-ffmpeg:7.1 AS ffmpeg-source
-
-# ── Stage 4: Official Jellyfin Runtime & Media Tools ───────────────────────────
-FROM jellyfin/jellyfin:latest AS jellyfin-source
-
-# ── Stage 5: Main Production Image ────────────────────────────────────────────
-FROM stirlingtools/stirling-pdf:latest
+# ── Stage 2: Main Production Image (Pinned Jellyfin LTS) ──────────────────────
+FROM jellyfin/jellyfin:10.9.11
 
 USER root
 
-# 1. Install Caddy Gateway (Zero apt dependencies)
-COPY --from=caddy-source /usr/bin/caddy /usr/local/bin/caddy
-RUN chmod +x /usr/local/bin/caddy
+# Install Nginx, curl, and CA certificates
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        nginx \
+        curl \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# 2. Install FFmpeg & FFprobe Static Binaries (Zero dynamic library dependencies)
-COPY --from=ffmpeg-source /ffmpeg /usr/local/bin/ffmpeg
-COPY --from=ffmpeg-source /ffprobe /usr/local/bin/ffprobe
-RUN chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
-    mkdir -p /usr/lib/jellyfin-ffmpeg && \
-    ln -sf /usr/local/bin/ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg && \
-    ln -sf /usr/local/bin/ffprobe /usr/lib/jellyfin-ffmpeg/ffprobe
-
-# 3. Install Official Jellyfin Media Server & Jellyfin Web Client
-COPY --from=jellyfin-source /jellyfin /opt/jellyfin
-RUN ln -sf /opt/jellyfin/jellyfin /usr/local/bin/jellyfin
-
-# 4. Install Apex Go Core Binary (Zero apt dependencies)
+# Install Apex Core Go binary
 RUN mkdir -p /opt/apex
 COPY --from=go-builder /app/apex-core /opt/apex/apex-core
 RUN chmod +x /opt/apex/apex-core
 
-# 5. Set up Python environment for PDF Enhancer (FastAPI + React)
-RUN pip install --no-cache-dir --break-system-packages \
-        httpx fastapi uvicorn python-multipart pydantic pymupdf opencv-python-headless numpy pillow 2>/dev/null || \
-    python3 -m pip install --no-cache-dir --break-system-packages \
-        httpx fastapi uvicorn python-multipart pydantic pymupdf opencv-python-headless numpy pillow 2>/dev/null || true
+# Symlink Jellyfin binary to standard PATH if needed
+RUN ln -sf /jellyfin/jellyfin /usr/local/bin/jellyfin 2>/dev/null || true
 
-# 6. Install Services and Gateway Configuration
-RUN mkdir -p /opt/pdf_enhancer /srv/portal /etc/caddy
-COPY pdf_enhancer/ /opt/pdf_enhancer/
-COPY portal/ /srv/portal/
-COPY Caddyfile /etc/caddy/Caddyfile
+# Install Nginx Gateway configuration & Entrypoint
+COPY nginx.conf /etc/nginx/nginx.conf
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# 7. Pre-create required directory layout
-RUN mkdir -p /data/Stirling/configs \
-             /data/Stirling/logs \
-             /data/Stirling/customFiles \
-             /data/Stirling/pipeline \
-             /data/Stirling/storage \
-             /data/Stirling/tessdata \
-             /data/jellyfin/data \
+# Pre-create standard storage directories
+RUN mkdir -p /data/jellyfin/data \
              /data/jellyfin/config \
              /data/jellyfin/backups \
              /data/jellyfin/log \
@@ -76,39 +47,24 @@ RUN mkdir -p /data/Stirling/configs \
              /data/apex/backups \
              /data/apex/session \
              /data/apex/metadata-cache \
-             /tmp/stirling-pdf \
              /tmp/jellyfin-cache \
-             /tmp/caddy/data \
-             /tmp/caddy/config \
              /tmp/apex-db \
              /tmp/apex-stream-cache
 
 # Environment Configuration
-ENV PORT="8080" \
-    DATA_DIR="/data" \
+ENV DATA_DIR="/data" \
     DOTNET_CLI_HOME="/data/jellyfin" \
     JELLYFIN_DATA_DIR="/data/jellyfin/data" \
     JELLYFIN_CONFIG_DIR="/data/jellyfin/config" \
     JELLYFIN_CACHE_DIR="/tmp/jellyfin-cache" \
     JELLYFIN_LOG_DIR="/data/jellyfin/log" \
-    SYSTEM_ROOTURIPATH="/stirling" \
-    STIRLING_BASE_PATH="/data/Stirling/" \
-    CONFIG_FILE="/data/Stirling/configs/settings.yml" \
-    STORAGE_LOCAL_BASEPATH="/data/Stirling/storage" \
-    STIRLING_TEMPFILES_DIRECTORY="/tmp/stirling-pdf" \
-    ENHANCER_PORT="8082" \
-    APEX_CORE_PORT="8084" \
     JELLYFIN_PORT="8096" \
+    APEX_CORE_PORT="8084" \
     APEX_MEMORY_CACHE_MB="128" \
     APEX_DISK_CACHE_MB="2048" \
     APEX_PREFETCH_MB="16" \
     APEX_MAX_STREAMS="2" \
-    APEX_TELEGRAM_MEDIA_CLIENTS="2" \
-    MAX_VIDEO_TRANSCODES="0" \
-    MAX_AUDIO_TRANSCODES="1" \
-    XDG_DATA_HOME="/tmp/caddy/data" \
-    XDG_CONFIG_HOME="/tmp/caddy/config" \
-    JAVA_TOOL_OPTIONS="-Dstirling.base-path=/data/Stirling/ -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/data/Stirling/configs/heap_dumps -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Dspring.threads.virtual.enabled=true -Djava.awt.headless=true -XX:InitialRAMPercentage=10 -XX:MaxRAMPercentage=40 -XX:MaxMetaspaceSize=384m"
+    APEX_TELEGRAM_MEDIA_CLIENTS="2"
 
 # Hugging Face default ingress port
 EXPOSE 7860

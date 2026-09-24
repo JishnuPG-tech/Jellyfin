@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"apex/internal/config"
@@ -20,13 +21,28 @@ import (
 	"github.com/gotd/td/tgerr"
 )
 
+type IngestionTask struct {
+	Doc     *tg.Document
+	ChatID  int64
+	MsgID   int
+	Caption string
+}
+
+type TransferWorker struct {
+	client            *telegram.Client
+	idx               int
+	activeReqs        int64
+	consecutiveErrors int
+	floodWaitUntil    time.Time
+	healthy           bool
+}
+
 type Manager struct {
 	cfg          *config.Config
 	database     *db.Database
 	updateClient *telegram.Client
-	transferPool []*telegram.Client
-	poolIndex    int
-	poolMu       sync.Mutex
+	transferPool []*TransferWorker
+	poolMu       sync.RWMutex
 	rawAPI       *tg.Client
 }
 
@@ -46,7 +62,7 @@ func isVideoExtension(filename string) bool {
 	return false
 }
 
-func (m *Manager) sendReply(peer tg.InputPeerClass, text string) {
+func (m *Manager) SendReply(peer tg.InputPeerClass, text string) {
 	if peer == nil || m.rawAPI == nil {
 		return
 	}
@@ -64,7 +80,7 @@ func (m *Manager) sendReply(peer tg.InputPeerClass, text string) {
 	}()
 }
 
-func (m *Manager) Start(ctx context.Context, onNewMedia func(ctx context.Context, doc *tg.Document, chatID int64, msgID int, caption string)) error {
+func (m *Manager) Start(ctx context.Context, jobQueue chan<- *IngestionTask) error {
 	if m.cfg.TelegramAPIID == 0 || m.cfg.TelegramAPIHash == "" || m.cfg.TelegramBotToken == "" {
 		log.Printf("[Telegram] Warning: Telegram credentials not fully configured. Ingestion disabled.")
 		return nil
@@ -104,32 +120,29 @@ func (m *Manager) Start(ctx context.Context, onNewMedia func(ctx context.Context
 			}
 		}
 
-		// Check if message is purely text without media
+		// Text commands without media
 		if msg.Media == nil {
 			text := strings.TrimSpace(msg.Message)
 			if text != "" {
 				log.Printf("[Telegram] Received text message #%d from %s: %s", msg.ID, peerDesc, text)
 				if strings.HasPrefix(text, "/start") || strings.HasPrefix(text, "/help") {
-					m.sendReply(inputPeer, "🎬 Apex Cloud Platform\n\nSend or forward any movie or TV series video file here.\nIt will be cataloged instantly and made available to stream on Jellyfin!")
+					m.SendReply(inputPeer, "🎬 Apex Media Platform\n\nSend or forward any movie or TV show video file here.\nIt will be queued, cataloged, and made available on Jellyfin instantly!")
 				}
 			}
 			return nil
 		}
 
-		// Inspect media for documents or videos
+		// Inspect media
 		docMedia, ok := msg.Media.(*tg.MessageMediaDocument)
 		if !ok {
-			log.Printf("[Telegram] Message #%d from %s has non-document media (%T)", msg.ID, peerDesc, msg.Media)
 			return nil
 		}
 
 		doc, ok := docMedia.Document.(*tg.Document)
 		if !ok {
-			log.Printf("[Telegram] Message #%d from %s has empty document", msg.ID, peerDesc)
 			return nil
 		}
 
-		// Extract filename & video flag
 		var filename string
 		var isVideo bool
 		for _, attr := range doc.Attributes {
@@ -154,21 +167,26 @@ func (m *Manager) Start(ctx context.Context, onNewMedia func(ctx context.Context
 		}
 
 		if strings.HasPrefix(doc.MimeType, "video/") || isVideo || isVideoExtension(filename) {
-			log.Printf("[Telegram] Ingesting video media: '%s' (size: %d MB, mime: %s) from %s msg #%d",
-				filename, doc.Size/(1024*1024), doc.MimeType, peerDesc, msg.ID)
+			log.Printf("[Telegram] Queuing video media: '%s' (size: %d MB) from %s msg #%d",
+				filename, doc.Size/(1024*1024), peerDesc, msg.ID)
 
-			m.sendReply(inputPeer, fmt.Sprintf("📥 Ingesting '%s'...\nAdding to your Jellyfin library.", filename))
+			m.SendReply(inputPeer, fmt.Sprintf("📥 Queued '%s' for ingestion...\nProcessing and adding to Jellyfin.", filename))
 
-			onNewMedia(ctx, doc, chatID, msg.ID, caption)
-		} else {
-			log.Printf("[Telegram] Ignored non-video document: '%s' (mime: %s) from %s msg #%d",
-				filename, doc.MimeType, peerDesc, msg.ID)
+			// Non-blocking enqueue to ingestion job worker queue
+			select {
+			case jobQueue <- &IngestionTask{
+				Doc:     doc,
+				ChatID:  chatID,
+				MsgID:   msg.ID,
+				Caption: caption,
+			}:
+			default:
+				log.Printf("[Telegram] Warning: Ingestion job queue full. Dropping task for %s", filename)
+			}
 		}
-
 		return nil
 	}
 
-	// Register update handlers for all message arrival vectors
 	dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
 		return processMessage(ctx, e, u.Message)
 	})
@@ -205,7 +223,7 @@ func (m *Manager) Start(ctx context.Context, onNewMedia func(ctx context.Context
 			}
 
 			m.rawAPI = m.updateClient.API()
-			log.Printf("[Telegram] Persistent MTProto update connection established.")
+			log.Printf("[Telegram] Dedicated MTProto update & metadata connection established.")
 			<-ctx.Done()
 			return nil
 		})
@@ -214,54 +232,89 @@ func (m *Manager) Start(ctx context.Context, onNewMedia func(ctx context.Context
 		}
 	}()
 
-	// Initialize Media Transfer Pool (Default: 2 clients)
+	// Initialize Adaptive Media Transfer Pool
 	numClients := m.cfg.MediaClients
 	if numClients <= 0 {
 		numClients = 2
 	}
 
-	log.Printf("[Telegram] Initializing %d dedicated media transfer connections...", numClients)
+	log.Printf("[Telegram] Initializing %d dedicated media transfer workers...", numClients)
 	for i := 0; i < numClients; i++ {
 		c := telegram.NewClient(m.cfg.TelegramAPIID, m.cfg.TelegramAPIHash, telegram.Options{})
-		m.transferPool = append(m.transferPool, c)
-		clientIdx := i
-		go func(client *telegram.Client, idx int) {
-			err := client.Run(ctx, func(ctx context.Context) error {
-				_, authErr := client.Auth().Bot(ctx, m.cfg.TelegramBotToken)
+		worker := &TransferWorker{
+			client:  c,
+			idx:     i + 1,
+			healthy: true,
+		}
+		m.transferPool = append(m.transferPool, worker)
+
+		go func(w *TransferWorker) {
+			err := w.client.Run(ctx, func(ctx context.Context) error {
+				_, authErr := w.client.Auth().Bot(ctx, m.cfg.TelegramBotToken)
 				if authErr != nil {
-					log.Printf("[Telegram] Media transfer connection #%d auth error: %v", idx+1, authErr)
+					log.Printf("[Telegram] Worker #%d auth error: %v", w.idx, authErr)
+					w.healthy = false
 					return authErr
 				}
-				log.Printf("[Telegram] Media transfer connection #%d active.", idx+1)
+				w.healthy = true
+				log.Printf("[Telegram] Media transfer worker #%d active.", w.idx)
 				<-ctx.Done()
 				return nil
 			})
 			if err != nil {
-				log.Printf("[Telegram] Media transfer connection #%d error: %v", idx+1, err)
+				log.Printf("[Telegram] Media transfer worker #%d stopped: %v", w.idx, err)
 			}
-		}(c, clientIdx)
+		}(worker)
 	}
 
 	return nil
 }
 
-func (m *Manager) getTransferClient() *telegram.Client {
-	m.poolMu.Lock()
-	defer m.poolMu.Unlock()
-	if len(m.transferPool) == 0 {
-		return m.updateClient
+// Adaptive health-aware worker selection
+func (m *Manager) getBestWorker() *TransferWorker {
+	m.poolMu.RLock()
+	defer m.poolMu.RUnlock()
+
+	now := time.Now()
+	var best *TransferWorker
+	minActive := int64(1<<62 - 1)
+
+	for _, w := range m.transferPool {
+		if !w.healthy {
+			continue
+		}
+		if now.Before(w.floodWaitUntil) {
+			continue // Skip workers currently throttled
+		}
+
+		active := atomic.LoadInt64(&w.activeReqs)
+		if active < minActive {
+			minActive = active
+			best = w
+		}
 	}
-	c := m.transferPool[m.poolIndex]
-	m.poolIndex = (m.poolIndex + 1) % len(m.transferPool)
-	return c
+
+	if best != nil {
+		return best
+	}
+	// Fallback to first worker if all are busy/recovering
+	if len(m.transferPool) > 0 {
+		return m.transferPool[0]
+	}
+	return nil
 }
 
 func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int64, limit int) ([]byte, error) {
 	docID, _ := strconv.ParseInt(item.FileID, 10, 64)
 
 	for attempt := 0; attempt < 3; attempt++ {
-		client := m.getTransferClient()
-		raw := client.API()
+		worker := m.getBestWorker()
+		if worker == nil {
+			return nil, fmt.Errorf("no media transfer worker available")
+		}
+
+		atomic.AddInt64(&worker.activeReqs, 1)
+		raw := worker.client.API()
 
 		location := &tg.InputDocumentFileLocation{
 			ID:            docID,
@@ -274,8 +327,10 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 			Offset:   offset,
 			Limit:    limit,
 		})
+		atomic.AddInt64(&worker.activeReqs, -1)
 
 		if err == nil {
+			worker.consecutiveErrors = 0
 			switch file := res.(type) {
 			case *tg.UploadFile:
 				return file.Bytes, nil
@@ -285,11 +340,14 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 			return nil, fmt.Errorf("unexpected file response type")
 		}
 
+		worker.consecutiveErrors++
+
 		// Handle FLOOD_WAIT_X
 		if d, ok := tgerr.AsFloodWait(err); ok {
 			jitter := time.Duration(rand.Intn(500)) * time.Millisecond
 			sleepDuration := d + jitter
-			log.Printf("[Telegram] FLOOD_WAIT received. Sleeping for %v", sleepDuration)
+			worker.floodWaitUntil = time.Now().Add(sleepDuration)
+			log.Printf("[Telegram] Worker #%d FLOOD_WAIT %v. Backing off.", worker.idx, sleepDuration)
 			select {
 			case <-time.After(sleepDuration):
 				continue
@@ -301,7 +359,7 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 		// Handle FILE_REFERENCE_EXPIRED
 		if strings.Contains(err.Error(), "FILE_REFERENCE_EXPIRED") || strings.Contains(err.Error(), "FILE_REFERENCE_INVALID") {
 			log.Printf("[Telegram] File reference expired for media %s. Refreshing file reference...", item.ID)
-			refreshed, refErr := m.refreshFileReference(ctx, item)
+			refreshed, refErr := m.RefreshFileReference(ctx, item)
 			if refErr == nil && refreshed {
 				continue
 			}
@@ -312,7 +370,7 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 	return nil, fmt.Errorf("failed to fetch chunk after multiple retries")
 }
 
-func (m *Manager) refreshFileReference(ctx context.Context, item *db.MediaItem) (bool, error) {
+func (m *Manager) RefreshFileReference(ctx context.Context, item *db.MediaItem) (bool, error) {
 	if m.rawAPI == nil {
 		return false, fmt.Errorf("raw API client not ready")
 	}
