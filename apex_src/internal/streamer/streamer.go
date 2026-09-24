@@ -30,23 +30,16 @@ type Gateway struct {
 	database  *db.Database
 	cache     *LRUCache
 	fetcher   TelegramChunkFetcher
-	semaphore chan struct{}
 	activeMu  sync.Mutex
 	activeMap map[string]context.CancelFunc
 }
 
 func NewGateway(cfg *config.Config, database *db.Database, cache *LRUCache, fetcher TelegramChunkFetcher) *Gateway {
-	maxStreams := cfg.MaxStreams
-	if maxStreams <= 0 {
-		maxStreams = 2
-	}
-
 	return &Gateway{
 		cfg:       cfg,
 		database:  database,
 		cache:     cache,
 		fetcher:   fetcher,
-		semaphore: make(chan struct{}, maxStreams),
 		activeMap: make(map[string]context.CancelFunc),
 	}
 }
@@ -182,33 +175,35 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Acquire concurrent stream semaphore
-	select {
-	case g.semaphore <- struct{}{}:
-		defer func() { <-g.semaphore }()
-	default:
-		w.Header().Set("Retry-After", "5")
-		http.Error(w, "maximum concurrent streams reached", http.StatusServiceUnavailable)
-		return
-	}
-
 	totalSize := item.FileSize
 	rangeHeader := r.Header.Get("Range")
 
-	contentType := item.MimeType
-	if contentType == "" || contentType == "application/octet-stream" {
-		contentType = "video/mp4"
+	// Match the proven Python streamer HTTP response contract.
+	// The URL is deliberately exposed as .mp4 and Python also presents video/mp4
+	// to Jellyfin while streaming the original Telegram bytes unchanged.
+	downloadName := filepath.Base(target)
+	if downloadName == "" || downloadName == "." || !strings.Contains(downloadName, ".") {
+		downloadName = "video.mp4"
 	}
+	downloadName = strings.ReplaceAll(downloadName, """, "")
 
+	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", item.CleanTitle+".mp4"))
-	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename="%s"", downloadName))
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// 3. Python-compatible HTTP streaming.
+	// Do not cap individual HTTP Range requests here. Jellyfin may issue several
+	// concurrent Range requests for one media item. Telegram transfer workers
+	// remain the actual concurrency/bandwidth governor.
 
 	// 4. RFC 7233 HTTP Range parsing
 	start := int64(0)
 	end := totalSize - 1
+	statusCode := http.StatusOK
 
 	if rangeHeader != "" {
 		// Reject multi-range requests
@@ -290,10 +285,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 5. Unique stream session setup
+	sourceKey := fmt.Sprintf("%d:%d", item.SourceChatID, item.MessageID)
 	streamCtx, streamCancel := context.WithCancel(r.Context())
 	defer streamCancel()
 
-	sessionID := fmt.Sprintf("%s:%d:%d", mediaID, time.Now().UnixNano(), rand.Int63())
+	sessionID := fmt.Sprintf("%s:%d:%d", sourceKey, time.Now().UnixNano(), rand.Int63())
 
 	g.activeMu.Lock()
 	g.activeMap[sessionID] = streamCancel
@@ -334,7 +330,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					if nextBaseOffset >= totalSize {
 						break
 					}
-					nextKey := fmt.Sprintf("%s:%d", mediaID, nextChunk)
+					nextKey := fmt.Sprintf("%s:%d", sourceKey, nextChunk)
 
 					// Skip if already in cache
 					if _, hit := g.cache.Get(nextKey); hit {
@@ -355,14 +351,14 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for currentOffset <= end {
 		select {
 		case <-r.Context().Done():
-			log.Printf("[Streamer] Client disconnected or seeked for %s at offset %d", mediaID, currentOffset)
+			log.Printf("[Streamer] Client disconnected or seeked for source=%s media=%s at offset=%d", sourceKey, mediaID, currentOffset)
 			return
 		default:
 		}
 
 		chunkIndex := currentOffset / ChunkSize
 		chunkBaseOffset := chunkIndex * ChunkSize
-		cacheKey := fmt.Sprintf("%s:%d", mediaID, chunkIndex)
+		cacheKey := fmt.Sprintf("%s:%d", sourceKey, chunkIndex)
 
 		// Fetch current chunk via coalescing cache
 		fetchStart := time.Now()
@@ -402,6 +398,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			break
 		}
+	}
+
+	if currentOffset <= end {
+		log.Printf("[Streamer] Incomplete HTTP stream source=%s media=%s wrote=%d expected=%d", sourceKey, mediaID, currentOffset-start, end-start+1)
+	} else {
+		log.Printf("[Streamer] Completed HTTP stream source=%s media=%s bytes=%d", sourceKey, mediaID, end-start+1)
 	}
 }
 

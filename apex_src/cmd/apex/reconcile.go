@@ -11,7 +11,7 @@ import (
 	"apex/internal/db"
 )
 
-func reconcileSTRMFiles(mediaRoot string, database *db.Database) {
+func reconcileSTRMFiles(mediaRoot string, database *db.Database, serverPort string) {
 	log.Printf("[Apex] Starting reconciliation of STRM files in %s", mediaRoot)
 	deletedCount := 0
 	migratedCount := 0
@@ -56,7 +56,7 @@ func reconcileSTRMFiles(mediaRoot string, database *db.Database) {
 					deletedCount++
 				} else if isOldFormat && item != nil && dbErr == nil {
 					// Migrate old format to new format
-					newURL := "http://127.0.0.1:8084/stream/" + strconv.FormatInt(item.SourceChatID, 10) + "/" + strconv.Itoa(item.MessageID) + "/video.mp4"
+					newURL := "http://127.0.0.1:" + serverPort + "/stream/" + strconv.FormatInt(item.SourceChatID, 10) + "/" + strconv.Itoa(item.MessageID) + "/video.mp4"
 					_ = os.WriteFile(path, []byte(newURL), 0644)
 					migratedCount++
 				}

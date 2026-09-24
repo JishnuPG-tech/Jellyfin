@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -165,6 +166,130 @@ func TestStreamGatewayAuthAndRanges(t *testing.T) {
 	gateway.ServeHTTP(rr, reqVLC)
 	if rr.Code != http.StatusOK {
 		t.Errorf("VLC endpoint request should return 200, got %d", rr.Code)
+	}
+}
+
+
+// blockingFetcher lets concurrent requests enter the Telegram-fetch boundary
+// before releasing them, proving the HTTP layer does not reject legitimate
+// parallel Range requests from Jellyfin/FFmpeg.
+type blockingFetcher struct {
+	data    []byte
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (f *blockingFetcher) FetchChunk(ctx context.Context, item *db.MediaItem, offset int64, limit int) ([]byte, error) {
+	select {
+	case f.entered <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-f.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if offset >= int64(len(f.data)) {
+		return []byte{}, nil
+	}
+	end := offset + int64(limit)
+	if end > int64(len(f.data)) {
+		end = int64(len(f.data))
+	}
+	return f.data[offset:end], nil
+}
+
+func TestPythonCompatibleConcurrentRanges(t *testing.T) {
+	tmpDB := t.TempDir() + "/test_apex.db"
+	tmpCache := t.TempDir() + "/cache"
+
+	database, err := db.Open(tmpDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	payload := make([]byte, 1024*1024)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+
+	item := &db.MediaItem{
+		ID: "apx_concurrent",
+		SourceChatID: 1769298522,
+		MessageID: 8,
+		FileID: "test_fid",
+		FileRef: []byte("ref"),
+		AccessHash: 1,
+		FileSize: int64(len(payload)),
+		MimeType: "video/x-matroska",
+		CleanTitle: "Concurrent Movie",
+		MediaType: "movie",
+		StrmPath: "/tmp/test.strm",
+	}
+	if err := database.SaveMediaItem(item); err != nil {
+		t.Fatal(err)
+	}
+
+	fetcher := &blockingFetcher{
+		data: payload,
+		entered: make(chan struct{}, 3),
+		release: make(chan struct{}),
+	}
+	gateway := NewGateway(
+		&config.Config{ApexSecretKey: "test_secret_key_32_bytes_long_12345", MaxStreams: 1, PrefetchMB: 1},
+		database,
+		NewLRUCache(16, 64, tmpCache),
+		fetcher,
+	)
+
+	results := make(chan int, 3)
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest("GET", "/stream/1769298522/8/video.mp4", nil)
+			req.RemoteAddr = "127.0.0.1:45678"
+			req.Header.Set("Range", "bytes=0-1048575")
+			rr := httptest.NewRecorder()
+			gateway.ServeHTTP(rr, req)
+
+			if rr.Header().Get("Content-Type") != "video/mp4" {
+				t.Errorf("Content-Type = %q, want video/mp4", rr.Header().Get("Content-Type"))
+			}
+			if rr.Header().Get("Accept-Ranges") != "bytes" {
+				t.Errorf("Accept-Ranges = %q, want bytes", rr.Header().Get("Accept-Ranges"))
+			}
+			if rr.Header().Get("Cache-Control") != "public, max-age=86400" {
+				t.Errorf("Cache-Control = %q, want public, max-age=86400", rr.Header().Get("Cache-Control"))
+			}
+			if rr.Header().Get("Content-Disposition") == "" {
+				t.Error("Content-Disposition missing")
+			}
+			if rr.Code != http.StatusPartialContent {
+				t.Errorf("concurrent Range request returned %d, want 206", rr.Code)
+			}
+			results <- rr.Code
+		}()
+	}
+
+	for i := 0; i < 3; i++ {
+		select {
+		case <-fetcher.entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected all three concurrent Range requests to reach the Telegram fetcher")
+		}
+	}
+	close(fetcher.release)
+	wg.Wait()
+	close(results)
+
+	for code := range results {
+		if code != http.StatusPartialContent {
+			t.Errorf("concurrent Range request returned %d, want 206", code)
+		}
 	}
 }
 

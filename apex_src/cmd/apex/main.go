@@ -44,7 +44,7 @@ func main() {
 	log.Printf("[Apex] Database initialized at %s", cfg.DBPath)
 
 	// Launch background reconciliation of STRM files
-	go reconcileSTRMFiles(cfg.JellyfinMedia, database)
+	go reconcileSTRMFiles(cfg.JellyfinMedia, database, cfg.ServerPort)
 
 	// 2. Initialize Two-Tier Cache & Streaming Gateway
 	cache := streamer.NewLRUCache(cfg.MemoryCacheMB, cfg.DiskCacheMB, cfg.DiskCachePath)
@@ -764,7 +764,7 @@ func processIngestionTask(
 	}
 
 	// 9. Media Capability Probe Analysis
-	streamURL := fmt.Sprintf("http://127.0.0.1:%s/stream/%s", cfg.ServerPort, opaqueID)
+	streamURL := fmt.Sprintf("http://127.0.0.1:%s/stream/%d/%d/video.mp4", cfg.ServerPort, task.ChatID, task.MsgID)
 	cap, probeErr := probe.Analyze(ctx, streamURL, opaqueID, filename)
 	if probeErr != nil {
 		log.Printf("[Worker #%d] Probe inspection note on %s: %v", workerID, opaqueID, probeErr)
