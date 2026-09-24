@@ -304,6 +304,20 @@ func processIngestionTask(
 		log.Printf("[Worker #%d] Media already cataloged as '%s' (ID: %s, STRM: %s). Updating file reference...",
 			workerID, existing.CleanTitle, existing.ID, existing.StrmPath)
 		_ = database.UpdateFileReference(existing.ID, doc.FileReference, doc.AccessHash)
+
+		// Verify STRM still exists; recreate if missing
+		if _, err := os.Stat(existing.StrmPath); os.IsNotExist(err) {
+			log.Printf("[Worker #%d] Missing STRM file detected for '%s'. Recreating...", workerID, existing.ID)
+			streamURL := fmt.Sprintf("http://127.0.0.1:8084/stream/%s", existing.ID)
+			_ = os.MkdirAll(filepath.Dir(existing.StrmPath), 0755)
+			_ = os.WriteFile(existing.StrmPath, []byte(streamURL), 0644)
+		}
+
+		// Enqueue Jellyfin refresh to ensure it's picked up
+		select {
+		case refreshNotify <- struct{}{}:
+		default:
+		}
 		return
 	}
 
