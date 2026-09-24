@@ -202,6 +202,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", item.CleanTitle+".mp4"))
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	// 4. RFC 7233 HTTP Range parsing
 	start := int64(0)
@@ -274,10 +277,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
 		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		log.Printf("[Streamer] %s request for %s (Range: bytes %d-%d/%d, Size: %d)", r.Method, mediaID, start, end, totalSize, end-start+1)
 		w.WriteHeader(http.StatusPartialContent)
 	} else {
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+		log.Printf("[Streamer] %s request for %s (Full file, Size: %d)", r.Method, mediaID, totalSize)
 		w.WriteHeader(http.StatusOK)
+	}
+
+	if r.Method == http.MethodHead {
+		return
 	}
 
 	// 5. Unique stream session setup
@@ -356,13 +365,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cacheKey := fmt.Sprintf("%s:%d", mediaID, chunkIndex)
 
 		// Fetch current chunk via coalescing cache
+		fetchStart := time.Now()
 		data, err := g.cache.FetchCoalesced(cacheKey, func() ([]byte, error) {
 			return g.fetcher.FetchChunk(streamCtx, item, chunkBaseOffset, ChunkSize)
 		})
 		if err != nil {
-			log.Printf("[Streamer] Failed to retrieve chunk %d for %s: %v", chunkIndex, mediaID, err)
+			log.Printf("[Streamer] Failed to retrieve chunk %d for %s (took %v): %v", chunkIndex, mediaID, time.Since(fetchStart), err)
 			return
 		}
+		// log.Printf("[Streamer] Served chunk %d for %s (fetched in %v)", chunkIndex, mediaID, time.Since(fetchStart))
 
 		// Trigger bounded prefetch worker for upcoming chunks
 		select {
