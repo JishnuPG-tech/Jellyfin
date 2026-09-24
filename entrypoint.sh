@@ -3,13 +3,12 @@ set -e
 
 echo "=================================================="
 echo " 🚀 Starting Apex Cloud Platform (v2.1 Production)"
-echo " Stack: Nginx + Jellyfin + Apex Core + Legacy Tools"
+echo " Stack: Caddy Gateway + Jellyfin + Apex Go Core"
 echo "=================================================="
 
 # ── 1. Initialize Storage Layout ───────────────────────────────────────────────
 echo "[Apex] Initializing storage directories..."
 
-# Persistent Bucket paths (/data)
 mkdir -p /data/Stirling/configs \
          /data/Stirling/logs \
          /data/Stirling/customFiles \
@@ -23,13 +22,11 @@ mkdir -p /data/Stirling/configs \
          /data/apex/backups \
          /data/apex/session \
          /data/apex/metadata-cache \
-         2>/dev/null || true
-
-# High-speed ephemeral paths (/tmp)
-mkdir -p /tmp/stirling-pdf \
+         /tmp/stirling-pdf \
+         /tmp/caddy/data \
+         /tmp/caddy/config \
          /tmp/apex-db \
          /tmp/apex-stream-cache \
-         /run/nginx \
          2>/dev/null || true
 
 # Secure session directory permissions
@@ -54,20 +51,28 @@ elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python3)"
 fi
 
+backup_sqlite() {
+    if [ -f "/tmp/apex-db/apex.db" ]; then
+        ${PYTHON_BIN} -c "
+import sqlite3, os, shutil
+try:
+    con = sqlite3.connect('/tmp/apex-db/apex.db')
+    con.execute(\"VACUUM INTO '/tmp/apex-db/backup.db'\")
+    con.close()
+    if os.path.exists('/tmp/apex-db/backup.db'):
+        shutil.move('/tmp/apex-db/backup.db', '/data/apex/backups/apex_latest.db')
+        print('[Apex] SQLite snapshot successfully saved.')
+except Exception as e:
+    print(f'[Apex] SQLite backup warning: {e}')
+" 2>/dev/null || true
+    fi
+}
+
 cleanup() {
     echo "[Apex] Received termination signal. Initiating graceful shutdown..."
-    
-    # Trigger final atomic backup of SQLite before exiting
-    if [ -f "/tmp/apex-db/apex.db" ] && command -v sqlite3 >/dev/null 2>&1; then
-        echo "[Apex] Performing pre-shutdown SQLite backup..."
-        sqlite3 /tmp/apex-db/apex.db "VACUUM INTO '/tmp/apex-db/backup.db';" 2>/dev/null || true
-        if [ -f "/tmp/apex-db/backup.db" ]; then
-            mv -f /tmp/apex-db/backup.db /data/apex/backups/apex_latest.db
-            echo "[Apex] SQLite backup saved to /data/apex/backups/apex_latest.db"
-        fi
-    fi
+    backup_sqlite
 
-    [ -n "${NGINX_PID:-}" ] && kill -TERM "${NGINX_PID}" 2>/dev/null || true
+    [ -n "${CADDY_PID:-}" ] && kill -TERM "${CADDY_PID}" 2>/dev/null || true
     [ -n "${APEX_CORE_PID:-}" ] && kill -TERM "${APEX_CORE_PID}" 2>/dev/null || true
     [ -n "${JELLYFIN_PID:-}" ] && kill -TERM "${JELLYFIN_PID}" 2>/dev/null || true
     [ -n "${STIRLING_PID:-}" ] && kill -TERM "${STIRLING_PID}" 2>/dev/null || true
@@ -123,16 +128,31 @@ if [ -d "/opt/pdf_enhancer" ]; then
 fi
 
 # ── 5. Start Jellyfin Media Server on Port 8096 ───────────────────────────────
-echo "[Apex] Starting Jellyfin on Port 8096..."
-(
-    exec /usr/bin/jellyfin \
-        --datadir /data/jellyfin/config \
-        --cachedir /data/jellyfin/cache \
-        --ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg \
-        --webdir /usr/share/jellyfin/web \
-        --restartpath /usr/local/bin/entrypoint.sh
-) &
-JELLYFIN_PID=$!
+JELLYFIN_BIN="/opt/jellyfin/jellyfin"
+if [ ! -f "${JELLYFIN_BIN}" ] && [ -f "/usr/bin/jellyfin" ]; then
+    JELLYFIN_BIN="/usr/bin/jellyfin"
+fi
+
+if [ -f "${JELLYFIN_BIN}" ]; then
+    echo "[Apex] Starting Jellyfin on Port 8096..."
+    FFMPEG_PATH="/usr/lib/jellyfin-ffmpeg/ffmpeg"
+    [ ! -f "${FFMPEG_PATH}" ] && FFMPEG_PATH="$(command -v ffmpeg || echo 'ffmpeg')"
+
+    WEBDIR="/opt/jellyfin/jellyfin-web"
+    [ ! -d "${WEBDIR}" ] && WEBDIR="/usr/share/jellyfin/web"
+
+    (
+        exec "${JELLYFIN_BIN}" \
+            --datadir /data/jellyfin/config \
+            --cachedir /data/jellyfin/cache \
+            --ffmpeg "${FFMPEG_PATH}" \
+            --webdir "${WEBDIR}" \
+            --restartpath /usr/local/bin/entrypoint.sh
+    ) &
+    JELLYFIN_PID=$!
+else
+    echo "[Apex] Notice: Jellyfin binary not found. Skipping Jellyfin startup."
+fi
 
 # ── 6. Start Apex Go Core Daemon on Port 8084 ─────────────────────────────────
 if [ -f "/opt/apex/apex-core" ]; then
@@ -141,14 +161,12 @@ if [ -f "/opt/apex/apex-core" ]; then
         exec /opt/apex/apex-core
     ) &
     APEX_CORE_PID=$!
-else
-    echo "[Apex] Note: /opt/apex/apex-core not found yet (will start once compiled)."
 fi
 
-# ── 7. Start Nginx Ingress Proxy on Port 7860 ─────────────────────────────────
-echo "[Apex] Starting Nginx on Port 7860..."
-nginx -g "daemon off;" -c /etc/nginx/nginx.conf &
-NGINX_PID=$!
+# ── 7. Start Caddy Gateway on Port 7860 ───────────────────────────────────────
+echo "[Apex] Starting Caddy Gateway on Port 7860..."
+caddy run --config /etc/caddy/Caddyfile --adapter caddyfile &
+CADDY_PID=$!
 
 echo "[Apex] All services dispatched successfully!"
 echo "[Apex] Ingress URL: http://0.0.0.0:7860/"
@@ -157,27 +175,27 @@ echo "[Apex] Ingress URL: http://0.0.0.0:7860/"
 BACKUP_COUNTER=0
 
 while true; do
-    # Check Nginx
-    if ! kill -0 "${NGINX_PID}" 2>/dev/null; then
-        echo "[Apex] CRITICAL: Nginx gateway exited unexpectedly."
+    # Check Caddy
+    if ! kill -0 "${CADDY_PID}" 2>/dev/null; then
+        echo "[Apex] CRITICAL: Caddy gateway exited unexpectedly."
         cleanup
     fi
 
-    # Check Jellyfin
-    if ! kill -0 "${JELLYFIN_PID}" 2>/dev/null; then
+    # Check Jellyfin (if running)
+    if [ -n "${JELLYFIN_PID:-}" ] && ! kill -0 "${JELLYFIN_PID}" 2>/dev/null; then
         echo "[Apex] WARNING: Jellyfin exited — restarting..."
         (
-            exec /usr/bin/jellyfin \
+            exec "${JELLYFIN_BIN}" \
                 --datadir /data/jellyfin/config \
                 --cachedir /data/jellyfin/cache \
-                --ffmpeg /usr/lib/jellyfin-ffmpeg/ffmpeg \
-                --webdir /usr/share/jellyfin/web \
+                --ffmpeg "${FFMPEG_PATH}" \
+                --webdir "${WEBDIR}" \
                 --restartpath /usr/local/bin/entrypoint.sh
         ) &
         JELLYFIN_PID=$!
     fi
 
-    # Check Apex Core (if binary exists)
+    # Check Apex Core (if running)
     if [ -f "/opt/apex/apex-core" ]; then
         if [ -z "${APEX_CORE_PID:-}" ] || ! kill -0 "${APEX_CORE_PID}" 2>/dev/null; then
             echo "[Apex] Restarting Apex Core Daemon..."
@@ -192,13 +210,7 @@ while true; do
     BACKUP_COUNTER=$((BACKUP_COUNTER + 1))
     if [ "${BACKUP_COUNTER}" -ge 180 ]; then
         BACKUP_COUNTER=0
-        if [ -f "/tmp/apex-db/apex.db" ] && command -v sqlite3 >/dev/null 2>&1; then
-            echo "[Apex] Periodic background backup of SQLite database..."
-            sqlite3 /tmp/apex-db/apex.db "VACUUM INTO '/tmp/apex-db/backup.db';" 2>/dev/null || true
-            if [ -f "/tmp/apex-db/backup.db" ]; then
-                mv -f /tmp/apex-db/backup.db /data/apex/backups/apex_latest.db
-            fi
-        fi
+        backup_sqlite
     fi
 
     sleep 5
