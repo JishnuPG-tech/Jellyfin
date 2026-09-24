@@ -29,25 +29,38 @@ type IngestionTask struct {
 }
 
 type TransferWorker struct {
-	mu                sync.RWMutex
-	client            *telegram.Client
-	idx               int
-	activeReqs        int64
-	consecutiveErrors int
-	floodWaitUntil    time.Time
-	healthy           bool
+	mu                  sync.RWMutex
+	client              *telegram.Client
+	idx                 int
+	activeReqs          int64
+	consecutiveErrors   int
+	floodWaitUntil      time.Time
+	circuitBreakerUntil time.Time
+	healthy             bool
 }
+
+const (
+	maxConsecutiveErrors   = 5
+	circuitBreakerCooldown = 30 * time.Second
+)
 
 func (w *TransferWorker) SetHealthy(healthy bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.healthy = healthy
+	if healthy {
+		w.circuitBreakerUntil = time.Time{}
+	}
 }
 
 func (w *TransferWorker) IsAvailable(now time.Time) bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	if !w.healthy {
+		// Allow single trial probe if circuit breaker cooldown has expired
+		if !w.circuitBreakerUntil.IsZero() && now.After(w.circuitBreakerUntil) {
+			return true
+		}
 		return false
 	}
 	return !now.Before(w.floodWaitUntil)
@@ -57,6 +70,8 @@ func (w *TransferWorker) RecordSuccess() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.consecutiveErrors = 0
+	w.healthy = true
+	w.circuitBreakerUntil = time.Time{}
 }
 
 func (w *TransferWorker) RecordFloodWait(until time.Time) {
@@ -70,6 +85,12 @@ func (w *TransferWorker) RecordError() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.consecutiveErrors++
+	if w.consecutiveErrors >= maxConsecutiveErrors {
+		w.healthy = false
+		w.circuitBreakerUntil = time.Now().Add(circuitBreakerCooldown)
+		log.Printf("[Telegram] TransferWorker #%d entered circuit breaker (%d errors). Cooldown for %v.",
+			w.idx, w.consecutiveErrors, circuitBreakerCooldown)
+	}
 }
 
 type Manager struct {
@@ -209,16 +230,19 @@ func (m *Manager) Start(ctx context.Context, jobQueue chan<- *IngestionTask) err
 
 			m.SendReply(inputPeer, fmt.Sprintf("📥 Queued '%s' for ingestion...\nProcessing and adding to Jellyfin.", filename))
 
-			// Non-blocking enqueue to ingestion job worker queue
-			select {
-			case jobQueue <- &IngestionTask{
+			task := &IngestionTask{
 				Doc:     doc,
 				ChatID:  chatID,
 				MsgID:   msg.ID,
 				Caption: caption,
-			}:
+			}
+			select {
+			case jobQueue <- task:
 			default:
-				log.Printf("[Telegram] Warning: Ingestion job queue full. Dropping task for %s", filename)
+				log.Printf("[Telegram] Ingestion queue busy. Asynchronously queuing task for '%s'", filename)
+				go func(t *IngestionTask) {
+					jobQueue <- t
+				}(task)
 			}
 		}
 		return nil
@@ -369,7 +393,17 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 			case *tg.UploadFile:
 				return file.Bytes, nil
 			case *tg.UploadFileCDNRedirect:
-				return nil, fmt.Errorf("CDN redirect not supported")
+				log.Printf("[Telegram] Received CDN redirect for media %s (DC: %d). Requesting re-upload to master DC...", item.ID, file.DCID)
+				_, reuploadErr := raw.UploadReuploadCdnFile(ctx, &tg.UploadReuploadCdnFileRequest{
+					FileToken:    file.FileToken,
+					RequestToken: file.FileToken,
+				})
+				if reuploadErr != nil {
+					log.Printf("[Telegram] CDN re-upload failed: %v", reuploadErr)
+					return nil, fmt.Errorf("CDN redirect received and re-upload failed: %w", reuploadErr)
+				}
+				time.Sleep(200 * time.Millisecond)
+				continue
 			}
 			return nil, fmt.Errorf("unexpected file response type")
 		}

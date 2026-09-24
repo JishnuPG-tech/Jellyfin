@@ -239,6 +239,7 @@ func (d *Database) migrate() error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_media_items_unique ON media_items(source_chat_id, message_id);
+	CREATE INDEX IF NOT EXISTS idx_media_items_file_id ON media_items(file_id);
 
 	CREATE TABLE IF NOT EXISTS media_capabilities (
 		media_id TEXT PRIMARY KEY,
@@ -361,6 +362,28 @@ func (d *Database) GetMediaItem(id string) (*MediaItem, error) {
 	FROM media_items WHERE id = ?
 	`
 	row := d.conn.QueryRow(query, id)
+
+	var item MediaItem
+	err := row.Scan(
+		&item.ID, &item.SourceChatID, &item.MessageID, &item.FileID, &item.FileUniqueID,
+		&item.FileRef, &item.AccessHash, &item.FileSize, &item.MimeType, &item.CleanTitle,
+		&item.MediaType, &item.Year, &item.Season, &item.Episode, &item.TMDBID,
+		&item.StrmPath, &item.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (d *Database) GetMediaItemByFileID(fileID string) (*MediaItem, error) {
+	query := `
+	SELECT id, source_chat_id, message_id, file_id, file_unique_id, file_reference,
+		   access_hash, file_size, mime_type, clean_title, media_type, year, season,
+		   episode, tmdb_id, strm_path, created_at
+	FROM media_items WHERE file_id = ? LIMIT 1
+	`
+	row := d.conn.QueryRow(query, fileID)
 
 	var item MediaItem
 	err := row.Scan(

@@ -95,6 +95,15 @@ fi
 backup_apex_sqlite() {
     if [ -f "/tmp/apex-db/apex.db" ]; then
         if command -v sqlite3 >/dev/null 2>&1; then
+            # Perform true transactional online atomic backup using VACUUM INTO
+            rm -f /tmp/apex-db/apex_snapshot.db 2>/dev/null || true
+            if sqlite3 /tmp/apex-db/apex.db "VACUUM INTO '/tmp/apex-db/apex_snapshot.db';" 2>/dev/null; then
+                mv -f /tmp/apex-db/apex_snapshot.db /data/apex/backups/apex_latest.db
+                rm -f /data/apex/backups/apex_latest.db-wal /data/apex/backups/apex_latest.db-shm 2>/dev/null || true
+                echo "[Apex] Online atomic SQLite snapshot saved (VACUUM INTO) to /data/apex/backups/apex_latest.db."
+                return 0
+            fi
+            # Fallback to checkpoint + copy if VACUUM INTO was interrupted
             sqlite3 /tmp/apex-db/apex.db "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
         fi
         cp -f /tmp/apex-db/apex.db /tmp/apex-db/apex_backup.db 2>/dev/null || true
