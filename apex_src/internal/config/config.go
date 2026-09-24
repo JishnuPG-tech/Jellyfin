@@ -30,6 +30,7 @@ type Config struct {
 	ServerPort      string
 	JellyfinURL     string
 	JellyfinAPIKey  string
+	MetadataCacheDir string
 }
 
 func Load() *Config {
@@ -82,6 +83,7 @@ func Load() *Config {
 		ServerPort:      getEnv("APEX_CORE_PORT", "8084"),
 		JellyfinURL:     getEnv("JELLYFIN_URL", "http://127.0.0.1:8096"),
 		JellyfinAPIKey:  jfAPIKey,
+		MetadataCacheDir: getEnv("APEX_METADATA_CACHE_DIR", "/data/apex/metadata-cache"),
 	}
 }
 

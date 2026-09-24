@@ -1,6 +1,8 @@
 package metadata
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -12,12 +14,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Client struct {
 	apiKey     string
+	cacheDir   string
 	httpClient *http.Client
+	mu         sync.RWMutex
+	memCache   map[string][]byte
 }
 
 type TMDBResult struct {
@@ -51,13 +57,57 @@ type TMDBEpisode struct {
 	VoteAverage   float64 `json:"vote_average"`
 }
 
-func NewClient(apiKey string) *Client {
+func NewClient(apiKey string, cacheDir ...string) *Client {
+	cDir := ""
+	if len(cacheDir) > 0 {
+		cDir = cacheDir[0]
+	}
+	if cDir != "" {
+		_ = os.MkdirAll(cDir, 0755)
+		_ = os.MkdirAll(filepath.Join(cDir, "images"), 0755)
+	}
 	return &Client{
-		apiKey: apiKey,
+		apiKey:   apiKey,
+		cacheDir: cDir,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		memCache: make(map[string][]byte),
 	}
+}
+
+func (c *Client) getCache(key string) ([]byte, bool) {
+	c.mu.RLock()
+	val, ok := c.memCache[key]
+	c.mu.RUnlock()
+	if ok {
+		return val, true
+	}
+	if c.cacheDir == "" {
+		return nil, false
+	}
+	data, err := os.ReadFile(filepath.Join(c.cacheDir, key+".json"))
+	if err == nil {
+		c.mu.Lock()
+		c.memCache[key] = data
+		c.mu.Unlock()
+		return data, true
+	}
+	return nil, false
+}
+
+func (c *Client) setCache(key string, data []byte) {
+	c.mu.Lock()
+	c.memCache[key] = data
+	c.mu.Unlock()
+	if c.cacheDir != "" {
+		_ = os.WriteFile(filepath.Join(c.cacheDir, key+".json"), data, 0644)
+	}
+}
+
+func cacheHash(val string) string {
+	h := sha256.Sum256([]byte(val))
+	return hex.EncodeToString(h[:12])
 }
 
 func (c *Client) Search(title string, year int, mediaType string) (*TMDBResult, error) {
@@ -76,6 +126,14 @@ func (c *Client) Search(title string, year int, mediaType string) (*TMDBResult, 
 }
 
 func (c *Client) searchInternal(title string, year int, mediaType string) (*TMDBResult, error) {
+	cacheKey := fmt.Sprintf("search_%s", cacheHash(fmt.Sprintf("%s_%d_%s", strings.ToLower(title), year, mediaType)))
+	if cachedData, ok := c.getCache(cacheKey); ok {
+		var cached TMDBResult
+		if err := json.Unmarshal(cachedData, &cached); err == nil {
+			return &cached, nil
+		}
+	}
+
 	endpoint := "movie"
 	if mediaType == "series" {
 		endpoint = "tv"
@@ -193,12 +251,25 @@ func (c *Client) searchInternal(title string, year int, mediaType string) (*TMDB
 	}
 
 	res.Confidence = highestScore
+
+	if resBytes, err := json.Marshal(&res); err == nil {
+		c.setCache(cacheKey, resBytes)
+	}
+
 	return &res, nil
 }
 
 func (c *Client) GetEpisodeDetails(seriesID int, seasonNumber int, episodeNumber int) (*TMDBEpisode, error) {
 	if c.apiKey == "" {
 		return nil, fmt.Errorf("TMDB_API_KEY is not configured")
+	}
+
+	cacheKey := fmt.Sprintf("ep_%d_%d_%d", seriesID, seasonNumber, episodeNumber)
+	if cachedData, ok := c.getCache(cacheKey); ok {
+		var ep TMDBEpisode
+		if err := json.Unmarshal(cachedData, &ep); err == nil {
+			return &ep, nil
+		}
 	}
 
 	u := fmt.Sprintf("https://api.themoviedb.org/3/tv/%d/season/%d/episode/%d?api_key=%s",
@@ -219,12 +290,24 @@ func (c *Client) GetEpisodeDetails(seriesID int, seasonNumber int, episodeNumber
 		return nil, err
 	}
 
+	if epBytes, err := json.Marshal(&ep); err == nil {
+		c.setCache(cacheKey, epBytes)
+	}
+
 	return &ep, nil
 }
 
 func (c *Client) GetMovieDetails(movieID int) (*DetailedMetadata, error) {
 	if c.apiKey == "" || movieID <= 0 {
 		return nil, fmt.Errorf("TMDB_API_KEY is not configured or invalid ID")
+	}
+
+	cacheKey := fmt.Sprintf("movie_details_%d", movieID)
+	if cachedData, ok := c.getCache(cacheKey); ok {
+		var meta DetailedMetadata
+		if err := json.Unmarshal(cachedData, &meta); err == nil {
+			return &meta, nil
+		}
 	}
 
 	u := fmt.Sprintf("https://api.themoviedb.org/3/movie/%d?api_key=%s&append_to_response=credits",
@@ -276,12 +359,25 @@ func (c *Client) GetMovieDetails(movieID int) (*DetailedMetadata, error) {
 			Role: actor.Character,
 		})
 	}
+
+	if resBytes, err := json.Marshal(res); err == nil {
+		c.setCache(cacheKey, resBytes)
+	}
+
 	return res, nil
 }
 
 func (c *Client) GetShowDetails(showID int) (*DetailedMetadata, error) {
 	if c.apiKey == "" || showID <= 0 {
 		return nil, fmt.Errorf("TMDB_API_KEY is not configured or invalid ID")
+	}
+
+	cacheKey := fmt.Sprintf("show_details_%d", showID)
+	if cachedData, ok := c.getCache(cacheKey); ok {
+		var meta DetailedMetadata
+		if err := json.Unmarshal(cachedData, &meta); err == nil {
+			return &meta, nil
+		}
 	}
 
 	u := fmt.Sprintf("https://api.themoviedb.org/3/tv/%d?api_key=%s&append_to_response=credits,external_ids",
@@ -335,6 +431,11 @@ func (c *Client) GetShowDetails(showID int) (*DetailedMetadata, error) {
 			Role: actor.Character,
 		})
 	}
+
+	if resBytes, err := json.Marshal(res); err == nil {
+		c.setCache(cacheKey, resBytes)
+	}
+
 	return res, nil
 }
 
@@ -342,6 +443,24 @@ func (c *Client) DownloadImage(imagePath, targetFile string) error {
 	if imagePath == "" {
 		return nil
 	}
+	// If destination already exists and is non-empty, avoid redundant download
+	if fi, err := os.Stat(targetFile); err == nil && fi.Size() > 0 {
+		return nil
+	}
+
+	// Check persistent image cache if configured
+	var cachedPath string
+	if c.cacheDir != "" {
+		imgName := strings.TrimPrefix(imagePath, "/")
+		imgName = strings.ReplaceAll(imgName, "/", "_")
+		cachedPath = filepath.Join(c.cacheDir, "images", imgName)
+		if fi, err := os.Stat(cachedPath); err == nil && fi.Size() > 0 {
+			if err := copyFile(cachedPath, targetFile); err == nil {
+				return nil
+			}
+		}
+	}
+
 	imageURL := fmt.Sprintf("https://image.tmdb.org/t/p/original%s", imagePath)
 
 	resp, err := c.httpClient.Get(imageURL)
@@ -364,7 +483,34 @@ func (c *Client) DownloadImage(imagePath, targetFile string) error {
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
+	if _, err = io.Copy(out, resp.Body); err != nil {
+		return err
+	}
+
+	if cachedPath != "" {
+		_ = copyFile(targetFile, cachedPath)
+	}
+
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
 	return err
 }
 
@@ -372,7 +518,7 @@ func (c *Client) DownloadImage(imagePath, targetFile string) error {
 type UniqueID struct {
 	Type    string `xml:"type,attr"`
 	Default string `xml:"default,attr,omitempty"`
-	Value   int    `xml:",chardata"`
+	Value   string `xml:",chardata"`
 }
 
 type Actor struct {
@@ -382,10 +528,10 @@ type Actor struct {
 }
 
 type DetailedMetadata struct {
-	Tagline string
-	IMDbID  string
-	Genres  []string
-	Actors  []Actor
+	Tagline string   `json:"tagline"`
+	IMDbID  string   `json:"imdb_id"`
+	Genres  []string `json:"genres"`
+	Actors  []Actor  `json:"actors"`
 }
 
 type MovieNFO struct {
@@ -398,6 +544,8 @@ type MovieNFO struct {
 	Genres   []string   `xml:"genre,omitempty"`
 	Actors   []Actor    `xml:"actor,omitempty"`
 	UniqueID []UniqueID `xml:"uniqueid"`
+	IMDbID   string     `xml:"imdbid,omitempty"`
+	ID       string     `xml:"id,omitempty"`
 }
 
 type TVShowNFO struct {
@@ -410,17 +558,22 @@ type TVShowNFO struct {
 	Genres   []string   `xml:"genre,omitempty"`
 	Actors   []Actor    `xml:"actor,omitempty"`
 	UniqueID []UniqueID `xml:"uniqueid"`
+	IMDbID   string     `xml:"imdbid,omitempty"`
+	ID       string     `xml:"id,omitempty"`
 }
 
 type EpisodeDetailsNFO struct {
-	XMLName  xml.Name   `xml:"episodedetails"`
-	Title    string     `xml:"title"`
-	Season   int        `xml:"season"`
-	Episode  int        `xml:"episode"`
-	Plot     string     `xml:"plot"`
-	Aired    string     `xml:"aired,omitempty"`
-	Rating   float64    `xml:"rating,omitempty"`
-	UniqueID []UniqueID `xml:"uniqueid"`
+	XMLName          xml.Name   `xml:"episodedetails"`
+	Title            string     `xml:"title"`
+	Season           int        `xml:"season"`
+	Episode          int        `xml:"episode"`
+	EpisodeNumberEnd int        `xml:"episodenumberend,omitempty"`
+	Plot             string     `xml:"plot"`
+	Aired            string     `xml:"aired,omitempty"`
+	Rating           float64    `xml:"rating,omitempty"`
+	UniqueID         []UniqueID `xml:"uniqueid"`
+	IMDbID           string     `xml:"imdbid,omitempty"`
+	ID               string     `xml:"id,omitempty"`
 }
 
 func GenerateMovieNFO(title, plot string, year int, rating float64, tmdbID int) string {
@@ -428,13 +581,15 @@ func GenerateMovieNFO(title, plot string, year int, rating float64, tmdbID int) 
 }
 
 func GenerateRichMovieNFO(title, plot string, year int, rating float64, tmdbID int, details *DetailedMetadata) string {
-	uids := []UniqueID{
-		{
+	uids := []UniqueID{}
+	if tmdbID > 0 {
+		uids = append(uids, UniqueID{
 			Type:    "tmdb",
 			Default: "true",
-			Value:   tmdbID,
-		},
+			Value:   strconv.Itoa(tmdbID),
+		})
 	}
+	var imdbID string
 	var genres []string
 	var actors []Actor
 	var tagline string
@@ -442,6 +597,13 @@ func GenerateRichMovieNFO(title, plot string, year int, rating float64, tmdbID i
 		tagline = details.Tagline
 		genres = details.Genres
 		actors = details.Actors
+		if details.IMDbID != "" {
+			imdbID = details.IMDbID
+			uids = append(uids, UniqueID{
+				Type:  "imdb",
+				Value: details.IMDbID,
+			})
+		}
 	}
 	nfo := MovieNFO{
 		Title:    title,
@@ -452,6 +614,8 @@ func GenerateRichMovieNFO(title, plot string, year int, rating float64, tmdbID i
 		Genres:   genres,
 		Actors:   actors,
 		UniqueID: uids,
+		IMDbID:   imdbID,
+		ID:       imdbID,
 	}
 	data, err := xml.MarshalIndent(nfo, "", "    ")
 	if err != nil {
@@ -465,13 +629,15 @@ func GenerateShowNFO(title, plot string, year int, rating float64, tmdbID int) s
 }
 
 func GenerateRichShowNFO(title, plot string, year int, rating float64, tmdbID int, details *DetailedMetadata) string {
-	uids := []UniqueID{
-		{
+	uids := []UniqueID{}
+	if tmdbID > 0 {
+		uids = append(uids, UniqueID{
 			Type:    "tmdb",
 			Default: "true",
-			Value:   tmdbID,
-		},
+			Value:   strconv.Itoa(tmdbID),
+		})
 	}
+	var imdbID string
 	var genres []string
 	var actors []Actor
 	var tagline string
@@ -479,6 +645,13 @@ func GenerateRichShowNFO(title, plot string, year int, rating float64, tmdbID in
 		tagline = details.Tagline
 		genres = details.Genres
 		actors = details.Actors
+		if details.IMDbID != "" {
+			imdbID = details.IMDbID
+			uids = append(uids, UniqueID{
+				Type:  "imdb",
+				Value: details.IMDbID,
+			})
+		}
 	}
 	nfo := TVShowNFO{
 		Title:    title,
@@ -489,6 +662,8 @@ func GenerateRichShowNFO(title, plot string, year int, rating float64, tmdbID in
 		Genres:   genres,
 		Actors:   actors,
 		UniqueID: uids,
+		IMDbID:   imdbID,
+		ID:       imdbID,
 	}
 	data, err := xml.MarshalIndent(nfo, "", "    ")
 	if err != nil {
@@ -498,20 +673,22 @@ func GenerateRichShowNFO(title, plot string, year int, rating float64, tmdbID in
 }
 
 func GenerateEpisodeNFO(title string, season, episode int, plot, airDate string, rating float64, tmdbID int) string {
+	uids := []UniqueID{}
+	if tmdbID > 0 {
+		uids = append(uids, UniqueID{
+			Type:    "tmdb",
+			Default: "true",
+			Value:   strconv.Itoa(tmdbID),
+		})
+	}
 	nfo := EpisodeDetailsNFO{
-		Title:   title,
-		Season:  season,
-		Episode: episode,
-		Plot:    plot,
-		Aired:   airDate,
-		Rating:  rating,
-		UniqueID: []UniqueID{
-			{
-				Type:    "tmdb",
-				Default: "true",
-				Value:   tmdbID,
-			},
-		},
+		Title:    title,
+		Season:   season,
+		Episode:  episode,
+		Plot:     plot,
+		Aired:    airDate,
+		Rating:   rating,
+		UniqueID: uids,
 	}
 	data, err := xml.MarshalIndent(nfo, "", "    ")
 	if err != nil {
@@ -521,14 +698,65 @@ func GenerateEpisodeNFO(title string, season, episode int, plot, airDate string,
 }
 
 func GenerateMultiEpisodeNFO(episodes []EpisodeDetailsNFO) string {
-	var sb strings.Builder
-	sb.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n")
+	if len(episodes) == 0 {
+		return ""
+	}
+	if len(episodes) == 1 {
+		data, err := xml.MarshalIndent(episodes[0], "", "    ")
+		if err != nil {
+			return ""
+		}
+		return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" + string(data)
+	}
+
+	first := episodes[0]
+	last := episodes[len(episodes)-1]
+
+	var titleParts []string
+	var plotParts []string
+	var totalRating float64
+	var ratingCount int
+
 	for _, ep := range episodes {
-		data, err := xml.MarshalIndent(ep, "", "    ")
-		if err == nil {
-			sb.Write(data)
-			sb.WriteString("\n")
+		if ep.Title != "" {
+			titleParts = append(titleParts, ep.Title)
+		}
+		if ep.Plot != "" {
+			plotParts = append(plotParts, fmt.Sprintf("Episode %d: %s", ep.Episode, ep.Plot))
+		}
+		if ep.Rating > 0 {
+			totalRating += ep.Rating
+			ratingCount++
 		}
 	}
-	return sb.String()
+
+	avgRating := first.Rating
+	if ratingCount > 0 {
+		avgRating = totalRating / float64(ratingCount)
+	}
+
+	combinedTitle := strings.Join(titleParts, " / ")
+	if combinedTitle == "" {
+		combinedTitle = fmt.Sprintf("Episodes %d-%d", first.Episode, last.Episode)
+	}
+	combinedPlot := strings.Join(plotParts, "\n\n")
+
+	composite := EpisodeDetailsNFO{
+		Title:            combinedTitle,
+		Season:           first.Season,
+		Episode:          first.Episode,
+		EpisodeNumberEnd: last.Episode,
+		Plot:             combinedPlot,
+		Aired:            first.Aired,
+		Rating:           avgRating,
+		UniqueID:         first.UniqueID,
+		IMDbID:           first.IMDbID,
+		ID:               first.ID,
+	}
+
+	data, err := xml.MarshalIndent(composite, "", "    ")
+	if err != nil {
+		return ""
+	}
+	return "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" + string(data)
 }

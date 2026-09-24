@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -59,12 +60,12 @@ func main() {
 		}
 	}
 
-	tmdbClient := metadata.NewClient(cfg.TMDBAPIKey)
+	tmdbClient := metadata.NewClient(cfg.TMDBAPIKey, cfg.MetadataCacheDir)
 	jfWriter := jellyfin.NewWriter(cfg.JellyfinMedia)
 	jfClient := jellyfin.NewClient(cfg.JellyfinURL, cfg.JellyfinAPIKey)
 
 	// Ingestion task queue (non-blocking decouple from Telegram event loop)
-	jobQueue := make(chan *telegram.IngestionTask, 100)
+	jobQueue := make(chan *telegram.IngestionTask, 500)
 
 	// Debounced Jellyfin Library Refresh Channel
 	refreshNotify := make(chan struct{}, 20)
@@ -184,32 +185,27 @@ func main() {
 			return
 		}
 
-		// Authenticate request using APEX_SECRET_KEY
+		// Authenticate request using APEX_SECRET_KEY via headers ONLY
 		authHeader := r.Header.Get("Authorization")
 		secretHeader := r.Header.Get("X-Apex-Secret")
-		secretQuery := r.URL.Query().Get("secret")
 
 		authenticated := false
-		if secretHeader == cfg.ApexSecretKey || secretQuery == cfg.ApexSecretKey {
+		if secretHeader != "" && secretHeader == cfg.ApexSecretKey {
 			authenticated = true
 		} else if strings.HasPrefix(authHeader, "Bearer ") && strings.TrimPrefix(authHeader, "Bearer ") == cfg.ApexSecretKey {
 			authenticated = true
 		}
 
 		if !authenticated {
-			http.Error(w, `{"error":"unauthorized: valid APEX_SECRET_KEY required"}`, http.StatusUnauthorized)
+			http.Error(w, `{"error":"unauthorized: valid APEX_SECRET_KEY required in X-Apex-Secret or Authorization header"}`, http.StatusUnauthorized)
 			return
 		}
 
 		var payload struct {
 			APIKey string `json:"api_key"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.APIKey == "" {
-			payload.APIKey = r.URL.Query().Get("key")
-		}
-
-		if strings.TrimSpace(payload.APIKey) == "" {
-			http.Error(w, `{"error":"api_key is required"}`, http.StatusBadRequest)
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || strings.TrimSpace(payload.APIKey) == "" {
+			http.Error(w, `{"error":"JSON body with 'api_key' is required"}`, http.StatusBadRequest)
 			return
 		}
 
@@ -264,6 +260,29 @@ func main() {
 	_ = server.Shutdown(shutdownCtx)
 
 	log.Println("[Apex] Shutdown complete.")
+}
+
+// generateVersionedStrmFileName generates a collision-free STRM file name
+// following Jellyfin multi-version convention:
+// 1. Primary: "<base>.strm"
+// 2. Secondary: "<base> - <edition>.strm"
+// 3. Collision: "<base> - <edition> [<opaqueID>].strm"
+func generateVersionedStrmFileName(targetDir, baseTitle, edition, opaqueID string) string {
+	primary := baseTitle + ".strm"
+	if _, err := os.Stat(filepath.Join(targetDir, primary)); os.IsNotExist(err) {
+		return primary
+	}
+
+	tag := strings.TrimSpace(edition)
+	if tag == "" {
+		tag = opaqueID
+	}
+	secondary := fmt.Sprintf("%s - %s.strm", baseTitle, tag)
+	if _, err := os.Stat(filepath.Join(targetDir, secondary)); os.IsNotExist(err) {
+		return secondary
+	}
+
+	return fmt.Sprintf("%s - %s [%s].strm", baseTitle, tag, opaqueID)
 }
 
 func processIngestionTask(
@@ -443,7 +462,9 @@ func processIngestionTask(
 			PosterPath:   posterPath,
 			BackdropPath: backdropPath,
 		}
-		_ = database.SaveSeries(seriesObj)
+		if err := database.SaveSeries(seriesObj); err != nil {
+			log.Printf("[Worker #%d] Warning: failed to save series %s: %v", workerID, seriesObj.ID, err)
+		}
 
 		// Persist Season row
 		seasonObj := &db.Season{
@@ -452,11 +473,14 @@ func processIngestionTask(
 			SeasonNumber: parsed.Season,
 			Title:        fmt.Sprintf("Season %02d", parsed.Season),
 		}
-		_ = database.SaveSeason(seasonObj)
+		if err := database.SaveSeason(seasonObj); err != nil {
+			log.Printf("[Worker #%d] Warning: failed to save season %s: %v", workerID, seasonObj.ID, err)
+		}
 
 		if endEp > startEp {
 			// Multi-episode file: Jellyfin native multi-episode convention "Show S01E01-E03.strm"
-			strmFileName := fmt.Sprintf("%s S%02dE%02d-E%02d.strm", parsed.CleanTitle, parsed.Season, startEp, endEp)
+			baseTitle := fmt.Sprintf("%s S%02dE%02d-E%02d", parsed.CleanTitle, parsed.Season, startEp, endEp)
+			strmFileName := generateVersionedStrmFileName(seasonDir, baseTitle, parsed.Resolution, opaqueID)
 			epStrmRelPath := filepath.Join(relDir, strmFileName)
 			epStrmPath, err := jfWriter.WriteSTRM(epStrmRelPath, opaqueID)
 			if err != nil {
@@ -500,7 +524,7 @@ func processIngestionTask(
 					Aired:   epAirDate,
 					Rating:  epRating,
 					UniqueID: []metadata.UniqueID{
-						{Type: "tmdb", Default: "true", Value: tmdbID},
+						{Type: "tmdb", Default: "true", Value: strconv.Itoa(tmdbID)},
 					},
 				})
 
@@ -522,26 +546,24 @@ func processIngestionTask(
 					StillPath:     epStillPath,
 					StrmPath:      epStrmPath,
 				}
-				_ = database.SaveEpisode(epObj)
+				if err := database.SaveEpisode(epObj); err != nil {
+					log.Printf("[Worker #%d] Warning: failed to save episode %s: %v", workerID, epObj.ID, err)
+				}
 			}
 
-			// Write multi-episode NFO
+			// Write multi-episode NFO matching the STRM file
 			multiNfoContent := metadata.GenerateMultiEpisodeNFO(epNFOs)
-			multiNfoPath := filepath.Join(seasonDir, fmt.Sprintf("%s S%02dE%02d-E%02d.nfo", parsed.CleanTitle, parsed.Season, startEp, endEp))
-			_ = os.WriteFile(multiNfoPath, []byte(multiNfoContent), 0644)
+			multiNfoPath := filepath.Join(seasonDir, fmt.Sprintf("%s.nfo", strings.TrimSuffix(strmFileName, ".strm")))
+			if _, err := os.Stat(multiNfoPath); os.IsNotExist(err) {
+				if err := os.WriteFile(multiNfoPath, []byte(multiNfoContent), 0644); err != nil {
+					log.Printf("[Worker #%d] Warning: failed to write multi-episode NFO: %v", workerID, err)
+				}
+			}
 
 		} else {
 			// Single episode
-			strmFileName := fmt.Sprintf("%s S%02dE%02d.strm", parsed.CleanTitle, parsed.Season, startEp)
-			// Avoid collision with existing different version
-			existingStrm := filepath.Join(cfg.JellyfinMedia, relDir, strmFileName)
-			if _, err := os.Stat(existingStrm); err == nil {
-				versionTag := parsed.Resolution
-				if versionTag == "" {
-					versionTag = opaqueID
-				}
-				strmFileName = fmt.Sprintf("%s S%02dE%02d - %s.strm", parsed.CleanTitle, parsed.Season, startEp, versionTag)
-			}
+			baseTitle := fmt.Sprintf("%s S%02dE%02d", parsed.CleanTitle, parsed.Season, startEp)
+			strmFileName := generateVersionedStrmFileName(seasonDir, baseTitle, parsed.Resolution, opaqueID)
 
 			epStrmRelPath := filepath.Join(relDir, strmFileName)
 			epStrmPath, err := jfWriter.WriteSTRM(epStrmRelPath, opaqueID)
@@ -576,10 +598,12 @@ func processIngestionTask(
 				}
 			}
 
-			epNfoPath := filepath.Join(seasonDir, fmt.Sprintf("%s S%02dE%02d.nfo", parsed.CleanTitle, parsed.Season, startEp))
+			epNfoPath := filepath.Join(seasonDir, fmt.Sprintf("%s.nfo", strings.TrimSuffix(strmFileName, ".strm")))
 			if _, err := os.Stat(epNfoPath); os.IsNotExist(err) {
 				epNfoContent := metadata.GenerateEpisodeNFO(epTitle, parsed.Season, startEp, epPlot, epAirDate, epRating, tmdbID)
-				_ = os.WriteFile(epNfoPath, []byte(epNfoContent), 0644)
+				if err := os.WriteFile(epNfoPath, []byte(epNfoContent), 0644); err != nil {
+					log.Printf("[Worker #%d] Warning: failed to write episode NFO: %v", workerID, err)
+				}
 			}
 			if epStillPath != "" {
 				thumbDest := filepath.Join(seasonDir, fmt.Sprintf("%s S%02dE%02d-thumb.jpg", parsed.CleanTitle, parsed.Season, startEp))
@@ -601,7 +625,9 @@ func processIngestionTask(
 				StillPath:     epStillPath,
 				StrmPath:      epStrmPath,
 			}
-			_ = database.SaveEpisode(epObj)
+			if err := database.SaveEpisode(epObj); err != nil {
+				log.Printf("[Worker #%d] Warning: failed to save episode %s: %v", workerID, epObj.ID, err)
+			}
 		}
 	} else {
 		// Movie
@@ -613,20 +639,7 @@ func processIngestionTask(
 		movieDir := filepath.Join(cfg.JellyfinMedia, relDir)
 		_ = os.MkdirAll(movieDir, 0755)
 
-		// Version-aware file naming to support multiple copies/editions in Jellyfin
-		strmFileName := baseName + ".strm"
-		fullDefaultStrm := filepath.Join(movieDir, strmFileName)
-		if _, err := os.Stat(fullDefaultStrm); err == nil {
-			// A version already exists! Determine unique edition/quality label
-			versionLabel := parsed.Resolution
-			if versionLabel == "" {
-				versionLabel = opaqueID
-			}
-			strmFileName = fmt.Sprintf("%s - %s.strm", baseName, versionLabel)
-			if _, err := os.Stat(filepath.Join(movieDir, strmFileName)); err == nil {
-				strmFileName = fmt.Sprintf("%s - %s [%s].strm", baseName, versionLabel, opaqueID)
-			}
-		}
+		strmFileName := generateVersionedStrmFileName(movieDir, baseName, parsed.Resolution, opaqueID)
 
 		strmRelPath := filepath.Join(relDir, strmFileName)
 		fullStrmPath, err := jfWriter.WriteSTRM(strmRelPath, opaqueID)
@@ -643,7 +656,9 @@ func processIngestionTask(
 		nfoPath := filepath.Join(movieDir, "movie.nfo")
 		if _, err := os.Stat(nfoPath); os.IsNotExist(err) {
 			nfoContent := metadata.GenerateRichMovieNFO(parsed.CleanTitle, plot, parsed.Year, rating, tmdbID, detailedMeta)
-			_ = os.WriteFile(nfoPath, []byte(nfoContent), 0644)
+			if err := os.WriteFile(nfoPath, []byte(nfoContent), 0644); err != nil {
+				log.Printf("[Worker #%d] Warning: failed to write movie NFO: %v", workerID, err)
+			}
 		}
 
 		if posterPath != "" {
@@ -670,7 +685,9 @@ func processIngestionTask(
 			BackdropPath: backdropPath,
 			StrmPath:     fullStrmPath,
 		}
-		_ = database.SaveMovie(movieObj)
+		if err := database.SaveMovie(movieObj); err != nil {
+			log.Printf("[Worker #%d] Warning: failed to save movie %s: %v", workerID, movieObj.ID, err)
+		}
 	}
 
 	// 8. Persist MediaItem lookup index with actual verified primary .strm path

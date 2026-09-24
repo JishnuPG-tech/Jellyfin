@@ -381,9 +381,11 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 		}
 
 		res, err := raw.UploadGetFile(ctx, &tg.UploadGetFileRequest{
-			Location: location,
-			Offset:   offset,
-			Limit:    limit,
+			Location:     location,
+			Offset:       offset,
+			Limit:        limit,
+			Precise:      true,
+			CDNSupported: false,
 		})
 		atomic.AddInt64(&worker.activeReqs, -1)
 
@@ -393,17 +395,8 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 			case *tg.UploadFile:
 				return file.Bytes, nil
 			case *tg.UploadFileCDNRedirect:
-				log.Printf("[Telegram] Received CDN redirect for media %s (DC: %d). Requesting re-upload to master DC...", item.ID, file.DCID)
-				_, reuploadErr := raw.UploadReuploadCDNFile(ctx, &tg.UploadReuploadCDNFileRequest{
-					FileToken:    file.FileToken,
-					RequestToken: file.FileToken,
-				})
-				if reuploadErr != nil {
-					log.Printf("[Telegram] CDN re-upload failed: %v", reuploadErr)
-					return nil, fmt.Errorf("CDN redirect received and re-upload failed: %w", reuploadErr)
-				}
-				time.Sleep(200 * time.Millisecond)
-				continue
+				log.Printf("[Telegram] Warning: CDN redirect received for media %s (DC: %d) despite CDNSupported: false", item.ID, file.DCID)
+				return nil, fmt.Errorf("file requires external Telegram CDN routing (DC: %d)", file.DCID)
 			}
 			return nil, fmt.Errorf("unexpected file response type")
 		}
