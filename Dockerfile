@@ -20,7 +20,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         nginx \
         curl \
-        ca-certificates && \
+        ca-certificates \
+        sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Apex Core Go binary

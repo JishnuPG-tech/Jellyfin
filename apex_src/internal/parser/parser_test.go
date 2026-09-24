@@ -68,6 +68,20 @@ func TestParserSeries(t *testing.T) {
 			wantEndEp:   3,
 		},
 		{
+			input:       "Show.Name.S01E01-03.720p.mkv",
+			wantTitle:   "Show Name",
+			wantSeason:  1,
+			wantEpisode: 1,
+			wantEndEp:   3,
+		},
+		{
+			input:       "Show.Name.S01E01E02.1080p.mkv",
+			wantTitle:   "Show Name",
+			wantSeason:  1,
+			wantEpisode: 1,
+			wantEndEp:   2,
+		},
+		{
 			input:       "The.Office.US.2x04.HDTV.mp4",
 			wantTitle:   "The Office US",
 			wantSeason:  2,

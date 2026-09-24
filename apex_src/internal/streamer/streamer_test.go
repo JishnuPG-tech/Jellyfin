@@ -76,11 +76,18 @@ func TestStreamGatewayAuthAndRanges(t *testing.T) {
 	}
 
 	item := &db.MediaItem{
-		ID:         mediaID,
-		FileSize:   int64(len(testPayload)),
-		MimeType:   "video/mp4",
-		CleanTitle: "Test Movie",
-		MediaType:  "movie",
+		ID:           mediaID,
+		SourceChatID: 1001,
+		MessageID:    42,
+		FileID:       "test_fid",
+		FileUniqueID: "test_fuid",
+		FileRef:      []byte("valid_test_blob_ref"),
+		AccessHash:   987654321,
+		FileSize:     int64(len(testPayload)),
+		MimeType:     "video/mp4",
+		CleanTitle:   "Test Movie",
+		MediaType:    "movie",
+		StrmPath:     "/tmp/test.strm",
 	}
 	if err := database.SaveMediaItem(item); err != nil {
 		t.Fatalf("Failed to save media item: %v", err)

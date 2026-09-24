@@ -48,6 +48,9 @@ echo "[Apex] APEX_SECRET_KEY verified."
 if [ -f "/data/apex/backups/apex_latest.db" ]; then
     echo "[Apex] Restoring Apex Core SQLite snapshot from /data/apex/backups/apex_latest.db..."
     cp -f /data/apex/backups/apex_latest.db /tmp/apex-db/apex.db
+    if [ -f "/data/apex/backups/apex_latest.db-wal" ]; then
+        cp -f /data/apex/backups/apex_latest.db-wal /tmp/apex-db/apex.db-wal
+    fi
 else
     echo "[Apex] Fresh database initialized at /tmp/apex-db/apex.db."
 fi
@@ -91,9 +94,14 @@ fi
 # ── 5. Graceful Shutdown & Snapshot Backup Handlers ────────────────────────────
 backup_apex_sqlite() {
     if [ -f "/tmp/apex-db/apex.db" ]; then
+        if command -v sqlite3 >/dev/null 2>&1; then
+            sqlite3 /tmp/apex-db/apex.db "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+        fi
         cp -f /tmp/apex-db/apex.db /tmp/apex-db/apex_backup.db 2>/dev/null || true
+        [ -f "/tmp/apex-db/apex.db-wal" ] && cp -f /tmp/apex-db/apex.db-wal /tmp/apex-db/apex_backup.db-wal 2>/dev/null || true
         if [ -f "/tmp/apex-db/apex_backup.db" ]; then
             mv -f /tmp/apex-db/apex_backup.db /data/apex/backups/apex_latest.db
+            [ -f "/tmp/apex-db/apex_backup.db-wal" ] && mv -f /tmp/apex-db/apex_backup.db-wal /data/apex/backups/apex_latest.db-wal
             echo "[Apex] Apex Core SQLite snapshot saved to /data/apex/backups/apex_latest.db."
         fi
     fi
@@ -111,8 +119,14 @@ cleanup() {
         done
     fi
 
-    # 2. Stop Apex Core & Nginx
-    [ -n "${APEX_CORE_PID:-}" ] && kill -TERM "${APEX_CORE_PID}" 2>/dev/null || true
+    # 2. Stop Apex Core (wait up to 5s for clean WAL flush) & Nginx
+    if [ -n "${APEX_CORE_PID:-}" ]; then
+        kill -TERM "${APEX_CORE_PID}" 2>/dev/null || true
+        for i in {1..10}; do
+            kill -0 "${APEX_CORE_PID}" 2>/dev/null || break
+            sleep 0.5
+        done
+    fi
     [ -n "${NGINX_PID:-}" ] && kill -QUIT "${NGINX_PID}" 2>/dev/null || true
 
     # 3. Snapshot local databases to persistent storage

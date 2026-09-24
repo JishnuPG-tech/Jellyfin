@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -46,7 +45,7 @@ func main() {
 	// 2. Initialize Two-Tier Cache & Streaming Gateway
 	cache := streamer.NewLRUCache(cfg.MemoryCacheMB, cfg.DiskCacheMB, cfg.DiskCachePath)
 	tgManager := telegram.NewManager(cfg, database)
-	gateway := streamer.NewGateway(database, cache, tgManager)
+	gateway := streamer.NewGateway(cfg, database, cache, tgManager)
 
 	// 3. Initialize Metadata & Jellyfin Services
 	apiKeyFile := filepath.Join(filepath.Dir(cfg.SessionFilePath), "jellyfin_api_key.txt")
@@ -182,6 +181,23 @@ func main() {
 	mux.HandleFunc("/apex/api-key", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed. Use POST with JSON: {\"api_key\":\"...\"}", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Authenticate request using APEX_SECRET_KEY
+		authHeader := r.Header.Get("Authorization")
+		secretHeader := r.Header.Get("X-Apex-Secret")
+		secretQuery := r.URL.Query().Get("secret")
+
+		authenticated := false
+		if secretHeader == cfg.ApexSecretKey || secretQuery == cfg.ApexSecretKey {
+			authenticated = true
+		} else if strings.HasPrefix(authHeader, "Bearer ") && strings.TrimPrefix(authHeader, "Bearer ") == cfg.ApexSecretKey {
+			authenticated = true
+		}
+
+		if !authenticated {
+			http.Error(w, `{"error":"unauthorized: valid APEX_SECRET_KEY required"}`, http.StatusUnauthorized)
 			return
 		}
 

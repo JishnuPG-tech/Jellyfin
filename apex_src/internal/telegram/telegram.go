@@ -29,6 +29,7 @@ type IngestionTask struct {
 }
 
 type TransferWorker struct {
+	mu                sync.RWMutex
 	client            *telegram.Client
 	idx               int
 	activeReqs        int64
@@ -37,13 +38,48 @@ type TransferWorker struct {
 	healthy           bool
 }
 
+func (w *TransferWorker) SetHealthy(healthy bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.healthy = healthy
+}
+
+func (w *TransferWorker) IsAvailable(now time.Time) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if !w.healthy {
+		return false
+	}
+	return !now.Before(w.floodWaitUntil)
+}
+
+func (w *TransferWorker) RecordSuccess() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.consecutiveErrors = 0
+}
+
+func (w *TransferWorker) RecordFloodWait(until time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.consecutiveErrors++
+	w.floodWaitUntil = until
+}
+
+func (w *TransferWorker) RecordError() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.consecutiveErrors++
+}
+
 type Manager struct {
-	cfg          *config.Config
-	database     *db.Database
-	updateClient *telegram.Client
-	transferPool []*TransferWorker
-	poolMu       sync.RWMutex
-	rawAPI       *tg.Client
+	cfg                 *config.Config
+	database            *db.Database
+	updateClient        *telegram.Client
+	transferPool        []*TransferWorker
+	poolMu              sync.RWMutex
+	rawAPI              *tg.Client
+	channelAccessHashes sync.Map
 }
 
 func NewManager(cfg *config.Config, database *db.Database) *Manager {
@@ -117,6 +153,7 @@ func (m *Manager) Start(ctx context.Context, jobQueue chan<- *IngestionTask) err
 			peerDesc = fmt.Sprintf("Channel(%d)", peer.ChannelID)
 			if c, exists := e.Channels[peer.ChannelID]; exists {
 				inputPeer = &tg.InputPeerChannel{ChannelID: peer.ChannelID, AccessHash: c.AccessHash}
+				m.channelAccessHashes.Store(peer.ChannelID, c.AccessHash)
 			}
 		}
 
@@ -253,10 +290,10 @@ func (m *Manager) Start(ctx context.Context, jobQueue chan<- *IngestionTask) err
 				_, authErr := w.client.Auth().Bot(ctx, m.cfg.TelegramBotToken)
 				if authErr != nil {
 					log.Printf("[Telegram] Worker #%d auth error: %v", w.idx, authErr)
-					w.healthy = false
+					w.SetHealthy(false)
 					return authErr
 				}
-				w.healthy = true
+				w.SetHealthy(true)
 				log.Printf("[Telegram] Media transfer worker #%d active.", w.idx)
 				<-ctx.Done()
 				return nil
@@ -280,11 +317,8 @@ func (m *Manager) getBestWorker() *TransferWorker {
 	minActive := int64(1<<62 - 1)
 
 	for _, w := range m.transferPool {
-		if !w.healthy {
+		if !w.IsAvailable(now) {
 			continue
-		}
-		if now.Before(w.floodWaitUntil) {
-			continue // Skip workers currently throttled
 		}
 
 		active := atomic.LoadInt64(&w.activeReqs)
@@ -330,7 +364,7 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 		atomic.AddInt64(&worker.activeReqs, -1)
 
 		if err == nil {
-			worker.consecutiveErrors = 0
+			worker.RecordSuccess()
 			switch file := res.(type) {
 			case *tg.UploadFile:
 				return file.Bytes, nil
@@ -340,13 +374,11 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 			return nil, fmt.Errorf("unexpected file response type")
 		}
 
-		worker.consecutiveErrors++
-
 		// Handle FLOOD_WAIT_X
 		if d, ok := tgerr.AsFloodWait(err); ok {
 			jitter := time.Duration(rand.Intn(500)) * time.Millisecond
 			sleepDuration := d + jitter
-			worker.floodWaitUntil = time.Now().Add(sleepDuration)
+			worker.RecordFloodWait(time.Now().Add(sleepDuration))
 			log.Printf("[Telegram] Worker #%d FLOOD_WAIT %v. Backing off.", worker.idx, sleepDuration)
 			select {
 			case <-time.After(sleepDuration):
@@ -354,6 +386,8 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
+		} else {
+			worker.RecordError()
 		}
 
 		// Handle FILE_REFERENCE_EXPIRED
@@ -376,9 +410,13 @@ func (m *Manager) RefreshFileReference(ctx context.Context, item *db.MediaItem) 
 	}
 
 	// 1. Try ChannelsGetMessages (for broadcast channels and supergroups)
+	var channelHash int64
+	if val, ok := m.channelAccessHashes.Load(item.SourceChatID); ok {
+		channelHash = val.(int64)
+	}
 	channel := &tg.InputChannel{
 		ChannelID:  item.SourceChatID,
-		AccessHash: 0,
+		AccessHash: channelHash,
 	}
 
 	messages, err := m.rawAPI.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{

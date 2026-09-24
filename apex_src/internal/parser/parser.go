@@ -20,8 +20,10 @@ type ParsedMedia struct {
 }
 
 var (
-	// Multi-episode: S01E01-E03 or S01E01-03 or S01E01E02
-	reMultiEp = regexp.MustCompile(`(?i)[._ -]S([0-9]{1,2})E([0-9]{1,3})[-_ ]?E?([0-9]{1,3})`)
+	// Multi-episode: S01E01-E03 or S01E01-03
+	reMultiEpDash = regexp.MustCompile(`(?i)[._ -]S([0-9]{1,2})E([0-9]{1,3})-(?:E)?([0-9]{1,3})`)
+	// Multi-episode: S01E01E02
+	reMultiEpEE = regexp.MustCompile(`(?i)[._ -]S([0-9]{1,2})E([0-9]{1,3})E([0-9]{1,3})`)
 
 	// Standard TV Season / Episode patterns: S01E02, s01e02
 	reSeasonEp1 = regexp.MustCompile(`(?i)[._ -]S([0-9]{1,2})E([0-9]{1,3})`)
@@ -62,44 +64,65 @@ func Parse(raw string) *ParsedMedia {
 	// Strip release group brackets at start, e.g. [SubsPlease] Title -> Title
 	clean = reBrackets.ReplaceAllString(clean, "")
 
-	// 1. Check for Multi-Episode: S01E01-E03
-	if match := reMultiEp.FindStringSubmatch(clean); len(match) == 4 {
-		res.MediaType = "series"
-		res.Season, _ = strconv.Atoi(match[1])
-		res.Episode, _ = strconv.Atoi(match[2])
-		res.EndEpisode, _ = strconv.Atoi(match[3])
-		clean = clean[:reMultiEp.FindStringIndex(clean)[0]]
-		res.Confidence += 0.3
-	} else if match := reSeasonEp1.FindStringSubmatch(clean); len(match) == 3 {
-		res.MediaType = "series"
-		res.Season, _ = strconv.Atoi(match[1])
-		res.Episode, _ = strconv.Atoi(match[2])
-		clean = clean[:reSeasonEp1.FindStringIndex(clean)[0]]
-		res.Confidence += 0.3
-	} else if match := reSeasonEp2.FindStringSubmatch(clean); len(match) == 3 {
-		res.MediaType = "series"
-		res.Season, _ = strconv.Atoi(match[1])
-		res.Episode, _ = strconv.Atoi(match[2])
-		clean = clean[:reSeasonEp2.FindStringIndex(clean)[0]]
-		res.Confidence += 0.25
-	} else if match := reSeasonEp3.FindStringSubmatch(clean); len(match) == 3 {
-		res.MediaType = "series"
-		res.Season, _ = strconv.Atoi(match[1])
-		res.Episode, _ = strconv.Atoi(match[2])
-		clean = clean[:reSeasonEp3.FindStringIndex(clean)[0]]
-		res.Confidence += 0.3
-	} else if match := reEpOnly.FindStringSubmatch(clean); len(match) == 2 {
-		res.MediaType = "series"
-		res.Season = 1
-		res.Episode, _ = strconv.Atoi(match[1])
-		clean = clean[:reEpOnly.FindStringIndex(clean)[0]]
-		res.Confidence += 0.2
-	} else if match := reAnimeEp.FindStringSubmatch(clean); len(match) == 2 {
-		res.MediaType = "series"
-		res.Season = 1
-		res.Episode, _ = strconv.Atoi(match[1])
-		clean = clean[:reAnimeEp.FindStringIndex(clean)[0]]
-		res.Confidence += 0.2
+	// 1. Check for Multi-Episode: S01E01-E03 or S01E01E02
+	if match := reMultiEpDash.FindStringSubmatch(clean); len(match) == 4 {
+		s, _ := strconv.Atoi(match[1])
+		e1, _ := strconv.Atoi(match[2])
+		e2, _ := strconv.Atoi(match[3])
+		if e2 > e1 {
+			res.MediaType = "series"
+			res.Season = s
+			res.Episode = e1
+			res.EndEpisode = e2
+			clean = clean[:reMultiEpDash.FindStringIndex(clean)[0]]
+			res.Confidence += 0.35
+		}
+	} else if match := reMultiEpEE.FindStringSubmatch(clean); len(match) == 4 {
+		s, _ := strconv.Atoi(match[1])
+		e1, _ := strconv.Atoi(match[2])
+		e2, _ := strconv.Atoi(match[3])
+		if e2 > e1 {
+			res.MediaType = "series"
+			res.Season = s
+			res.Episode = e1
+			res.EndEpisode = e2
+			clean = clean[:reMultiEpEE.FindStringIndex(clean)[0]]
+			res.Confidence += 0.35
+		}
+	}
+
+	if res.MediaType != "series" {
+		if match := reSeasonEp1.FindStringSubmatch(clean); len(match) == 3 {
+			res.MediaType = "series"
+			res.Season, _ = strconv.Atoi(match[1])
+			res.Episode, _ = strconv.Atoi(match[2])
+			clean = clean[:reSeasonEp1.FindStringIndex(clean)[0]]
+			res.Confidence += 0.3
+		} else if match := reSeasonEp2.FindStringSubmatch(clean); len(match) == 3 {
+			res.MediaType = "series"
+			res.Season, _ = strconv.Atoi(match[1])
+			res.Episode, _ = strconv.Atoi(match[2])
+			clean = clean[:reSeasonEp2.FindStringIndex(clean)[0]]
+			res.Confidence += 0.25
+		} else if match := reSeasonEp3.FindStringSubmatch(clean); len(match) == 3 {
+			res.MediaType = "series"
+			res.Season, _ = strconv.Atoi(match[1])
+			res.Episode, _ = strconv.Atoi(match[2])
+			clean = clean[:reSeasonEp3.FindStringIndex(clean)[0]]
+			res.Confidence += 0.3
+		} else if match := reEpOnly.FindStringSubmatch(clean); len(match) == 2 {
+			res.MediaType = "series"
+			res.Season = 1
+			res.Episode, _ = strconv.Atoi(match[1])
+			clean = clean[:reEpOnly.FindStringIndex(clean)[0]]
+			res.Confidence += 0.2
+		} else if match := reAnimeEp.FindStringSubmatch(clean); len(match) == 2 {
+			res.MediaType = "series"
+			res.Season = 1
+			res.Episode, _ = strconv.Atoi(match[1])
+			clean = clean[:reAnimeEp.FindStringIndex(clean)[0]]
+			res.Confidence += 0.2
+		}
 	}
 
 	// 2. Check for Year
