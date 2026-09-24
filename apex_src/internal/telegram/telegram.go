@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -414,7 +415,13 @@ func (m *Manager) FetchChunk(ctx context.Context, item *db.MediaItem, offset int
 				return nil, ctx.Err()
 			}
 		} else {
-			worker.RecordError()
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// The downstream client closed the connection or timed out.
+				// This is normal and should not trip the circuit breaker.
+			} else {
+				worker.RecordError()
+				log.Printf("[Telegram] Worker #%d error streaming chunk offset %d for %s: %v", worker.idx, offset, item.ID, err)
+			}
 		}
 
 		// Handle FILE_REFERENCE_EXPIRED

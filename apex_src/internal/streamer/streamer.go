@@ -159,8 +159,25 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Lookup media record
-	item, err := g.database.GetMediaItem(mediaID)
-	if err != nil {
+	var item *db.MediaItem
+	var err error
+
+	if prefix == "stream" && len(parts) >= 3 {
+		chatID, err1 := strconv.ParseInt(parts[1], 10, 64)
+		msgID, err2 := strconv.Atoi(parts[2])
+		if err1 == nil && err2 == nil {
+			item, err = g.database.GetMediaItemByMessageID(chatID, msgID)
+			if item != nil {
+				mediaID = item.ID // use internal ID for caching and session management
+			}
+		}
+	}
+
+	if item == nil {
+		item, err = g.database.GetMediaItem(mediaID)
+	}
+
+	if err != nil || item == nil {
 		http.Error(w, "media item not found", http.StatusNotFound)
 		return
 	}

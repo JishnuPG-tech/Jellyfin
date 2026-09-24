@@ -24,13 +24,12 @@ func NewWriter(baseDir string) *Writer {
 	return &Writer{baseDir: baseDir}
 }
 
-func (w *Writer) WriteSTRM(relPath, apxID string) (string, error) {
+func (w *Writer) WriteSTRM(relPath, streamURL string) (string, error) {
 	fullPath := filepath.Join(w.baseDir, relPath)
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		return "", err
 	}
 
-	streamURL := fmt.Sprintf("http://127.0.0.1:8084/stream/%s", apxID)
 	err := os.WriteFile(fullPath, []byte(streamURL), 0644)
 	if err != nil {
 		return "", err
@@ -40,7 +39,7 @@ func (w *Writer) WriteSTRM(relPath, apxID string) (string, error) {
 
 // ClaimAndWriteSTRM atomically creates a new STRM file using O_CREATE|O_EXCL.
 // If the target file already exists, it returns os.ErrExist to allow race-free collision handling.
-func (w *Writer) ClaimAndWriteSTRM(relPath, apxID string) (string, error) {
+func (w *Writer) ClaimAndWriteSTRM(relPath, streamURL string) (string, error) {
 	fullPath := filepath.Join(w.baseDir, relPath)
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		return "", err
@@ -52,7 +51,6 @@ func (w *Writer) ClaimAndWriteSTRM(relPath, apxID string) (string, error) {
 	}
 	defer f.Close()
 
-	streamURL := fmt.Sprintf("http://127.0.0.1:8084/stream/%s", apxID)
 	if _, err := f.WriteString(streamURL); err != nil {
 		return "", err
 	}
@@ -63,7 +61,7 @@ func (w *Writer) ClaimAndWriteSTRM(relPath, apxID string) (string, error) {
 // 1. Primary: "<base>.strm"
 // 2. Secondary: "<base> - <edition>.strm"
 // 3. Collision: "<base> - <edition> [<opaqueID>].strm"
-func (w *Writer) WriteVersionedSTRM(relDir, baseTitle, edition, opaqueID string) (fileName string, fullPath string, err error) {
+func (w *Writer) WriteVersionedSTRM(relDir, baseTitle, edition, opaqueID, streamURL string) (fileName string, fullPath string, err error) {
 	tag := strings.TrimSpace(edition)
 	if tag == "" {
 		tag = opaqueID
@@ -77,7 +75,7 @@ func (w *Writer) WriteVersionedSTRM(relDir, baseTitle, edition, opaqueID string)
 
 	for _, name := range candidates {
 		relPath := filepath.Join(relDir, name)
-		fp, err := w.ClaimAndWriteSTRM(relPath, opaqueID)
+		fp, err := w.ClaimAndWriteSTRM(relPath, streamURL)
 		if err == nil {
 			return name, fp, nil
 		}
@@ -90,7 +88,7 @@ func (w *Writer) WriteVersionedSTRM(relDir, baseTitle, edition, opaqueID string)
 	// Microsecond fallback to guarantee collision immunity under extreme worker concurrency
 	fallback := fmt.Sprintf("%s - %s [%s_%d].strm", baseTitle, tag, opaqueID, time.Now().UnixNano()%100000)
 	relPath := filepath.Join(relDir, fallback)
-	fp, err := w.ClaimAndWriteSTRM(relPath, opaqueID)
+	fp, err := w.ClaimAndWriteSTRM(relPath, streamURL)
 	return fallback, fp, err
 }
 

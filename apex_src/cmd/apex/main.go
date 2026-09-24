@@ -43,6 +43,9 @@ func main() {
 	defer database.Close()
 	log.Printf("[Apex] Database initialized at %s", cfg.DBPath)
 
+	// Launch background reconciliation of STRM files
+	go reconcileSTRMFiles(cfg.JellyfinMedia, database)
+
 	// 2. Initialize Two-Tier Cache & Streaming Gateway
 	cache := streamer.NewLRUCache(cfg.MemoryCacheMB, cfg.DiskCacheMB, cfg.DiskCachePath)
 	tgManager := telegram.NewManager(cfg, database)
@@ -310,7 +313,7 @@ func processIngestionTask(
 		// Verify STRM still exists; recreate if missing
 		if _, err := os.Stat(existing.StrmPath); os.IsNotExist(err) {
 			log.Printf("[Worker #%d] Missing STRM file detected for '%s'. Recreating...", workerID, existing.ID)
-			streamURL := fmt.Sprintf("http://127.0.0.1:8084/stream/%s", existing.ID)
+			streamURL := fmt.Sprintf("http://127.0.0.1:8084/stream/%d/%d/video.mp4", existing.SourceChatID, existing.MessageID)
 			_ = os.MkdirAll(filepath.Dir(existing.StrmPath), 0755)
 			_ = os.WriteFile(existing.StrmPath, []byte(streamURL), 0644)
 		}
@@ -473,7 +476,7 @@ func processIngestionTask(
 		if endEp > startEp {
 			// Multi-episode file: Jellyfin native multi-episode convention "Show S01E01-E03.strm"
 			baseTitle := fmt.Sprintf("%s S%02dE%02d-E%02d", parsed.CleanTitle, parsed.Season, startEp, endEp)
-			strmFileName, epStrmPath, err := jfWriter.WriteVersionedSTRM(relDir, baseTitle, parsed.Resolution, opaqueID)
+			strmFileName, epStrmPath, err := jfWriter.WriteVersionedSTRM(relDir, baseTitle, parsed.Resolution, opaqueID, fmt.Sprintf("http://127.0.0.1:%s/stream/%d/%d/video.mp4", cfg.ServerPort, task.ChatID, task.MsgID))
 			if err != nil {
 				log.Printf("[Worker #%d] Error writing multi-ep .strm: %v", workerID, err)
 				job.Status = "failed"
@@ -579,7 +582,7 @@ func processIngestionTask(
 		} else {
 			// Single episode
 			baseTitle := fmt.Sprintf("%s S%02dE%02d", parsed.CleanTitle, parsed.Season, startEp)
-			strmFileName, epStrmPath, err := jfWriter.WriteVersionedSTRM(relDir, baseTitle, parsed.Resolution, opaqueID)
+			strmFileName, epStrmPath, err := jfWriter.WriteVersionedSTRM(relDir, baseTitle, parsed.Resolution, opaqueID, fmt.Sprintf("http://127.0.0.1:%s/stream/%d/%d/video.mp4", cfg.ServerPort, task.ChatID, task.MsgID))
 			if err != nil {
 				log.Printf("[Worker #%d] Error writing episode .strm: %v", workerID, err)
 				job.Status = "failed"
@@ -671,7 +674,7 @@ func processIngestionTask(
 		movieDir := filepath.Join(cfg.JellyfinMedia, relDir)
 		_ = os.MkdirAll(movieDir, 0755)
 
-		strmFileName, fullStrmPath, err := jfWriter.WriteVersionedSTRM(relDir, baseName, parsed.Resolution, opaqueID)
+		strmFileName, fullStrmPath, err := jfWriter.WriteVersionedSTRM(relDir, baseName, parsed.Resolution, opaqueID, fmt.Sprintf("http://127.0.0.1:%s/stream/%d/%d/video.mp4", cfg.ServerPort, task.ChatID, task.MsgID))
 		if err != nil {
 			log.Printf("[Worker #%d] Error writing .strm: %v", workerID, err)
 			job.Status = "failed"
