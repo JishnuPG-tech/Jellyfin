@@ -619,13 +619,6 @@ func processIngestionTask(
 		if _, err := os.Stat(fullDefaultStrm); err == nil {
 			// A version already exists! Determine unique edition/quality label
 			versionLabel := parsed.Resolution
-			if parsed.Quality != "" {
-				if versionLabel != "" {
-					versionLabel += " " + parsed.Quality
-				} else {
-					versionLabel = parsed.Quality
-				}
-			}
 			if versionLabel == "" {
 				versionLabel = opaqueID
 			}
