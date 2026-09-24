@@ -61,67 +61,39 @@ else
     echo "[Apex] No existing database snapshot found. Fresh database will be created at /tmp/apex-db/apex.db."
 fi
 
-# ── 3. Jellyfin Database & Authentication Recovery ────────────────────────────
+# ── 3. Jellyfin Clean Start & Authentication Reset ───────────────────────────
+if [ ! -f "/data/jellyfin/.fresh_start_done" ] || [ "${RESET_JELLYFIN_AUTH:-}" = "true" ]; then
+    echo "[Apex] User requested fresh start: wiping old Jellyfin credentials and configuration..."
+    rm -rf /data/jellyfin/data/* \
+           /data/jellyfin/config/* \
+           /data/jellyfin/backups/* \
+           /data/jellyfin/.aspnet/* \
+           /data/jellyfin/.auth_* 2>/dev/null || true
+    mkdir -p /data/jellyfin/data \
+             /data/jellyfin/config \
+             /data/jellyfin/backups \
+             /data/jellyfin/.aspnet/DataProtection-Keys
+    touch /data/jellyfin/.fresh_start_done
+    echo "[Apex] Fresh start complete. Jellyfin Initial Setup Wizard will be presented."
+fi
+
+# Pre-flight check: ensure no failed-login account lockouts if database exists
 repair_jellyfin_auth() {
     ${PYTHON_BIN} -c "
-import os, sqlite3, shutil, xml.etree.ElementTree as ET
+import os, sqlite3
 
 db_path = '/data/jellyfin/data/data/jellyfin.db'
-backup_db = '/data/jellyfin/backups/jellyfin_latest.db'
-sys_xml = '/data/jellyfin/config/system.xml'
-fix_flag = '/data/jellyfin/.auth_fixed_v1'
-force_reset = os.environ.get('RESET_JELLYFIN_AUTH', '').lower() in ('1', 'true', 'yes')
-
-# Auto-restore from backup snapshot if main database is missing
-if not os.path.exists(db_path) and os.path.exists(backup_db):
-    try:
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        shutil.copy2(backup_db, db_path)
-        print('[Apex] Restored Jellyfin database from /data/jellyfin/backups/jellyfin_latest.db.')
-    except Exception as e:
-        print(f'[Apex] DB restore notice: {e}')
-
 if os.path.exists(db_path):
     try:
         con = sqlite3.connect(db_path)
         cur = con.cursor()
-        
-        # Verify Users table
         cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='Users';\")
         if cur.fetchone():
-            cur.execute('SELECT Id, Username FROM Users;')
-            users = cur.fetchall()
-            print(f'[Apex] Detected Jellyfin registered users: {users}')
-
-            # Always unlock accounts to prevent failed attempt lockouts
             cur.execute('UPDATE Users SET InvalidLoginAttemptCount = 0;')
             con.commit()
-
-            if len(users) == 0:
-                print('[Apex] Database has 0 users. Ensuring setup wizard is accessible...')
-                if os.path.exists(sys_xml):
-                    try:
-                        tree = ET.parse(sys_xml)
-                        root = tree.getroot()
-                        elem = root.find('IsStartupWizardCompleted')
-                        if elem is not None and elem.text != 'false':
-                            elem.text = 'false'
-                            tree.write(sys_xml)
-                            print('[Apex] Reset IsStartupWizardCompleted to false in system.xml.')
-                    except Exception as xe:
-                        print(f'[Apex] XML parse notice: {xe}')
-            elif not os.path.exists(fix_flag) or force_reset:
-                # Reset password to NULL once for immediate recovery
-                print('[Apex] Performing one-time credential recovery: resetting passwords to blank...')
-                cur.execute('UPDATE Users SET Password = NULL;')
-                con.commit()
-                with open(fix_flag, 'w') as f:
-                    f.write('fixed\n')
-                print('[Apex] SUCCESS: You can now sign in using your username with a BLANK password.')
-                print('[Apex] After signing in, set your permanent password in Jellyfin User Settings.')
         con.close()
     except Exception as e:
-        print(f'[Apex] Jellyfin database repair notice: {e}')
+        print(f'[Apex] Account unlock check notice: {e}')
 " 2>/dev/null || true
 }
 
