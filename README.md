@@ -42,8 +42,15 @@ Configure these in **HF Space Settings $\rightarrow$ Variables and secrets**:
 | `TELEGRAM_ALLOWED_CHAT_IDS` | Comma-separated list of allowed source channel/group chat IDs |
 | `TMDB_API_KEY` | The Movie Database v3 API key for automated metadata & poster fetching |
 | `APEX_SECRET_KEY` | Secret key used for signing tokens and admin operations |
+| `APEX_JELLYFIN_API_KEY` | Jellyfin API key used by Apex for library provisioning and refresh operations |
 
 ---
+
+## 🔧 Jellyfin Integration
+
+Apex automatically maintains the application-owned **Movies** and **Shows** Jellyfin libraries. It verifies the canonical paths, repairs stale library paths, and refreshes Jellyfin after catalog ingestion.
+
+The Jellyfin database is checked for SQLite integrity and Jellyfin 10.9.11 schema compatibility before startup. Corrupt or incompatible database files are quarantined under `/data/jellyfin/backups/` while the STRM/NFO media catalog under `/data/jellyfin/media/` is preserved.
 
 ## 💾 Storage Architecture
 
