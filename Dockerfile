@@ -1,74 +1,76 @@
 # ==============================================================================
-# Apex Media Platform - Production Dockerfile (v2.0 Architecture)
-# Stack: Jellyfin 10.9.11 + Apex Go Core + Nginx Gateway (Port 7860)
+# STAGE 1: Extract prebuilt OmniRoute production runtime
+# No source compilation. No npm install. No Next.js build. No OOM.
 # ==============================================================================
+FROM diegosouzapw/omniroute:main AS omniroute-source
 
-# ── Stage 1: Build Apex Go Core Daemon ─────────────────────────────────────────
-FROM golang:1.22-bookworm AS go-builder
+# ==============================================================================
+# STAGE 2: Final Multi-Service Production Runtime
+# Assembles all services using prebuilt artifacts only.
+# ==============================================================================
+FROM debian:bookworm-slim
 
-WORKDIR /app
-COPY apex_src/ ./
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o apex-core ./cmd/apex
+ENV XDG_DATA_HOME=/data/share
+ENV XDG_CONFIG_HOME=/data/config
+ENV XDG_CACHE_HOME=/root/.cache
+ENV XDG_STATE_HOME=/data/state
+ENV HOME=/root
 
-# ── Stage 2: Main Production Image (Pinned Jellyfin LTS) ──────────────────────
-FROM jellyfin/jellyfin:10.9.11
+# 1. Install runtime system packages only — no build toolchain for OmniRoute
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    git \
+    python3 \
+    python3-pip \
+    nginx \
+    gnupg \
+    sqlite3 \
+    redis-server \
+ && rm -rf /var/lib/apt/lists/*
 
-USER root
+# 2. Add Jellyfin official repo & install Jellyfin + FFmpeg
+RUN mkdir -p /etc/apt/keyrings \
+ && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/jellyfin.gpg arch=amd64] https://repo.jellyfin.org/debian bookworm main" > /etc/apt/sources.list.d/jellyfin.list \
+ && apt-get update && apt-get install -y --no-install-recommends jellyfin-server jellyfin-web ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 
-# Install Nginx, curl, and CA certificates
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        nginx \
-        curl \
-        ca-certificates \
-        sqlite3 && \
-    rm -rf /var/lib/apt/lists/*
+# 3. Install core Python runtime dependencies (Lightweight, no Open WebUI)
+RUN pip3 install --no-cache-dir \
+    aiohttp pyrogram tgcrypto httpx uvicorn fastapi \
+    --break-system-packages
 
-# Install Apex Core Go binary
-RUN mkdir -p /opt/apex
-COPY --from=go-builder /app/apex-core /opt/apex/apex-core
-RUN chmod +x /opt/apex/apex-core
+# Install hermes-agent separately with --no-deps to avoid version backtracking
+RUN pip3 install --no-cache-dir --no-deps hermes-agent \
+    --break-system-packages
 
-# Symlink Jellyfin binary to standard PATH if needed
-RUN ln -sf /jellyfin/jellyfin /usr/local/bin/jellyfin 2>/dev/null || true
+# 4. Copy prebuilt OmniRoute production runtime from Stage 1
+#    /app inside the upstream image contains the complete standalone production server:
+#    .next/, server.js (or package.json start script), node_modules/, and Node binary
+COPY --from=omniroute-source /app /omniroute
 
-# Install Nginx Gateway configuration & Entrypoint
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# 5. Copy Node.js runtime from the OmniRoute image (avoids manual curl download)
+COPY --from=omniroute-source /usr/local/bin/node /usr/local/bin/node
+COPY --from=omniroute-source /usr/local/bin/npm  /usr/local/bin/npm
+COPY --from=omniroute-source /usr/local/bin/npx  /usr/local/bin/npx
+COPY --from=omniroute-source /usr/local/lib/node_modules /usr/local/lib/node_modules
 
-# Pre-create standard storage directories
-RUN mkdir -p /data/jellyfin/data \
-             /data/jellyfin/config \
-             /data/jellyfin/backups \
-             /data/jellyfin/log \
-             /data/jellyfin/media/Movies \
-             /data/jellyfin/media/Shows \
-             /data/jellyfin/.aspnet/DataProtection-Keys \
-             /data/apex/backups \
-             /data/apex/session \
-             /data/apex/metadata-cache \
-             /tmp/jellyfin-cache \
-             /tmp/apex-db \
-             /tmp/apex-stream-cache
+RUN mkdir -p /root/.cache /data/cache /data/omniroute
+RUN chmod -R 777 /root/.cache /data/cache /omniroute
 
-# Environment Configuration
-ENV DATA_DIR="/data" \
-    DOTNET_CLI_HOME="/data/jellyfin" \
-    JELLYFIN_DATA_DIR="/data/jellyfin/data" \
-    JELLYFIN_CONFIG_DIR="/data/jellyfin/config" \
-    JELLYFIN_CACHE_DIR="/tmp/jellyfin-cache" \
-    JELLYFIN_LOG_DIR="/data/jellyfin/log" \
-    JELLYFIN_DB_PATH="/data/jellyfin/data/data/jellyfin.db" \
-    JELLYFIN_PORT="8096" \
-    APEX_CORE_PORT="8084" \
-    APEX_MEMORY_CACHE_MB="128" \
-    APEX_DISK_CACHE_MB="2048" \
-    APEX_PREFETCH_MB="16" \
-    APEX_MAX_STREAMS="2" \
-    APEX_TELEGRAM_MEDIA_CLIENTS="2"
+# 6. Copy Gateway Proxy Application & Entrypoint Scripts
+WORKDIR /
+COPY entrypoint.sh /entrypoint.sh
+COPY nginx.conf /nginx.conf
+COPY proxy.py /proxy.py
+COPY tg_streamer.py /tg_streamer.py
+COPY fix_omniroute.py /fix_omniroute.py
+COPY health_doctor.py /health_doctor.py
+COPY gateway /gateway
+COPY index.html /index.html
+RUN chmod +x /entrypoint.sh /fix_omniroute.py /health_doctor.py
 
-# Hugging Face default ingress port
-EXPOSE 7860
+EXPOSE 4096
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["/entrypoint.sh"]
