@@ -301,21 +301,65 @@ def create_strm_file(msg_id, file_id, clean_title, is_tv=False, show_name=None, 
     return strm_filename
 
 async def trigger_jellyfin_scan():
-    """Trigger Jellyfin Library Scan automatically with retry while Jellyfin boots"""
-    for attempt in range(5):
+    """Trigger Jellyfin Library Scan automatically with retry while Jellyfin boots."""
+    headers = _jellyfin_auth_header()
+    for attempt in range(8):
         try:
             connector = aiohttp.TCPConnector(family=socket.AF_INET)
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.post("http://127.0.0.1:8096/Library/Refresh") as resp:
+                async with session.post("http://127.0.0.1:8096/Library/Refresh", headers=headers, timeout=15) as resp:
                     logger.info(f"Jellyfin library refresh triggered: {resp.status}")
-                    return
+                    if resp.status in (200, 204):
+                        return
         except Exception as e:
-            if attempt < 4:
-                await asyncio.sleep(3)
+            if attempt < 7:
+                await asyncio.sleep(5)
                 continue
             logger.warning(f"Could not trigger Jellyfin library refresh after retries: {e}")
 
 WEBHOOK_SECRET = get_env("APEX_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET")
+
+def _read_jellyfin_api_key():
+    """Return a working Jellyfin API key: env secret first, then any active row from the DB."""
+    key = get_env("APEX_JELLYFIN_API_KEY", "JELLYFIN_API_KEY", default="").strip().strip('"')
+    if key:
+        return key
+    for db in ("/opt/jellyfin-local/data/data/jellyfin.db", "/data/jellyfin/data/data/jellyfin.db"):
+        if os.path.exists(db):
+            try:
+                with __import__("sqlite3").connect(db, timeout=5) as conn:
+                    cur = conn.cursor()
+                    cur.execute("PRAGMA table_info('api_keys')")
+                    columns = [r[1] for r in cur.fetchall()]
+                    if "AccessToken" not in columns:
+                        continue
+                    if "IsActive" in columns:
+                        cur.execute("SELECT AccessToken FROM api_keys WHERE IsActive IS NOT 0 ORDER BY DateCreated DESC LIMIT 1")
+                    else:
+                        cur.execute("SELECT AccessToken FROM api_keys ORDER BY DateCreated DESC LIMIT 1")
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        return str(row[0]).strip()
+            except Exception as e:
+                logger.warning(f"[JELLYFIN] Could not read api_keys table from {db}: {e}")
+    return ""
+
+
+def _jellyfin_auth_header():
+    """Build a full-format MediaBrowser Authorization header accepted by Jellyfin 12+."""
+    key = _read_jellyfin_api_key()
+    if not key:
+        return {}
+    return {
+        "Authorization": (
+            'MediaBrowser Client="TG-Drive Streamer", '
+            'Device="Apex Server", '
+            'DeviceId="tg-streamer", '
+            'Version="12.1.0", '
+            f'Token="{key}"'
+        ),
+        "Accept": "application/json",
+    }
 
 async def telegram_api_call(method: str, **params):
     """Call the Telegram Bot API via httpx (uses trust_env to honor proxy vars)."""
@@ -496,77 +540,87 @@ async def stream_file(request):
     if not file_id:
         return web.Response(status=404, text=f"Media not available for message {msg_id_str}.")
 
-    if tg_app and tg_app.is_connected:
-        try:
-            range_header = request.headers.get("Range")
-            start = 0
-            end = file_size - 1 if file_size > 0 else 0
+    if not (tg_app and tg_app.is_connected):
+        # Jellyfin probes .strm files at library-scan time, which can run before the
+        # MTProto client has finished connecting. Wait briefly instead of failing fast
+        # so ffprobe/ffmpeg get a real stream rather than a 500.
+        for _ in range(30):
+            if tg_app and tg_app.is_connected:
+                break
+            await asyncio.sleep(1)
+        else:
+            return web.Response(status=503, text="Streaming temporarily unavailable (Telegram client not connected yet).")
 
+    try:
+        range_header = request.headers.get("Range")
+        start = 0
+        end = file_size - 1 if file_size > 0 else 0
+
+        if range_header:
+            match = re.match(r"^bytes=(\d+)-(\d+)?$", range_header)
+            if match:
+                start = int(match.group(1))
+                if match.group(2):
+                    end = int(match.group(2))
+                elif file_size > 0:
+                    end = file_size - 1
+
+        if file_size > 0 and end >= file_size:
+            end = file_size - 1
+
+        req_length = (end - start + 1) if (file_size > 0 and end >= start) else file_size
+
+        # Pyrogram 1MB Chunk calculation
+        CHUNK_SIZE = 1024 * 1024
+        start_chunk = start // CHUNK_SIZE
+        skip_leading_bytes = start % CHUNK_SIZE
+        chunk_count = ((end - start + skip_leading_bytes + CHUNK_SIZE) // CHUNK_SIZE) if file_size > 0 else 0
+
+        status = 206 if range_header and file_size > 0 else 200
+
+        # High-Performance 5G & Direct Play Headers
+        headers = {
+            "Content-Type": "video/mp4",
+            "Accept-Ranges": "bytes",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=86400",
+            "Connection": "keep-alive",
+            "Content-Disposition": f'inline; filename="{filename}"'
+        }
+        if file_size > 0:
+            headers["Content-Length"] = str(req_length)
             if range_header:
-                match = re.match(r"^bytes=(\d+)-(\d+)?$", range_header)
-                if match:
-                    start = int(match.group(1))
-                    if match.group(2):
-                        end = int(match.group(2))
-                    elif file_size > 0:
-                        end = file_size - 1
+                headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
-            if file_size > 0 and end >= file_size:
-                end = file_size - 1
+        response = web.StreamResponse(status=status, headers=headers)
+        await response.prepare(request)
 
-            req_length = (end - start + 1) if (file_size > 0 and end >= start) else file_size
+        bytes_written = 0
+        is_first_chunk = True
 
-            # Pyrogram 1MB Chunk calculation
-            CHUNK_SIZE = 1024 * 1024
-            start_chunk = start // CHUNK_SIZE
-            skip_leading_bytes = start % CHUNK_SIZE
-            chunk_count = ((end - start + skip_leading_bytes + CHUNK_SIZE) // CHUNK_SIZE) if file_size > 0 else 0
+        try:
+            async for chunk in tg_app.stream_media(file_id, offset=start_chunk, limit=chunk_count):
+                if is_first_chunk:
+                    chunk = chunk[skip_leading_bytes:]
+                    is_first_chunk = False
 
-            status = 206 if range_header and file_size > 0 else 200
-
-            # High-Performance 5G & Direct Play Headers
-            headers = {
-                "Content-Type": "video/mp4",
-                "Accept-Ranges": "bytes",
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "public, max-age=86400",
-                "Connection": "keep-alive",
-                "Content-Disposition": f'inline; filename="{filename}"'
-            }
-            if file_size > 0:
-                headers["Content-Length"] = str(req_length)
-                if range_header:
-                    headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-
-            response = web.StreamResponse(status=status, headers=headers)
-            await response.prepare(request)
-
-            bytes_written = 0
-            is_first_chunk = True
-
-            try:
-                async for chunk in tg_app.stream_media(file_id, offset=start_chunk, limit=chunk_count):
-                    if is_first_chunk:
-                        chunk = chunk[skip_leading_bytes:]
-                        is_first_chunk = False
-
-                    if bytes_written + len(chunk) > req_length:
-                        needed = req_length - bytes_written
-                        await response.write(chunk[:needed])
-                        bytes_written += needed
+                if bytes_written + len(chunk) > req_length:
+                    needed = req_length - bytes_written
+                    await response.write(chunk[:needed])
+                    bytes_written += needed
+                    break
+                else:
+                    await response.write(chunk)
+                    bytes_written += len(chunk)
+                    if bytes_written >= req_length:
                         break
-                    else:
-                        await response.write(chunk)
-                        bytes_written += len(chunk)
-                        if bytes_written >= req_length:
-                            break
-            except (ConnectionResetError, asyncio.CancelledError):
-                pass
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
 
-            return response
-        except Exception as e:
-            if not isinstance(e, (ConnectionResetError, asyncio.CancelledError)):
-                logger.warning(f"[STREAM] MTProto stream exception: {e}")
+        return response
+    except Exception as e:
+        if not isinstance(e, (ConnectionResetError, asyncio.CancelledError)):
+            logger.warning(f"[STREAM] MTProto stream exception: {e}")
 
     return web.Response(status=500, text="Streaming temporarily unavailable.")
 
@@ -610,10 +664,9 @@ async def restore_cached_strm_files():
 
 async def start_pyrogram():
     """Starts Pyrogram Client and restores cached media"""
-    await restore_cached_strm_files()
-
     if not tg_app:
         logger.warning("[PYROGRAM] Pyrogram client not configured.")
+        await restore_cached_strm_files()
         return
 
     logger.info("[PYROGRAM] Starting Pyrogram MTProto Client...")
@@ -621,6 +674,7 @@ async def start_pyrogram():
     me = await tg_app.get_me()
     logger.info(f"[PYROGRAM] Pyrogram Client started successfully! Bot: @{getattr(me, 'username', '?')} (id={getattr(me, 'id', '?')})")
 
+    await restore_cached_strm_files()
     await register_telegram_webhook()
 
 async def stop_pyrogram():

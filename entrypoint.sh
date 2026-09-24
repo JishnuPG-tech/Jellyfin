@@ -26,9 +26,13 @@ restore_jellyfin_local() {
     echo "[JELLYFIN] Preparing local datadir at $LOCAL_ROOT ..."
     mkdir -p "$LOCAL_ROOT/data/data" "$LOCAL_ROOT/config" "$LOCAL_ROOT/cache" "$LOCAL_ROOT/log"
     # Restore durable data/config snapshot from the persistent volume if present.
+    # Exclude the metadata tree: it is handled via snapshot below and its old
+    # absolute DB path is redirected to the fast local datadir.
     if [ -f "/data/jellyfin/data/data/jellyfin.db" ]; then
         echo "[JELLYFIN] Restoring database + metadata from persistent volume..."
-        cp -a -f /data/jellyfin/data/. "$LOCAL_ROOT/data/" 2>/dev/null || true
+        find /data/jellyfin/data -mindepth 1 -maxdepth 1 \
+            \( -name metadata -o -name metadata.snapshot \) -prune -o \
+            -exec cp -a -f {} "$LOCAL_ROOT/data/" \; 2>/dev/null || true
     fi
     if [ -d "/data/jellyfin/config" ]; then
         cp -a -f /data/jellyfin/config/. "$LOCAL_ROOT/config/" 2>/dev/null || true
@@ -36,6 +40,23 @@ restore_jellyfin_local() {
     if [ -d "/data/jellyfin/cache" ]; then
         cp -a -f /data/jellyfin/cache/. "$LOCAL_ROOT/cache/" 2>/dev/null || true
     fi
+
+    # Jellyfin's item DB bakes absolute metadata paths (e.g. .../Data/metadata/People/x/folder.jpg)
+    # into its rows. Redirect that whole path onto the fast local disk so Skia reads
+    # don't hit the flaky network volume. Keep a durable snapshot for restart recovery.
+    mkdir -p "$LOCAL_ROOT/data/metadata"
+    if [ -d "/data/jellyfin/data/metadata.snapshot" ]; then
+        cp -a -f /data/jellyfin/data/metadata.snapshot/. "$LOCAL_ROOT/data/metadata/" 2>/dev/null || true
+    elif [ -d "/data/jellyfin/data/metadata" ] && [ ! -L "/data/jellyfin/data/metadata" ]; then
+        cp -a -f /data/jellyfin/data/metadata/. "$LOCAL_ROOT/data/metadata/" 2>/dev/null || true
+    fi
+    rm -rf /data/jellyfin/data/metadata 2>/dev/null || true
+    ln -s "$LOCAL_ROOT/data/metadata" /data/jellyfin/data/metadata 2>/dev/null || true
+    if [ -d "$LOCAL_ROOT/data/metadata" ]; then
+        mkdir -p /data/jellyfin/data/metadata.snapshot
+        cp -a -f "$LOCAL_ROOT/data/metadata/." /data/jellyfin/data/metadata.snapshot/ 2>/dev/null || true
+    fi
+    echo "[JELLYFIN] Local datadir ready. Metadata redirected to fast local disk."
 }
 
 sync_jellyfin_back() {
@@ -52,7 +73,13 @@ sync_jellyfin_back() {
         if [ -d "$LOCAL_ROOT/data" ]; then
             find "$LOCAL_ROOT/data" -mindepth 1 -maxdepth 1 \
                 -not -name data \
+                -not -name metadata \
                 -exec cp -a -f {} /data/jellyfin/data/ \; 2>/dev/null || true
+        fi
+        # Metadata lives on fast local disk; keep a durable snapshot for restarts.
+        if [ -d "$LOCAL_ROOT/data/metadata" ]; then
+            mkdir -p /data/jellyfin/data/metadata.snapshot
+            cp -a -f "$LOCAL_ROOT/data/metadata/." /data/jellyfin/data/metadata.snapshot/ 2>/dev/null || true
         fi
         cp -a -f "$LOCAL_ROOT/config/." /data/jellyfin/config/ 2>/dev/null || true
         cp -a -f "$LOCAL_ROOT/log/." /data/jellyfin/log/ 2>/dev/null || true

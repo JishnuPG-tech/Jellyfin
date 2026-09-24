@@ -97,12 +97,23 @@ def purge_old_backups(backup_dir: str = BACKUP_DIR, max_age_days: int = RETENTIO
         logger.warning(f"Error purging old backups: {exc}")
 
 
-def _jellyfin_auth_header() -> str:
-    """Build a Jellyfin API auth header from the APEX_JELLYFIN_API_KEY secret (if present)."""
-    key = os.environ.get("APEX_JELLYFIN_API_KEY", "").strip().strip('"')
+def _jellyfin_auth_header_for(key: str) -> str:
+    """Build a full-format MediaBrowser Authorization header accepted by Jellyfin 12+."""
+    key = (key or "").strip().strip('"')
     if not key:
         return ""
-    return f'MediaBrowser Token="{key}"'
+    return (
+        'MediaBrowser Client="ApexOps", '
+        'Device="HealthDoctor", '
+        'DeviceId="health-doctor", '
+        'Version="12.1.0", '
+        f'Token="{key}"'
+    )
+
+
+def _jellyfin_auth_header() -> str:
+    """Build a Jellyfin API auth header from the APEX_JELLYFIN_API_KEY secret (if present)."""
+    return _jellyfin_auth_header_for(os.environ.get("APEX_JELLYFIN_API_KEY", ""))
 
 
 def _jellyfin_virtual_folders(auth):
@@ -179,7 +190,7 @@ def ensure_active_jellyfin_api_key():
         if tok in tried:
             continue
         tried.add(tok)
-        auth = f'MediaBrowser Token="{tok}"'
+        auth = _jellyfin_auth_header_for(tok)
         try:
             status, _ = _jellyfin_virtual_folders(auth)
             if status == 200:
@@ -232,7 +243,7 @@ def _insert_jellyfin_api_key():
             placeholders = ",".join("?" * len(vals))
             cur.execute(f"INSERT INTO 'api_keys' ({','.join(cols)}) VALUES ({placeholders})", vals)
             conn.commit()
-        return f'MediaBrowser Token="{token}"'
+        return _jellyfin_auth_header_for(token)
     except Exception as exc:
         logger.warning(f"[JELLYFIN] Could not insert API key: {exc}")
         return ""
