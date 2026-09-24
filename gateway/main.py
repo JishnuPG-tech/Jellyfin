@@ -63,4 +63,5 @@ async def route_catch_all(path: str, request: Request):
     if req_path == "/health/live":
         return JSONResponse({"status": "live"})
         
-    return JSONResponse(content={"status": "error", "message": f"Route not found: {req_path}"}, status_code=404)
+    logger.info(f"[ROUTER] {req_path} -> Jellyfin fallback ({JELLYFIN_PORT})")
+    return await proxy_http_request(f"http://127.0.0.1:{JELLYFIN_PORT}{req_path}", request, default_prefix="")
