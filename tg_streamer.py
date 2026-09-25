@@ -182,7 +182,7 @@ if API_ID and API_HASH and BOT_TOKEN:
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
             workdir=DATA_DIR,
-            in_memory=False
+            in_memory=True
         )
         logger.info("[PYROGRAM] Pyrogram persistent client initialized.")
     except Exception as e:
