@@ -14,6 +14,7 @@ The pyrogram/aiohttp wiring lives in tg_streamer.py; everything importable here
 is unit-testable without a Telegram connection.
 """
 
+from .errors import SourceError, SourceReferenceExpired, StreamError
 from .ranges import (
     RangeRequest,
     RangeNotSatisfiable,
@@ -29,6 +30,9 @@ from .stream import FileInfo, StreamPlan, StreamDriver
 from .config import Config
 
 __all__ = [
+    "StreamError",
+    "SourceError",
+    "SourceReferenceExpired",
     "RangeRequest",
     "RangeNotSatisfiable",
     "parse_range",

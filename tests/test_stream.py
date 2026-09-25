@@ -6,6 +6,7 @@ import pytest
 
 from apex_stream.cache import BoundedChunkCache
 from apex_stream.config import Config
+from apex_stream.errors import SourceError
 from apex_stream.inflight import InFlightRegistry
 from apex_stream.metrics import StreamMetrics
 from apex_stream.pool import ClientPool
@@ -209,6 +210,87 @@ class TestFailover:
         # the client's stream counters should be back to 0
         assert pool.snapshot()["clients"][0]["active_streams"] == 0
         assert pool.snapshot()["clients"][0]["active_requests"] == 0
+
+
+class _FakeSourceBroken:
+    """read_range() that always raises a source-level error (e.g. expired ref)."""
+
+    def __init__(self):
+        self.chunk_size = 1024 * 1024
+
+    async def read_range(self, offset_chunk, chunk_count):
+        for _ in ():  # make this an async generator that fails on first iteration
+            yield None
+        raise SourceError("media reference expired and refresh failed")
+
+
+class _FakeShortFile:
+    """Serves only half of each requested run (file shorter than recorded)."""
+
+    def __init__(self, chunks_served=4):
+        self.chunks_served = chunks_served
+        self.chunk_size = 1024 * 1024
+
+    async def read_range(self, offset_chunk, chunk_count):
+        for i in range(min(self.chunks_served, chunk_count)):
+            b = bytearray(self.chunk_size)
+            yield (i, bytes(b))
+
+
+class TestSourceErrorClassification:
+    """Source-level failures must fail over / surface WITHOUT cooling down the client."""
+
+    async def test_source_error_does_not_cooldown(self):
+        driver, pool, *_ = _make_driver(
+            file_size=8 * 1024 * 1024, max_retries=2, num_clients=1
+        )
+        await pool.register(1, _FakeSourceBroken())
+        plan = await driver.plan(1, 2, None)
+        with pytest.raises(SourceError):
+            _ = [c async for c in driver.generate(plan)]
+        snap = pool.snapshot()["clients"][0]
+        assert snap["state"] == "healthy"
+        assert snap["consecutive_failures"] == 0
+
+    async def test_source_error_fails_over_to_healthy_client(self):
+        driver, pool, *_ = _make_driver(
+            file_size=2 * 1024 * 1024, max_retries=1, num_clients=2
+        )
+        await pool.register(1, _FakeSourceBroken())
+        await pool.register(2, _FakeTelegram(file_size=2 * 1024 * 1024))
+        plan = await driver.plan(1, 2, None)
+        body = b"".join([c async for c in driver.generate(plan)])
+        assert len(body) == 2 * 1024 * 1024  # healthy client 2 served full
+        states = {c["id"]: c["state"] for c in pool.snapshot()["clients"]}
+        assert states[1] == "healthy"
+        assert states[2] == "healthy"
+
+    async def test_short_file_raises_stream_exhausted_without_cooldown(self):
+        driver, pool, *_ = _make_driver(
+            file_size=8 * 1024 * 1024, max_retries=2, num_clients=1
+        )
+        await pool.register(1, _FakeShortFile(chunks_served=4))
+        plan = await driver.plan(1, 2, None)
+        with pytest.raises(Exception):  # StreamExhausted surfaces to caller
+            _ = [c async for c in driver.generate(plan)]
+        snap = pool.snapshot()["clients"][0]
+        assert snap["state"] == "healthy"
+        assert snap["consecutive_failures"] == 0
+
+    async def test_transport_failure_still_cools_down(self):
+        driver, pool, *_ = _make_driver(
+            file_size=8 * 1024 * 1024,
+            max_retries=1,
+            num_clients=1,
+        )
+        await pool.register(1, _FakeTelegram(file_size=8 * 1024 * 1024, fail_call_count=999))
+        plan = await driver.plan(1, 2, None)
+        with pytest.raises(ConnectionError):
+            _ = [c async for c in driver.generate(plan)]
+        snap = pool.snapshot()["clients"][0]
+        # a real transport failure is still recorded (cooldown candidate)
+        assert snap["consecutive_failures"] == 1
+        assert snap["state"] == "degraded"
 
 
 class TestAdmission:

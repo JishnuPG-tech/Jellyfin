@@ -60,6 +60,19 @@ class TestPoolSelection:
         h2 = await pool.select()
         assert h2.client_id == h.client_id
 
+    async def test_select_avoids_specific_client(self):
+        pool = ClientPool(max_streams_per_client=4)
+        await pool.register(1, _client(name="bad"))
+        await pool.register(2, _client(name="good"))
+        h = await pool.select(avoid=1)
+        assert h.client_id == 2
+
+    async def test_avoid_ignored_when_only_one_eligible(self):
+        pool = ClientPool(max_streams_per_client=2)
+        await pool.register(1, _client(name="only"))
+        h = await pool.select(avoid=1)
+        assert h.client_id == 1
+
     async def test_least_loaded_prefers_idle(self):
         pool = ClientPool(max_streams_per_client=10)
         await pool.register(1, _client(name="busy"))

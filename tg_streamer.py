@@ -16,10 +16,10 @@ from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, RPCError, AuthKeyDuplicated
+from pyrogram.errors import FloodWait, RPCError, AuthKeyDuplicated, FILE_REFERENCE_EXPIRED
 
 # Apex streaming core (telegram-free; wired to Pyrogram below)
-from apex_stream import Config, BoundedChunkCache, ClientPool, InFlightRegistry, StreamMetrics, StreamDriver, FileInfo, RangeNotSatisfiable, NoClientAvailable
+from apex_stream import Config, BoundedChunkCache, ClientPool, InFlightRegistry, StreamMetrics, StreamDriver, FileInfo, RangeNotSatisfiable, NoClientAvailable, SourceReferenceExpired
 from apex_stream.organize import (
     DEFAULT_LANGUAGE,
     detect_language,
@@ -109,6 +109,60 @@ def _save_cache_sync():
     except Exception as e:
         logger.warning(f"[CACHE] Error saving file_ids.json: {e}")
 
+# ---------------------------------------------------------------------------
+# FILE_ID_CACHE is keyed by (chat_id, message_id) as "<chat>:<msg>" so the same
+# message id in two different chats can never collide. Legacy plain "<msg>"
+# keys (single-channel deployments / pre-upgrade disk caches) remain readable.
+# ---------------------------------------------------------------------------
+
+def _cache_key(chat_id, message_id):
+    try:
+        chat = int(chat_id or 0)
+    except (TypeError, ValueError):
+        chat = 0
+    return f"{chat}:{int(message_id)}"
+
+
+def _cache_lookup(message_id, chat_id=None):
+    """Resolve a FILE_ID_CACHE entry by message id.
+
+    Prefers the composite (chat_id:message_id) key when chat_id is known;
+    falls back to legacy plain-message_id keys, and finally to a scan over
+    composite keys when only the message id is available (legacy routes). A
+    resolved legacy entry whose chat_id contradicts `chat_id` is rejected.
+    """
+    if chat_id:
+        entry = FILE_ID_CACHE.get(_cache_key(chat_id, message_id))
+        if isinstance(entry, dict):
+            return entry
+    legacy = FILE_ID_CACHE.get(str(message_id))
+    if isinstance(legacy, dict):
+        if chat_id and legacy.get("chat_id") and str(legacy.get("chat_id")) != str(chat_id):
+            return None
+        return legacy
+    if not chat_id:
+        for key, entry in FILE_ID_CACHE.items():
+            if not isinstance(entry, dict) or not isinstance(key, str) or ":" not in key:
+                continue
+            try:
+                _chat_part, _msg_part = key.rsplit(":", 1)
+                if int(_msg_part) == int(message_id):
+                    return entry
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _split_cache_key(key):
+    """Return (chat_id, message_id) for a composite key, else (None, msg_id)."""
+    if isinstance(key, str) and ":" in key:
+        try:
+            chat_part, msg_part = key.rsplit(":", 1)
+            return int(chat_part), int(msg_part)
+        except (TypeError, ValueError):
+            return None, key
+    return None, key
+
 def _load_subtitle_cache():
     global SUBTITLE_CACHE
     if os.path.exists(SUBTITLE_CACHE_FILE):
@@ -164,10 +218,8 @@ apex_metrics = StreamMetrics()
 
 async def _resolve_source(chat_id, message_id):
     """Look up a (chat_id, message_id) source in the persistent index."""
-    entry = FILE_ID_CACHE.get(str(message_id))
+    entry = _cache_lookup(message_id, chat_id)
     if not isinstance(entry, dict):
-        return None
-    if chat_id and entry.get("chat_id") and str(entry.get("chat_id")) != str(chat_id):
         return None
     return FileInfo(
         size=int(entry.get("file_size") or 0),
@@ -177,18 +229,87 @@ async def _resolve_source(chat_id, message_id):
     )
 
 
+async def _refresh_file_reference(client, chat_id, message_id):
+    """Re-resolve a fresh media file reference through `client`.
+
+    Telegram file references are short-lived tokens, so on FILE_REFERENCE_EXPIRED
+    the source message must be re-fetched via get_messages() and the fresh
+    file_id / file_size written back into FILE_ID_CACHE. Each pool client runs
+    this through its own connection so a refresh is never shared across bots.
+    Returns (file_id, file_size) or None when this client cannot re-resolve it.
+    """
+    try:
+        message = await client.get_messages(chat_id, message_id)
+    except Exception as e:
+        logger.warning(
+            f"[REFRESH] get_messages({chat_id}, {message_id}) failed: {type(e).__name__}: {e}"
+        )
+        return None
+    media = (
+        (message.video or message.document or message.audio or message.animation)
+        if message else None
+    )
+    file_id = getattr(media, "file_id", None) if media else None
+    if not file_id:
+        logger.warning(
+            f"[REFRESH] message {chat_id}:{message_id} no longer carries fresh media "
+            f"(media={type(media).__name__ if media else None})"
+        )
+        return None
+    return file_id, int(getattr(media, "file_size", 0) or 0)
+
+
 async def _fetch_chunks(client, chat_id, message_id, run_start, chunk_count):
-    """Yield (offset_in_run, chunk) 1 MiB chunks from one client via MTProto."""
-    entry = FILE_ID_CACHE.get(str(message_id))
+    """Yield (offset_in_run, chunk) 1 MiB chunks from one client via MTProto.
+
+    When the stored Telegram file reference has expired mid-run, the reference
+    is refreshed through THAT SAME client, the cache is updated, and the whole
+    run is replayed against the fresh reference. Re-delivered chunks are
+    deduplicated by the inflight registry against consumer positions, so a
+    refresh never re-serves bytes already consumed.
+    """
+    entry = _cache_lookup(message_id, chat_id)
     if not isinstance(entry, dict):
         return
     file_id = entry.get("file_id")
     if not file_id:
         return
-    i = 0
-    async for chunk in client.stream_media(file_id, offset=run_start, limit=chunk_count):
-        yield (i, chunk)
-        i += 1
+
+    # Attempt 1: current reference. Attempt 2: after a fresh reference refresh.
+    for attempt in (1, 2):
+        try:
+            i = 0
+            async for chunk in client.stream_media(file_id, offset=run_start, limit=chunk_count):
+                yield (i, chunk)
+                i += 1
+            return
+        except FILE_REFERENCE_EXPIRED as exc:
+            if attempt >= 2:
+                logger.warning(
+                    f"[STREAM] source {chat_id}:{message_id} reference expired again "
+                    f"after refresh (client {getattr(client, 'name', '?')})"
+                )
+                raise SourceReferenceExpired(
+                    f"file reference for {chat_id}:{message_id} expired and refresh failed"
+                ) from exc
+            refreshed = await _refresh_file_reference(client, chat_id, message_id)
+            if refreshed is None:
+                raise SourceReferenceExpired(
+                    f"could not refresh expired reference for {chat_id}:{message_id}"
+                ) from exc
+            new_file_id, new_size = refreshed
+            changed = new_file_id != file_id
+            if changed or (new_size and int(entry.get("file_size") or 0) != new_size):
+                entry["file_id"] = new_file_id
+                if new_size:
+                    entry["file_size"] = new_size
+                await save_cache_async()
+                logger.info(
+                    f"[REFRESH] refreshed expired reference {chat_id}:{message_id} "
+                    f"for client {getattr(client, 'name', '?')}"
+                )
+            file_id = new_file_id
+            # loop back and replay the same run against the fresh reference
 
 
 apex_driver = StreamDriver(
@@ -225,14 +346,14 @@ def index_media(msg_id, chat_id, file_id, file_size, file_name):
     if not file_id or not msg_id:
         return False
 
-    cached = FILE_ID_CACHE.get(str(msg_id))
+    cached = _cache_lookup(msg_id, chat_id)
     if isinstance(cached, dict) and cached.get("file_id") == file_id:
         return cached.get("title") or True
 
     is_tv, title, show_name, season, episode = parse_media_type(file_name)
     language = detect_language(file_name)
 
-    FILE_ID_CACHE[str(msg_id)] = {
+    FILE_ID_CACHE[_cache_key(chat_id, msg_id)] = {
         "file_id": file_id,
         "chat_id": chat_id,
         "file_size": file_size,
@@ -299,7 +420,7 @@ async def process_telegram_media(message, is_channel_post):
                 await _retry_pending_subtitles()
             except Exception as e:
                 logger.warning(f"[PYROGRAM] subtitle retry failed: {e}")
-            await trigger_jellyfin_scan()
+            await request_jellyfin_scan()
     except Exception as e:
         logger.error(f"[PYROGRAM] Error handling update: {e}")
 
@@ -608,6 +729,22 @@ async def trigger_jellyfin_scan():
                 continue
             logger.warning(f"Could not trigger Jellyfin library refresh after retries: {e}")
 
+# Debounced refresh: bursts of webhook ingests must coalesce into ONE library
+# scan instead of hammering Jellyfin's /Library/Refresh per message.
+_JF_SCAN_LAST = 0.0
+_JF_SCAN_MIN_INTERVAL = int(get_env("APEX_JELLYFIN_SCAN_INTERVAL", default="15"))
+_JF_SCAN_LOCK = asyncio.Lock()
+
+async def request_jellyfin_scan():
+    """Coalesce ingest-triggered library refreshes into one scan per interval."""
+    global _JF_SCAN_LAST
+    async with _JF_SCAN_LOCK:
+        now = time.monotonic()
+        if now - _JF_SCAN_LAST < _JF_SCAN_MIN_INTERVAL:
+            return
+        _JF_SCAN_LAST = now
+        await trigger_jellyfin_scan()
+
 WEBHOOK_SECRET = get_env("APEX_WEBHOOK_SECRET", "TG_WEBHOOK_SECRET")
 
 def _read_jellyfin_api_key():
@@ -745,10 +882,10 @@ async def telegram_webhook(request):
         language = detect_language(file_name)
 
         if file_id and msg_id:
-            if FILE_ID_CACHE.get(str(msg_id)):
+            if _cache_lookup(msg_id, chat_id):
                 return web.json_response({"ok": True, "dedup": True})
 
-            FILE_ID_CACHE[str(msg_id)] = {
+            FILE_ID_CACHE[_cache_key(chat_id, msg_id)] = {
                 "file_id": file_id,
                 "chat_id": chat_id,
                 "file_size": file_size,
@@ -763,7 +900,7 @@ async def telegram_webhook(request):
 
             strm_name = await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id, language)
             logger.info(f"[WEBHOOK] 🎉 Successfully indexed media from Webhook: {strm_name}")
-            await trigger_jellyfin_scan()
+            await request_jellyfin_scan()
             try:
                 await _retry_pending_subtitles()
             except Exception as e:
@@ -833,7 +970,7 @@ async def _scan_chat_history(chat_id, limit, indexed_list):
         if msg_chat_id is None or not allowed_chat(chat):
             continue
         msg_id = message.id
-        existing = FILE_ID_CACHE.get(str(msg_id))
+        existing = _cache_lookup(msg_id, msg_chat_id)
         if isinstance(existing, dict) and existing.get("file_id") == media.file_id:
             skipped += 1
             continue
@@ -845,7 +982,7 @@ async def _scan_chat_history(chat_id, limit, indexed_list):
             continue
         is_tv, title, show_name, season, episode = parse_media_type(file_name)
         language = detect_language(file_name)
-        FILE_ID_CACHE[str(msg_id)] = {
+        FILE_ID_CACHE[_cache_key(msg_chat_id, msg_id)] = {
             "file_id": media.file_id,
             "chat_id": msg_chat_id,
             "file_size": media.file_size or 0,
@@ -964,7 +1101,7 @@ def _source_path_from_request(request):
     # Legacy /stream_file and /stream/{message_id} routes carry no chat_id;
     # recover it from the index (0 = any channel is acceptable).
     if chat_id is None:
-        entry = FILE_ID_CACHE.get(str(message_id))
+        entry = _cache_lookup(message_id)
         if isinstance(entry, dict) and entry.get("chat_id"):
             chat_id = entry["chat_id"]
         else:
@@ -1005,7 +1142,7 @@ async def stream_file(request):
 
     chat_id, message_id = source
 
-    entry = FILE_ID_CACHE.get(str(message_id))
+    entry = _cache_lookup(message_id, chat_id)
     filename = request.match_info.get("filename", "video.mp4")
     if not isinstance(entry, dict):
         return web.Response(status=404, text=f"Media not available for message {message_id}.")
@@ -1127,8 +1264,9 @@ async def restore_cached_strm_files():
         logger.info(f"[MIGRATION] Removed {removed} obsolete Go-era .strm file(s)")
 
     count = 0
-    for msg_id, data in FILE_ID_CACHE.items():
+    for key, data in FILE_ID_CACHE.items():
         if isinstance(data, dict):
+            _chat_from_key, msg_id = _split_cache_key(key)
             file_id = data.get("file_id")
             title = data.get("title") or f"Media_{msg_id}"
             is_tv = data.get("is_tv", False)
@@ -1138,7 +1276,7 @@ async def restore_cached_strm_files():
             language = data.get("language") or detect_language(title) or DEFAULT_LANGUAGE
 
             if file_id and title:
-                chat_id = data.get("chat_id")
+                chat_id = data.get("chat_id") or _chat_from_key
                 await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id, language)
                 count += 1
     if count > 0:

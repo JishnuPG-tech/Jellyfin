@@ -27,6 +27,8 @@ from .ranges import (
     parse_range,
     trim_first_chunk,
 )
+from .inflight import StreamExhausted
+from .errors import SourceError
 from .pool import ClientHandle, NoClientAvailable
 
 logger = logging.getLogger("ApexStream")
@@ -211,6 +213,7 @@ class StreamDriver:
         emitted_window = 0
         total_needed = layout.total_needed
         skip_leading = layout.skip_leading
+        retry_avoid: Optional[int] = None  # client to skip on the next pass
 
         while chunk_index <= layout.end_chunk:
             run_start = (chunk_index // cfg.run_size) * cfg.run_size
@@ -220,9 +223,10 @@ class StreamDriver:
             try:
                 while active_client is None:
                     try:
-                        active_client = await self.pool.select()
+                        active_client = await self.pool.select(avoid=retry_avoid)
                     except NoClientAvailable:
                         await asyncio.sleep(0.05)
+                retry_avoid = None  # a fresh client is bound; clear the skip hint
 
                 factory = self._factory_for(active_client.client, plan.chat_id, plan.message_id)
                 run = await self.registry.get_run(
@@ -252,10 +256,28 @@ class StreamDriver:
                 await self.pool.note_success(active_client.client_id)
             except asyncio.CancelledError:
                 raise
-            except (RangeNotSatisfiable, FileNotFoundError, ValueError):
+            except (RangeNotSatisfiable, FileNotFoundError, ValueError, StreamExhausted):
+                # Deterministic source-level failures: missing file, empty file,
+                # or a file shorter than its recorded size. Retrying the same
+                # plan is futile and a healthy client can provoke these — never
+                # trip client cooldown for them.
                 raise
             except NoClientAvailable:
                 await asyncio.sleep(0.05)
+            except SourceError as exc:
+                # e.g. FILE_REFERENCE_EXPIRED whose per-client refresh failed.
+                # Fail the run over to a DIFFERENT client (its own refresh may
+                # succeed); the client that reported it is healthy, so take it
+                # out of the loop WITHOUT touching its cooldown bookkeeping.
+                if retries_left > 0:
+                    retries_left -= 1
+                    retry_avoid = active_client.client_id if active_client else None
+                    self.log.warning(
+                        f"[STREAM] source-level failover for {source_key}: "
+                        f"{type(exc).__name__}: {exc} ({retries_left} retries left)"
+                    )
+                    continue
+                raise
             except Exception as exc:  # noqa: BLE001
                 # transport-level telegram failure -> failover to another client
                 if (
@@ -263,6 +285,7 @@ class StreamDriver:
                     and not isinstance(exc, (RangeNotSatisfiable, FileNotFoundError, ValueError))
                 ):
                     retries_left -= 1
+                    retry_avoid = active_client.client_id if active_client else None
                     await self.pool.note_failure(
                         active_client.client_id, telegram_error=True
                     )

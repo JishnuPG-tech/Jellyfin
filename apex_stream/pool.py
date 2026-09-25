@@ -109,8 +109,12 @@ class ClientPool:
             out.append(handle)
         return out
 
-    async def select(self) -> ClientHandle:
-        """Pick the least-loaded eligible client, or raise NoClientAvailable."""
+    async def select(self, avoid: Optional[int] = None) -> ClientHandle:
+        """Pick the least-loaded eligible client, or raise NoClientAvailable.
+
+        When `avoid` is set and another eligible client exists, that client is
+        skipped so a failed run reconnects to a *different* pool member.
+        """
         now = time.monotonic()
         async with self._lock:
             eligible = self._eligible(now)
@@ -118,7 +122,12 @@ class ClientPool:
                 raise NoClientAvailable(
                     "all Telegram clients at capacity or in cooldown"
                 )
-            chosen = min(eligible, key=lambda h: h.current_load())
+            candidates = eligible
+            if avoid is not None and len(eligible) > 1:
+                others = [h for h in eligible if h.client_id != avoid]
+                if others:
+                    candidates = others
+            chosen = min(candidates, key=lambda h: h.current_load())
             chosen.active_streams += 1
             chosen.active_requests += 1
             return chosen

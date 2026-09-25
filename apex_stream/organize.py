@@ -150,10 +150,11 @@ def _sig_tokens(text: str) -> set:
 
 
 def match_subtitle_media(subtitle_base: str, entries: Dict, threshold: float = 0.6):
-    """Return (msg_id, entry, score) of the best matching indexed media.
+    """Return (media_key, entry, score) of the best matching indexed media.
 
-    `entries` is the FILE_ID_CACHE dict {str(msg_id): entry}. Matching is
-    token-overlap based, tolerating release tags / season markers. None if no
+    `entries` is the FILE_ID_CACHE dict {cache_key: entry} — keys are either
+    composite "chat_id:message_id" strings or legacy plain message ids. Matching
+    is token-overlap based, tolerating release tags / season markers. None if no
     entry clears `threshold`.
     """
     # Drop language-tag tokens (e.g. "mal", "eng" in "Movie.mal.srt") so they
