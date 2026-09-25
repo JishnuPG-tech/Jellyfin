@@ -351,6 +351,195 @@ def _is_expired_reference(exc):
     return False
 
 
+async def _media_session_for(client, dc_id):
+    """Return a session authorized on ``dc_id``, creating + caching it once per
+    (client, dc) like Pyrogram's ``inline_session.get_session`` (export auth at
+    most once per account). Same-DC file requests get the main client itself.
+
+    This is the fix for the ``auth.ExportAuthorization`` FLOOD_WAIT: Pyrogram's
+    ``Client.get_file`` builds a brand-new Session and re-runs ExportAuthorization
+    on EVERY call, but a cached media session exports exactly once.
+    """
+    if dc_id == await client.storage.dc_id():
+        return client
+    lock = getattr(client, "media_sessions_lock", None)
+    sessions = getattr(client, "media_sessions", None)
+    if lock is None or sessions is None:
+        return client
+    from pyrogram import raw as _raw
+    from pyrogram.errors import AuthBytesInvalid
+    from pyrogram.session import Auth, Session
+
+    async with lock:
+        existing = sessions.get(dc_id)
+        if existing:
+            return existing
+        session = sessions[dc_id] = Session(
+            client, dc_id,
+            await Auth(client, dc_id, await client.storage.test_mode()).create(),
+            await client.storage.test_mode(), is_media=True
+        )
+        try:
+            await session.start()
+            for _ in range(3):
+                exported_auth = await client.invoke(_raw.functions.auth.ExportAuthorization(dc_id=dc_id))
+                try:
+                    await session.invoke(_raw.functions.auth.ImportAuthorization(id=exported_auth.id, bytes=exported_auth.bytes))
+                except AuthBytesInvalid:
+                    continue
+                else:
+                    break
+            else:
+                raise AuthBytesInvalid
+        except Exception:
+            # don't leave a started-but-unauthorized session cached; a later
+            # call (this client or a failover) must be able to re-export
+            sessions.pop(dc_id, None)
+            try:
+                await session.stop()
+            except Exception:
+                pass
+            raise
+        return session
+
+
+async def _stream_file_chunks(client, file_id, run_start, chunk_count):
+    """Yield 1 MiB ``upload.GetFile`` chunks over a cached media session.
+
+    Mirrors Pyrogram's ``get_file`` transport (location shape, CDN decrypt)
+    WITHOUT its error-swallowing: FILE_REFERENCE_EXPIRED / FLOOD_WAIT / transport
+    errors propagate so the driver can refresh-and-replay or fail over to another
+    (non-flooded) pool client.
+    """
+    from hashlib import sha256
+
+    from pyrogram import raw as _raw
+    from pyrogram import utils as _utils
+    from pyrogram.crypto import aes
+    from pyrogram.errors import CDNFileHashMismatch, VolumeLocNotFound
+    from pyrogram.file_id import FileId, FileType, ThumbnailSource
+    from pyrogram.session import Auth, Session
+
+    fid = FileId.decode(file_id)
+
+    if fid.file_type == FileType.CHAT_PHOTO:
+        if fid.chat_id > 0:
+            peer = _raw.types.InputPeerUser(user_id=fid.chat_id, access_hash=fid.chat_access_hash)
+        else:
+            if fid.chat_access_hash == 0:
+                peer = _raw.types.InputPeerChat(chat_id=-fid.chat_id)
+            else:
+                peer = _raw.types.InputPeerChannel(
+                    channel_id=_utils.get_channel_id(fid.chat_id),
+                    access_hash=fid.chat_access_hash
+                )
+        location = _raw.types.InputPeerPhotoFileLocation(
+            peer=peer,
+            photo_id=fid.media_id,
+            big=fid.thumbnail_source == ThumbnailSource.CHAT_PHOTO_BIG
+        )
+    elif fid.file_type == FileType.PHOTO:
+        location = _raw.types.InputPhotoFileLocation(
+            id=fid.media_id,
+            access_hash=fid.access_hash,
+            file_reference=fid.file_reference,
+            thumb_size=fid.thumbnail_size
+        )
+    else:
+        location = _raw.types.InputDocumentFileLocation(
+            id=fid.media_id,
+            access_hash=fid.access_hash,
+            file_reference=fid.file_reference,
+            thumb_size=fid.thumbnail_size
+        )
+
+    session = await _media_session_for(client, fid.dc_id)
+    chunk_size = 1024 * 1024
+    offset_bytes = run_start * chunk_size
+    total = chunk_count
+    current = 0
+
+    r = await session.invoke(
+        _raw.functions.upload.GetFile(location=location, offset=offset_bytes, limit=chunk_size),
+        sleep_threshold=30
+    )
+
+    if isinstance(r, _raw.types.upload.File):
+        while True:
+            chunk = r.bytes
+            yield chunk
+            current += 1
+            if len(chunk) < chunk_size or current >= total:
+                break
+            offset_bytes += chunk_size
+            r = await session.invoke(
+                _raw.functions.upload.GetFile(location=location, offset=offset_bytes, limit=chunk_size),
+                sleep_threshold=30
+            )
+    elif isinstance(r, _raw.types.upload.FileCdnRedirect):
+        cdn_session = Session(
+            client, r.dc_id,
+            await Auth(client, r.dc_id, await client.storage.test_mode()).create(),
+            await client.storage.test_mode(), is_media=True, is_cdn=True
+        )
+        try:
+            await cdn_session.start()
+            while True:
+                r2 = await cdn_session.invoke(
+                    _raw.functions.upload.GetCdnFile(file_token=r.file_token, offset=offset_bytes, limit=chunk_size)
+                )
+                if isinstance(r2, _raw.types.upload.CdnFileReuploadNeeded):
+                    try:
+                        await session.invoke(
+                            _raw.functions.upload.ReuploadCdnFile(file_token=r.file_token, request_token=r2.request_token)
+                        )
+                    except VolumeLocNotFound:
+                        break
+                    else:
+                        continue
+
+                chunk = r2.bytes
+                decrypted_chunk = aes.ctr256_decrypt(
+                    chunk,
+                    r.encryption_key,
+                    bytearray(r.encryption_iv[:-4] + (offset_bytes // 16).to_bytes(4, "big"))
+                )
+                hashes = await session.invoke(
+                    _raw.functions.upload.GetCdnFileHashes(file_token=r.file_token, offset=offset_bytes)
+                )
+                for i, h in enumerate(hashes):
+                    cdn_chunk = decrypted_chunk[h.limit * i:h.limit * (i + 1)]
+                    CDNFileHashMismatch.check(h.hash == sha256(cdn_chunk).digest(), "h.hash == sha256(cdn_chunk).digest()")
+
+                yield decrypted_chunk
+                current += 1
+                if len(chunk) < chunk_size or current >= total:
+                    break
+                offset_bytes += chunk_size
+        finally:
+            await cdn_session.stop()
+
+
+class _MediaTransport:
+    """Instance-level ``stream_media(file_id, offset=, limit=)`` replacement that
+    serves chunks over a cached media session (export auth once). Installed on
+    every pool client so ``_fetch_chunks`` keeps its ``client.stream_media(...)``
+    call site while never re-running ExportAuthorization per run."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def __call__(self, file_id, offset=0, limit=0):
+        return _stream_file_chunks(self._client, file_id, offset, limit)
+
+
+def _install_media_transport(client):
+    try:
+        client.stream_media = _MediaTransport(client)
+    except Exception as e:
+        logger.warning(f"[MEDIA] could not install cached-session transport on {type(client).__name__}: {type(e).__name__}: {e}")
+
+
 async def _fetch_chunks(client, chat_id, message_id, run_start, chunk_count):
     """Yield (offset_in_run, chunk) 1 MiB chunks from one client via MTProto.
 
@@ -1431,6 +1620,7 @@ async def _register_main_client():
     if not any(c["id"] == 1 for c in clients):
         dc_id = await _client_dc_id(tg_app)
         await apex_pool.register(1, tg_app, ready=True, dc_id=dc_id)
+        _install_media_transport(tg_app)
         logger.info(f"[POOL] primary client registered (dc={dc_id})")
 
 
@@ -1444,6 +1634,7 @@ async def _start_extra_clients():
             logger.info(f"[PYROGRAM] extra client {idx} started")
             dc_id = await _client_dc_id(client)
             await apex_pool.register(idx, client, ready=True, dc_id=dc_id)
+            _install_media_transport(client)
             logger.info(f"[POOL] extra client {idx} registered (dc={dc_id})")
         except Exception as e:
             logger.warning(f"[PYROGRAM] extra client {idx} failed to start: {type(e).__name__}: {e}")

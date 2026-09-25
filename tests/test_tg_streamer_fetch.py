@@ -13,18 +13,44 @@ import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "tg_streamer.py"
 
-# Stub pyrogram.raw so AST-extracted _warm_channel_peer can resolve
-# raw.functions.channels / raw.types without the real package installed.
+# Stub pyrogram.raw so AST-extracted _warm_channel_peer / _media_session_for /
+# _stream_file_chunks can resolve raw.functions.* / raw.types.* without the
+# real package installed.
 _pg = types.ModuleType("pyrogram")
 _raw = types.ModuleType("pyrogram.raw")
 _funcs = types.ModuleType("pyrogram.raw.functions")
 _channels = types.ModuleType("pyrogram.raw.functions.channels")
+_auth_funcs = types.ModuleType("pyrogram.raw.functions.auth")
+_upload_funcs = types.ModuleType("pyrogram.raw.functions.upload")
 _rtypes = types.ModuleType("pyrogram.raw.types")
+_up_types = types.ModuleType("pyrogram.raw.types.upload")
+_utils = types.ModuleType("pyrogram.utils")
+_crypto = types.ModuleType("pyrogram.crypto")
+_aes = types.ModuleType("pyrogram.crypto.aes")
+_errors = types.ModuleType("pyrogram.errors")
+_session = types.ModuleType("pyrogram.session")
+_file_id = types.ModuleType("pyrogram.file_id")
 
 
 class _Stub:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
+
+
+class _UploadFile(_Stub):
+    pass
+
+
+class _FileCdnRedirect(_Stub):
+    pass
+
+
+class _GetFile(_Stub):
+    pass
+
+
+class _InputDocumentFileLocation(_Stub):
+    pass
 
 
 class _GetChannels(_Stub):
@@ -35,17 +61,143 @@ class _InputChannel(_Stub):
     pass
 
 
+class _ExportAuthorization(_Stub):
+    pass
+
+
+class _ImportAuthorization(_Stub):
+    pass
+
+
+class FloodWait(Exception):
+    def __init__(self, value):
+        super().__init__(value)
+        self.value = value
+
+
+class AuthBytesInvalid(Exception):
+    pass
+
+
+class VolumeLocNotFound(Exception):
+    pass
+
+
+class CDNFileHashMismatch(Exception):
+    @staticmethod
+    def check(cond, expr):
+        if not cond:
+            raise CDNFileHashMismatch(expr)
+
+
+class FileType:
+    CHAT_PHOTO = "chat_photo"
+    PHOTO = "photo"
+    DOCUMENT = "document"
+
+
+class ThumbnailSource:
+    CHAT_PHOTO_BIG = "chat_photo_big"
+
+
+class _FakeAuth:
+    def __init__(self, *a, **k):
+        pass
+
+    async def create(self):
+        return b"authkey"
+
+
+class FakeMediaSession:
+    instances = []
+
+    def __init__(self, client, dc_id, auth_key, test_mode, **kw):
+        self.client = client
+        self.dc_id = dc_id
+        self.started = False
+        self.stopped = False
+        self.invoked = []
+        FakeMediaSession.instances.append(self)
+
+    async def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+    async def invoke(self, rpc, **kw):
+        self.invoked.append((rpc, kw))
+        if isinstance(rpc, _GetFile):
+            return _UploadFile(bytes=b"x" * MIB)
+        return _Stub(id=7, bytes=b"import-bytes")
+
+
+class _FakeFileId:
+    @staticmethod
+    def decode(file_id):
+        return _Stub(
+            file_type=FileType.DOCUMENT,
+            dc_id=5,
+            chat_id=-1003907801136,
+            chat_access_hash=0,
+            media_id=12345,
+            access_hash=67890,
+            file_reference=b"ref",
+            thumbnail_size="",
+            thumbnail_source=None,
+        )
+
+
+def _get_channel_id(chat_id):
+    return -chat_id
+
+
+def ctr256_decrypt(chunk, key, iv):
+    return chunk
+
+
+_up_types.File = _UploadFile
+_up_types.FileCdnRedirect = _FileCdnRedirect
+_upload_funcs.GetFile = _GetFile
+_auth_funcs.ExportAuthorization = _ExportAuthorization
+_auth_funcs.ImportAuthorization = _ImportAuthorization
 _channels.GetChannels = _GetChannels
 _rtypes.InputChannel = _InputChannel
+_rtypes.InputDocumentFileLocation = _InputDocumentFileLocation
 _funcs.channels = _channels
+_funcs.auth = _auth_funcs
+_funcs.upload = _upload_funcs
 _raw.functions = _funcs
 _raw.types = _rtypes
+_rtypes.upload = _up_types
 _pg.raw = _raw
+_utils.get_channel_id = _get_channel_id
+_crypto.aes = _aes
+_aes.ctr256_decrypt = ctr256_decrypt
+_errors.FloodWait = FloodWait
+_errors.AuthBytesInvalid = AuthBytesInvalid
+_errors.VolumeLocNotFound = VolumeLocNotFound
+_errors.CDNFileHashMismatch = CDNFileHashMismatch
+_session.Auth = _FakeAuth
+_session.Session = FakeMediaSession
+_file_id.FileId = _FakeFileId
+_file_id.FileType = FileType
+_file_id.ThumbnailSource = ThumbnailSource
+
 sys.modules["pyrogram"] = _pg
 sys.modules["pyrogram.raw"] = _raw
 sys.modules["pyrogram.raw.functions"] = _funcs
 sys.modules["pyrogram.raw.functions.channels"] = _channels
+sys.modules["pyrogram.raw.functions.auth"] = _auth_funcs
+sys.modules["pyrogram.raw.functions.upload"] = _upload_funcs
 sys.modules["pyrogram.raw.types"] = _rtypes
+sys.modules["pyrogram.raw.types.upload"] = _up_types
+sys.modules["pyrogram.utils"] = _utils
+sys.modules["pyrogram.crypto"] = _crypto
+sys.modules["pyrogram.crypto.aes"] = _aes
+sys.modules["pyrogram.errors"] = _errors
+sys.modules["pyrogram.session"] = _session
+sys.modules["pyrogram.file_id"] = _file_id
 
 MIB = 1024 * 1024
 FILE_SIZE = 895_849_434
@@ -78,6 +230,8 @@ def tc():
         "_cache_lookup",
         "_cache_key",
         "_is_expired_reference",
+        "_media_session_for",
+        "_stream_file_chunks",
     }
     mod_nodes = [
         n
@@ -255,3 +409,142 @@ def test_refresh_peer_warm_failure_returns_none(tc):
 
     assert asyncio_run(drain()) is None
     assert client.get_messages_calls == 1
+
+
+# --- cached media session transport -------------------------------------------------
+
+
+class MediaStorage:
+    def __init__(self, dc_id):
+        self._dc = dc_id
+
+    async def dc_id(self):
+        return self._dc
+
+    async def test_mode(self):
+        return False
+
+
+class MediaClient:
+    """Fake pyrogram client: storage + media_sessions + invoke. Export grants a
+    hardcoded peer; GetFile serves `serve_chunks` MiB chunks then one short tail."""
+
+    def __init__(self, primary_dc=5, file_dc=5, serve_chunks=16, fail_export=False):
+        self.storage = MediaStorage(primary_dc)
+        self.file_dc = file_dc
+        self.serve_chunks = serve_chunks
+        self.fail_export = fail_export
+        self.media_sessions = {}
+        self.media_sessions_lock = asyncio.Lock()
+        self.export_calls = 0
+        self.get_calls = 0
+        self.get_offsets = []
+        self.import_calls = 0
+
+    async def invoke(self, rpc, **kwargs):
+        if isinstance(rpc, _ExportAuthorization):
+            self.export_calls += 1
+            if self.fail_export:
+                raise FloodWait(1720)
+            return _Stub(id=7, bytes=b"import-bytes")
+        if isinstance(rpc, _ImportAuthorization):
+            self.import_calls += 1
+            return _Stub(id=7, bytes=b"ok")
+        if isinstance(rpc, _GetFile):
+            self.get_calls += 1
+            self.get_offsets.append(rpc.offset)
+            if self.get_calls <= self.serve_chunks:
+                return _UploadFile(bytes=b"x" * MIB)
+            return _UploadFile(bytes=b"")
+        raise AssertionError(f"unexpected rpc {type(rpc).__name__}")
+
+
+def test_media_session_exports_once_and_caches(tc):
+    FakeMediaSession.instances.clear()
+    client = MediaClient(primary_dc=2, file_dc=5)
+
+    async def main():
+        s1 = await tc["_media_session_for"](client, 5)
+        s2 = await tc["_media_session_for"](client, 5)
+        return s1, s2
+
+    s1, s2 = asyncio_run(main())
+    assert len(FakeMediaSession.instances) == 1
+    assert s1 is s2
+    assert s1.dc_id == 5
+    assert client.export_calls == 1  # never re-export on cache hit
+    assert len([rpc for rpc, _ in s1.invoked if isinstance(rpc, _ImportAuthorization)]) == 1
+    assert s1.started and not s1.stopped
+
+
+def test_media_session_same_dc_returns_client(tc):
+    client = MediaClient(primary_dc=5, file_dc=5)
+    s = asyncio_run(tc["_media_session_for"](client, 5))
+    assert s is client
+    assert client.export_calls == 0
+
+
+def test_media_session_flood_cleans_cache(tc):
+    FakeMediaSession.instances.clear()
+    client = MediaClient(primary_dc=2, file_dc=5, fail_export=True)
+
+    async def main():
+        try:
+            await tc["_media_session_for"](client, 5)
+        except FloodWait as e:
+            return e.value
+        raise AssertionError("expected FloodWait")
+
+    assert asyncio_run(main()) == 1720
+    assert 5 not in client.media_sessions  # no zombie session left for failover
+
+
+def test_stream_file_chunks_document_path(tc):
+    client = MediaClient(primary_dc=5, file_dc=5, serve_chunks=16)
+
+    async def main():
+        out = []
+        async for chunk in tc["_stream_file_chunks"](client, "fid", 768, 16):
+            out.append(chunk)
+        return out
+
+    chunks = asyncio_run(main())
+    assert len(chunks) == 16  # exactly chunk_count full chunks; tail clipped downstream
+    assert sum(len(c) for c in chunks) == 16 * MIB
+    assert client.get_offsets[:3] == [768 * MIB, 769 * MIB, 770 * MIB]  # run_start offset honored
+    assert client.export_calls == 0  # same-DC file needs no export
+
+
+def test_stream_file_chunks_cross_dc_exports_once(tc):
+    FakeMediaSession.instances.clear()
+    client = MediaClient(primary_dc=2, file_dc=5, serve_chunks=2)
+
+    async def main():
+        out = []
+        async for chunk in tc["_stream_file_chunks"](client, "fid", 0, 2):
+            out.append(chunk)
+        return out
+
+    chunks = asyncio_run(main())
+    assert len(chunks) == 2  # exactly chunk_count full chunks
+    assert client.export_calls == 1  # exported once for the cross-DC session
+    assert len(FakeMediaSession.instances) == 1
+    s = FakeMediaSession.instances[0]
+    assert len([rpc for rpc, _ in s.invoked if isinstance(rpc, _ImportAuthorization)]) == 1
+
+
+def test_stream_file_chunks_cross_dc_flood_propagates(tc):
+    FakeMediaSession.instances.clear()
+    client = MediaClient(primary_dc=2, file_dc=5, serve_chunks=2, fail_export=True)
+
+    async def main():
+        try:
+            async for _ in tc["_stream_file_chunks"](client, "fid", 0, 2):
+                pass
+        except FloodWait as e:
+            return e.value
+        raise AssertionError("expected FloodWait")
+
+    assert asyncio_run(main()) == 1720
+    assert client.export_calls == 1  # only the one attempt
+    assert 5 not in client.media_sessions
