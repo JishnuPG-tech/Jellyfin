@@ -36,6 +36,7 @@ COPY nginx.conf /nginx.conf
 COPY proxy.py /proxy.py
 COPY tg_streamer.py /tg_streamer.py
 COPY health_doctor.py /health_doctor.py
+COPY apex_stream /apex_stream
 COPY gateway /gateway
 RUN chmod +x /entrypoint.sh /health_doctor.py
 

@@ -17,6 +17,9 @@ from pyrogram.enums import ChatType
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, RPCError, AuthKeyDuplicated
 
+# Apex streaming core (telegram-free; wired to Pyrogram below)
+from apex_stream import Config, BoundedChunkCache, ClientPool, InFlightRegistry, StreamMetrics, StreamDriver, FileInfo, RangeNotSatisfiable, NoClientAvailable
+
 logger = logging.getLogger("TG_Drive_Streamer")
 if not logger.handlers:
     _fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -98,6 +101,87 @@ def save_cache():
     _save_cache_sync()
 
 load_cache()
+
+# ---------------------------------------------------------------------------
+# Apex streaming core singletons (wired to Pyrogram clients below).
+# ---------------------------------------------------------------------------
+APEX_CFG = Config()
+apex_cache = BoundedChunkCache(
+    max_bytes=APEX_CFG.cache_size_bytes if APEX_CFG.cache_enabled_effective() else 0,
+    ttl_seconds=APEX_CFG.cache_ttl_seconds,
+)
+apex_pool = ClientPool(
+    max_streams_per_client=APEX_CFG.max_per_client,
+    failure_threshold=APEX_CFG.client_failure_threshold,
+    cooldown_seconds=APEX_CFG.client_cooldown_seconds,
+    logger=logger,
+)
+apex_registry = InFlightRegistry(
+    cache=apex_cache,
+    run_size=APEX_CFG.run_size,
+    max_window=APEX_CFG.run_window,
+    max_inflight_runs=APEX_CFG.max_inflight_runs,
+    logger_obj=logger,
+)
+apex_metrics = StreamMetrics()
+
+
+async def _resolve_source(chat_id, message_id):
+    """Look up a (chat_id, message_id) source in the persistent index."""
+    entry = FILE_ID_CACHE.get(str(message_id))
+    if not isinstance(entry, dict):
+        return None
+    if chat_id and entry.get("chat_id") and str(entry.get("chat_id")) != str(chat_id):
+        return None
+    return FileInfo(
+        size=int(entry.get("file_size") or 0),
+        name=entry.get("title") or f"Media_{message_id}",
+        file_id=entry.get("file_id"),
+        mime_type="video/mp4",
+    )
+
+
+async def _fetch_chunks(client, chat_id, message_id, run_start, chunk_count):
+    """Yield (offset_in_run, chunk) 1 MiB chunks from one client via MTProto."""
+    entry = FILE_ID_CACHE.get(str(message_id))
+    if not isinstance(entry, dict):
+        return
+    file_id = entry.get("file_id")
+    if not file_id:
+        return
+    i = 0
+    async for chunk in client.stream_media(file_id, offset=run_start, limit=chunk_count):
+        yield (i, chunk)
+        i += 1
+
+
+apex_driver = StreamDriver(
+    cfg=APEX_CFG,
+    pool=apex_pool,
+    registry=apex_registry,
+    metrics=apex_metrics,
+    resolve_fn=_resolve_source,
+    fetch_fn=_fetch_chunks,
+    logger_obj=logger,
+)
+
+# Extra Telegram bots (APEX_TELEGRAM_EXTRA_TOKENS): started solely for streaming;
+# they never consume updates so the webhook/primary bot owns ingestion.
+extra_clients = []
+for _ec_idx, _ec_token in enumerate(APEX_CFG.extra_tokens, start=2):
+    if API_ID and API_HASH and _ec_token:
+        try:
+            extra_clients.append((_ec_idx, Client(
+                f"tg_extra_{_ec_idx}",
+                api_id=int(API_ID),
+                api_hash=API_HASH,
+                bot_token=_ec_token,
+                workdir=DATA_DIR,
+                in_memory=True,
+                no_updates=True,
+            )))
+        except Exception as e:
+            logger.error(f"[PYROGRAM] Error initializing extra client {_ec_idx}: {e}")
 
 def index_media(msg_id, chat_id, file_id, file_size, file_name):
     """Core ingestion: cache the file and create a .strm for Jellyfin."""
@@ -206,12 +290,19 @@ routes = web.RouteTableDef()
 @routes.get("/")
 @routes.get("/health")
 async def health(request):
+    pool_state = apex_pool.snapshot()
     is_ready = bool(tg_app and tg_app.is_connected)
     return web.json_response({
         "status": "ok",
         "service": "TG-Drive High-Speed 5G Streamer",
         "pyrogram_configured": bool(tg_app),
         "pyrogram_connected": is_ready,
+        "pool_clients": pool_state["total"],
+        "pool": pool_state["clients"],
+        "active_runs": apex_registry.active_run_count(),
+        "inflight_runs": apex_registry.snapshot(),
+        "cache": apex_cache.stats(),
+        "metrics": {k: v for k, v in apex_metrics.snapshot().items() if k != "recent_streams"},
         "cached_files": len(FILE_ID_CACHE),
         "movies_dir": MOVIES_DIR,
         "shows_dir": SHOWS_DIR
@@ -526,112 +617,144 @@ async def register_webhook_route(request):
     return web.json_response({"ok": ok, "url": url, "description": desc, "purpose": "activate bot connection"})
 
 
+def _source_path_from_request(request):
+    """Return (chat_id, message_id) for a request on any supported route."""
+    chat_id = request.match_info.get("chat_id")
+    msg_id = request.match_info.get("message_id") or request.query.get("message_id")
+    if msg_id is None:
+        return None
+    try:
+        message_id = int(msg_id)
+    except (TypeError, ValueError):
+        return None
+    # Legacy /stream_file and /stream/{message_id} routes carry no chat_id;
+    # recover it from the index (0 = any channel is acceptable).
+    if chat_id is None:
+        entry = FILE_ID_CACHE.get(str(message_id))
+        if isinstance(entry, dict) and entry.get("chat_id"):
+            chat_id = entry["chat_id"]
+        else:
+            chat_id = 0
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        chat_id = 0
+    return chat_id, message_id
+
+
+async def _wait_pool_ready():
+    """Wait briefly for at least one MTProto client to register (startup grace)."""
+    for _ in range(30):
+        if len(apex_pool) > 0:
+            return True
+        await asyncio.sleep(1)
+    return False
+
+
 @routes.get("/stream_file")
 @routes.get("/stream/{message_id}")
 @routes.get("/stream/{message_id}/{filename}")
+@routes.get("/stream/{chat_id}/{message_id}/video.mp4")
+@routes.head("/stream_file")
+@routes.head("/stream/{message_id}")
+@routes.head("/stream/{message_id}/{filename}")
+@routes.head("/stream/{chat_id}/{message_id}/video.mp4")
 async def stream_file(request):
     """
-    High-Speed 5G Byte-Accurate Range Streamer:
-    Optimized TCP Keep-Alive, memory caching headers, and multi-chunk Pyrogram MTProto buffer.
-    Pushes maximum throughput to Jellyfin / mobile clients without CPU re-encoding overhead!
+    Coalescing, byte-accurate Range streamer backed by the apex_stream driver:
+    multi-client pool, shared in-flight Telegram fetches, bounded LRU+TTL cache,
+    client failover and per-request cancellation. All old routes are preserved.
     """
-    file_id = request.query.get("file_id")
-    msg_id_str = request.match_info.get("message_id") or request.query.get("message_id")
+    source = _source_path_from_request(request)
+    if source is None:
+        return web.Response(status=400, text="message_id is required.")
+
+    chat_id, message_id = source
+
+    entry = FILE_ID_CACHE.get(str(message_id))
     filename = request.match_info.get("filename", "video.mp4")
+    if not isinstance(entry, dict):
+        return web.Response(status=404, text=f"Media not available for message {message_id}.")
 
-    cached_entry = FILE_ID_CACHE.get(str(msg_id_str))
-    file_size = 0
-    if isinstance(cached_entry, dict):
-        if not file_id:
-            file_id = cached_entry.get("file_id")
-        file_size = cached_entry.get("file_size", 0)
-
-    if not file_id:
-        return web.Response(status=404, text=f"Media not available for message {msg_id_str}.")
-
-    if not (tg_app and tg_app.is_connected):
+    if len(apex_pool) == 0 and not await _wait_pool_ready():
         # Jellyfin probes .strm files at library-scan time, which can run before the
         # MTProto client has finished connecting. Wait briefly instead of failing fast
         # so ffprobe/ffmpeg get a real stream rather than a 500.
-        for _ in range(30):
-            if tg_app and tg_app.is_connected:
-                break
-            await asyncio.sleep(1)
-        else:
-            return web.Response(status=503, text="Streaming temporarily unavailable (Telegram client not connected yet).")
+        return web.Response(status=503, text="Streaming temporarily unavailable (Telegram client not connected yet).")
 
+    range_header = request.headers.get("Range")
     try:
-        range_header = request.headers.get("Range")
-        start = 0
-        end = file_size - 1 if file_size > 0 else 0
+        plan = await apex_driver.plan(chat_id, message_id, range_header)
+    except FileNotFoundError:
+        return web.Response(status=404, text=f"Media not available for message {message_id}.")
+    except RangeNotSatisfiable:
+        size = int(entry.get("file_size") or 0)
+        headers = {"Content-Range": f"bytes */{size}"} if size > 0 else {}
+        return web.Response(status=416, headers=headers, text="Requested range not satisfiable.")
+    except ValueError:
+        return web.Response(status=404, text="Media has no bytes.")
 
-        if range_header:
-            match = re.match(r"^bytes=(\d+)-(\d+)?$", range_header)
-            if match:
-                start = int(match.group(1))
-                if match.group(2):
-                    end = int(match.group(2))
-                elif file_size > 0:
-                    end = file_size - 1
+    headers = {
+        "Content-Type": plan.content_type,
+        "Accept-Ranges": plan.accept_ranges,
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=86400",
+        "Connection": "keep-alive",
+        "Content-Length": str(plan.content_length),
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+    if plan.content_range:
+        headers["Content-Range"] = plan.content_range
 
-        if file_size > 0 and end >= file_size:
-            end = file_size - 1
+    response = web.StreamResponse(status=plan.status, headers=headers)
+    await response.prepare(request)
 
-        req_length = (end - start + 1) if (file_size > 0 and end >= start) else file_size
-
-        # Pyrogram 1MB Chunk calculation
-        CHUNK_SIZE = 1024 * 1024
-        start_chunk = start // CHUNK_SIZE
-        skip_leading_bytes = start % CHUNK_SIZE
-        chunk_count = ((end - start + skip_leading_bytes + CHUNK_SIZE) // CHUNK_SIZE) if file_size > 0 else 0
-
-        status = 206 if range_header and file_size > 0 else 200
-
-        # High-Performance 5G & Direct Play Headers
-        headers = {
-            "Content-Type": "video/mp4",
-            "Accept-Ranges": "bytes",
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "public, max-age=86400",
-            "Connection": "keep-alive",
-            "Content-Disposition": f'inline; filename="{filename}"'
-        }
-        if file_size > 0:
-            headers["Content-Length"] = str(req_length)
-            if range_header:
-                headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-
-        response = web.StreamResponse(status=status, headers=headers)
-        await response.prepare(request)
-
-        bytes_written = 0
-        is_first_chunk = True
-
-        try:
-            async for chunk in tg_app.stream_media(file_id, offset=start_chunk, limit=chunk_count):
-                if is_first_chunk:
-                    chunk = chunk[skip_leading_bytes:]
-                    is_first_chunk = False
-
-                if bytes_written + len(chunk) > req_length:
-                    needed = req_length - bytes_written
-                    await response.write(chunk[:needed])
-                    bytes_written += needed
-                    break
-                else:
-                    await response.write(chunk)
-                    bytes_written += len(chunk)
-                    if bytes_written >= req_length:
-                        break
-        except (ConnectionResetError, asyncio.CancelledError):
-            pass
-
-        return response
+    started_at = time.monotonic()
+    bytes_written = 0
+    try:
+        async for chunk in apex_driver.generate(plan):
+            await response.write(chunk)
+            bytes_written += len(chunk)
+    except asyncio.CancelledError:
+        apex_metrics.record_stream({
+            "source": f"{chat_id}:{message_id}",
+            "status": "cancelled",
+            "duration": round(time.monotonic() - started_at, 3),
+            "bytes_sent": bytes_written,
+        })
+        raise
+    except ConnectionResetError:
+        apex_metrics.record_stream({
+            "source": f"{chat_id}:{message_id}",
+            "status": "cancelled",
+            "duration": round(time.monotonic() - started_at, 3),
+            "bytes_sent": bytes_written,
+        })
     except Exception as e:
-        if not isinstance(e, (ConnectionResetError, asyncio.CancelledError)):
-            logger.warning(f"[STREAM] MTProto stream exception: {e}")
+        # A hard failure (retries exhausted) — surface it but keep the process up.
+        logger.warning(f"[STREAM] generate error for {chat_id}:{message_id}: {type(e).__name__}: {e}")
+        apex_metrics.record_stream({
+            "source": f"{chat_id}:{message_id}",
+            "status": "error",
+            "error": str(e),
+            "duration": round(time.monotonic() - started_at, 3),
+            "bytes_sent": bytes_written,
+        })
+        if not response.prepared:
+            return web.Response(status=502, text="Streaming source unavailable.")
+    return response
 
-    return web.Response(status=500, text="Streaming temporarily unavailable.")
+
+@routes.get("/status")
+async def status(request):
+    snap = apex_driver.status_snapshot()
+    snap["cached_files"] = len(FILE_ID_CACHE)
+    return web.json_response(snap)
+
+
+@routes.get("/metrics")
+async def metrics(request):
+    return web.json_response(apex_metrics.snapshot())
 
 async def restore_cached_strm_files():
     """Removes obsolete Go-era .strm files and restores every cached movie & TV show from disk."""
@@ -671,10 +794,39 @@ async def restore_cached_strm_files():
         logger.info(f"[RESTORE] Restored {count} .strm file(s) from persistent disk cache.")
         await trigger_jellyfin_scan()
 
+async def _register_main_client():
+    """Register the primary client in the pool once it is connected."""
+    if tg_app is None:
+        return
+    clients = apex_pool.snapshot()["clients"]
+    if not any(c["id"] == 1 for c in clients):
+        await apex_pool.register(1, tg_app, ready=True)
+        logger.info("[POOL] primary client registered")
+
+
+async def _start_extra_clients():
+    """Start extra streaming bots and register them in the pool."""
+    for idx, client in extra_clients:
+        try:
+            if client.is_connected:
+                continue
+            await client.start()
+            logger.info(f"[PYROGRAM] extra client {idx} started")
+            await apex_pool.register(idx, client, ready=True)
+            logger.info(f"[POOL] extra client {idx} registered")
+        except Exception as e:
+            logger.warning(f"[PYROGRAM] extra client {idx} failed to start: {type(e).__name__}: {e}")
+            try:
+                await client.stop()
+            except Exception:
+                pass
+
+
 async def start_pyrogram():
     """Starts Pyrogram Client (retrying through transient session collisions) and restores cached media."""
     if not tg_app:
         logger.warning("[PYROGRAM] Pyrogram client not configured.")
+        await _start_extra_clients()
         await restore_cached_strm_files()
         return
 
@@ -687,6 +839,8 @@ async def start_pyrogram():
             await tg_app.start()
             me = await tg_app.get_me()
             logger.info(f"[PYROGRAM] Pyrogram Client started successfully! Bot: @{getattr(me, 'username', '?')} (id={getattr(me, 'id', '?')})")
+            await _register_main_client()
+            await _start_extra_clients()
             await restore_cached_strm_files()
             await register_telegram_webhook()
             return
@@ -726,14 +880,27 @@ async def start_pyrogram():
         await tg_app.start()
         me = await tg_app.get_me()
         logger.info(f"[PYROGRAM] Pyrogram reconnected with fresh session! Bot: @{getattr(me, 'username', '?')} (id={getattr(me, 'id', '?')})")
+        await _register_main_client()
+        await _start_extra_clients()
         await restore_cached_strm_files()
         await register_telegram_webhook()
     except Exception as e:
         logger.error(f"[PYROGRAM] Fresh-session start failed: {e}")
 
 async def stop_pyrogram():
-    if tg_app and tg_app.is_connected:
-        await tg_app.stop()
+    try:
+        if tg_app and tg_app.is_connected:
+            await apex_pool.unregister(1)
+            await tg_app.stop()
+    except Exception as e:
+        logger.warning(f"[PYROGRAM] shutdown primary: {e}")
+    for idx, client in extra_clients:
+        try:
+            await apex_pool.unregister(idx)
+            if client.is_connected:
+                await client.stop()
+        except Exception as e:
+            logger.warning(f"[PYROGRAM] shutdown extra {idx}: {e}")
 
 async def start_background_tasks(app):
     async def _guard():
