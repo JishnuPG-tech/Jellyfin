@@ -226,69 +226,104 @@ def build_movie_nfo(data: Dict) -> str:
         if c.get("iso_3166_1"):
             country = c["iso_3166_1"]
             break
-    return f"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+    genre_lines = "".join("  <genre>%s</genre>\n" % xml_escape(x) for x in genres)
+    country_line = "  <country>%s</country>\n" % xml_escape(country) if country else ""
+    return """<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <movie>
-  <title>{xml_escape(g('title'))}</title>
-  <originaltitle>{xml_escape(g('original_title'))}</originaltitle>
-  <year>{xml_escape(g('release_date'))[:4]}</year>
-  <premiered>{xml_escape(g('release_date'))}</premiered>
-  <releasedate>{xml_escape(g('release_date'))}</releasedate>
-  <rating>{xml_escape(g('vote_average'))}</rating>
-  <votes>{xml_escape(g('vote_count'))}</votes>
-  <runtime>{xml_escape(g('runtime'))}</runtime>
-  <plot>{xml_escape(g('overview'))}</plot>
-  <tagline>{xml_escape(g('tagline'))}</tagline>
-  <imdbid>{xml_escape(str(data.get('imdb_id') or ''))}</imdbid>
-  <tmdbid>{xml_escape(str(data.get('id') or ''))}</tmdbid>
-  <uniqueid type="tmdb">{xml_escape(str(data.get('id') or ''))}</uniqueid>
-  {''.join(f'  <genre>{xml_escape(x)}</genre>\n' for x in genres)}
-  {f'  <country>{xml_escape(country)}</country>\n' if country else ''}
-  <art>
+  <title>%(title)s</title>
+  <originaltitle>%(original_title)s</originaltitle>
+  <year>%(year)s</year>
+  <premiered>%(premiered)s</premiered>
+  <releasedate>%(releasedate)s</releasedate>
+  <rating>%(rating)s</rating>
+  <votes>%(votes)s</votes>
+  <runtime>%(runtime)s</runtime>
+  <plot>%(plot)s</plot>
+  <tagline>%(tagline)s</tagline>
+  <imdbid>%(imdbid)s</imdbid>
+  <tmdbid>%(tmdbid)s</tmdbid>
+  <uniqueid type="tmdb">%(tmdbid)s</uniqueid>
+  %(genres)s%(country)s  <art>
     <poster>poster.jpg</poster>
     <backdrop>backdrop.jpg</backdrop>
   </art>
 </movie>
-"""
+""" % {
+        "title": xml_escape(g("title")),
+        "original_title": xml_escape(g("original_title")),
+        "year": xml_escape(g("release_date"))[:4],
+        "premiered": xml_escape(g("release_date")),
+        "releasedate": xml_escape(g("release_date")),
+        "rating": xml_escape(g("vote_average")),
+        "votes": xml_escape(g("vote_count")),
+        "runtime": xml_escape(g("runtime")),
+        "plot": xml_escape(g("overview")),
+        "tagline": xml_escape(g("tagline")),
+        "imdbid": xml_escape(str(data.get("imdb_id") or "")),
+        "tmdbid": xml_escape(str(data.get("id") or "")),
+        "genres": genre_lines,
+        "country": country_line,
+    }
 
 
 def build_tvshow_nfo(data: Dict) -> str:
     g = lambda k: str(data.get(k) or "")
     genres = [_gen(x) for x in (data.get("genres") or []) if _gen(x)]
-    return f"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+    genre_lines = "".join("  <genre>%s</genre>\n" % xml_escape(x) for x in genres)
+    return """<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <tvshow>
-  <title>{xml_escape(g('name'))}</title>
-  <originaltitle>{xml_escape(g('original_name'))}</originaltitle>
-  <year>{xml_escape(g('first_air_date'))[:4]}</year>
-  <premiered>{xml_escape(g('first_air_date'))}</premiered>
-  <rating>{xml_escape(g('vote_average'))}</rating>
-  <votes>{xml_escape(g('vote_count'))}</votes>
-  <runtime>{xml_escape(_tv_runtime(data))}</runtime>
-  <plot>{xml_escape(g('overview'))}</plot>
-  <tmdbid>{xml_escape(str(data.get('id') or ''))}</tmdbid>
-  <uniqueid type="tmdb">{xml_escape(str(data.get('id') or ''))}</uniqueid>
-  {''.join(f'  <genre>{xml_escape(x)}</genre>\n' for x in genres)}
-  <art>
+  <title>%(title)s</title>
+  <originaltitle>%(original_title)s</originaltitle>
+  <year>%(year)s</year>
+  <premiered>%(premiered)s</premiered>
+  <rating>%(rating)s</rating>
+  <votes>%(votes)s</votes>
+  <runtime>%(runtime)s</runtime>
+  <plot>%(plot)s</plot>
+  <tmdbid>%(tmdbid)s</tmdbid>
+  <uniqueid type="tmdb">%(tmdbid)s</uniqueid>
+  %(genres)s  <art>
     <poster>poster.jpg</poster>
     <backdrop>backdrop.jpg</backdrop>
   </art>
 </tvshow>
-"""
+""" % {
+        "title": xml_escape(g("name")),
+        "original_title": xml_escape(g("original_name")),
+        "year": xml_escape(g("first_air_date"))[:4],
+        "premiered": xml_escape(g("first_air_date")),
+        "rating": xml_escape(g("vote_average")),
+        "votes": xml_escape(g("vote_count")),
+        "runtime": xml_escape(_tv_runtime(data)),
+        "plot": xml_escape(g("overview")),
+        "tmdbid": xml_escape(str(data.get("id") or "")),
+        "genres": genre_lines,
+    }
 
 
 def build_episode_nfo(data: Dict) -> str:
     g = lambda k: str(data.get(k) or "")
-    return f"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+    return """<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <episodedetails>
-  <season>{xml_escape(g('season_number'))}</season>
-  <episode>{xml_escape(g('episode_number'))}</episode>
-  <title>{xml_escape(g('name'))}</title>
-  <plot>{xml_escape(g('overview'))}</plot>
-  <aired>{xml_escape(g('air_date'))}</aired>
-  <rating>{xml_escape(g('vote_average'))}</rating>
-  <runtime>{xml_escape(g('runtime'))}</runtime>
-  <uniqueid type="tmdb">{xml_escape(str(data.get('id') or ''))}</uniqueid>
+  <season>%(season)s</season>
+  <episode>%(episode)s</episode>
+  <title>%(title)s</title>
+  <plot>%(plot)s</plot>
+  <aired>%(aired)s</aired>
+  <rating>%(rating)s</rating>
+  <runtime>%(runtime)s</runtime>
+  <uniqueid type="tmdb">%(tmdbid)s</uniqueid>
 </episodedetails>
-"""
+""" % {
+        "season": xml_escape(g("season_number")),
+        "episode": xml_escape(g("episode_number")),
+        "title": xml_escape(g("name")),
+        "plot": xml_escape(g("overview")),
+        "aired": xml_escape(g("air_date")),
+        "rating": xml_escape(g("vote_average")),
+        "runtime": xml_escape(g("runtime")),
+        "tmdbid": xml_escape(str(data.get("id") or "")),
+    }
 
 
 def _gen(obj) -> str:
