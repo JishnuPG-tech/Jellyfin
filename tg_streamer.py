@@ -7,6 +7,7 @@ import logging
 import asyncio
 import socket
 import urllib.parse
+import time
 import aiohttp
 import httpx
 from aiohttp import web
@@ -618,6 +619,123 @@ async def webhook_link(request):
 async def register_webhook_route(request):
     ok, url, desc = await register_telegram_webhook()
     return web.json_response({"ok": ok, "url": url, "description": desc, "purpose": "activate bot connection"})
+
+
+async def _scan_chat_history(chat_id, limit, indexed_list):
+    """Scan one chat's history and re-ingest every media message into FILE_ID_CACHE + .strm."""
+    indexed = 0
+    skipped = 0
+    async for message in tg_app.get_chat_history(chat_id, limit=limit):
+        media = message.video or message.document or message.audio or message.animation
+        if not media or not getattr(media, "file_id", None):
+            continue
+        chat = message.chat
+        msg_chat_id = chat.id if chat else chat_id
+        if msg_chat_id is None or not allowed_chat(chat):
+            continue
+        msg_id = message.id
+        existing = FILE_ID_CACHE.get(str(msg_id))
+        if isinstance(existing, dict) and existing.get("file_id") == media.file_id:
+            skipped += 1
+            continue
+        file_name = media_file_name(message, media)
+        is_tv, title, show_name, season, episode = parse_media_type(file_name)
+        FILE_ID_CACHE[str(msg_id)] = {
+            "file_id": media.file_id,
+            "chat_id": msg_chat_id,
+            "file_size": media.file_size or 0,
+            "title": title,
+            "is_tv": is_tv,
+            "show_name": show_name,
+            "season": season,
+            "episode": episode
+        }
+        strm_name = await create_strm_file_async(msg_id, media.file_id, title, is_tv, show_name, season, episode, msg_chat_id)
+        logger.info(f"[REINDEX] Re-ingested '{strm_name}' (msg {msg_id}, chat {msg_chat_id})")
+        indexed += 1
+    indexed_list.append({"chat_id": chat_id, "indexed": indexed, "skipped": skipped})
+
+
+async def _resolve_reindex_targets(explicit_chat_id):
+    """Return a de-duplicated list of chat ids to scan for media."""
+    targets = set()
+    if explicit_chat_id:
+        targets.add(int(explicit_chat_id))
+        return list(targets)
+
+    for raw in (RAW_CHANNEL_ID or "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            if raw.lstrip("-").isdigit() or raw.lstrip("@").isdigit():
+                chat = await tg_app.get_chat(int(raw))
+            else:
+                chat = await tg_app.get_chat(raw)
+            targets.add(chat.id)
+        except Exception as e:
+            logger.warning(f"[REINDEX] Could not resolve configured chat '{raw}': {e}")
+
+    if DETECTED_CHANNEL_ID:
+        targets.add(int(DETECTED_CHANNEL_ID))
+
+    if tg_app:
+        try:
+            async for dialog in tg_app.get_dialogs(limit=200):
+                dchat = dialog.chat
+                if dchat is None or dchat.id in targets:
+                    continue
+                ctype = getattr(dchat, "type", None)
+                if ctype in (ChatType.PRIVATE, ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP):
+                    targets.add(dchat.id)
+        except Exception as e:
+            logger.warning(f"[REINDEX] get_dialogs failed: {e}")
+    return list(targets)
+
+
+@routes.post("/reindex")
+@routes.get("/reindex")
+async def reindex_route(request):
+    """Re-scan the bot's channels + DMs and re-ingest every media message.
+
+    Rebuilds FILE_ID_CACHE and .strm files from Telegram chat history — useful after a
+    fresh deploy where file_ids.json was empty (ingestion only receives NEW updates).
+    """
+    if not tg_app or not tg_app.is_connected:
+        return web.json_response({"ok": False, "error": "Pyrogram client not connected"}, status=503)
+    try:
+        limit = int(request.query.get("limit", "200"))
+    except (TypeError, ValueError):
+        limit = 200
+    explicit = request.query.get("chat_id")
+
+    try:
+        targets = await _resolve_reindex_targets(explicit)
+    except Exception as e:
+        return web.json_response({"ok": False, "error": f"resolve targets: {e}"}, status=500)
+
+    if not targets:
+        return web.json_response({"ok": False, "error": "no target chats resolved (configure TELEGRAM_ALLOWED_CHAT_IDS or visit the configured channel/dialog)"}, status=404)
+
+    results = []
+    for chat_id in targets:
+        try:
+            await _scan_chat_history(chat_id, limit, results)
+        except FloodWait as e:
+            logger.info(f"[REINDEX] FloodWait on chat {chat_id}: sleeping {e.value}s")
+            await asyncio.sleep(e.value)
+            try:
+                await _scan_chat_history(chat_id, limit, results)
+            except Exception as e2:
+                logger.warning(f"[REINDEX] chat {chat_id} retry failed: {e2}")
+        except Exception as e:
+            logger.warning(f"[REINDEX] chat {chat_id} failed: {type(e).__name__}: {e}")
+
+    await save_cache_async()
+    await restore_cached_strm_files()
+    await trigger_jellyfin_scan()
+    total = sum(r["indexed"] for r in results)
+    return web.json_response({"ok": True, "chats": results, "total_indexed": total, "cache_now": len(FILE_ID_CACHE)})
 
 
 def _source_path_from_request(request):
