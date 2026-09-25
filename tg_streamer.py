@@ -663,6 +663,10 @@ async def _resolve_reindex_targets(explicit_chat_id):
         targets.add(int(explicit_chat_id))
         return list(targets)
 
+    for entry in FILE_ID_CACHE.values():
+        if isinstance(entry, dict) and entry.get("chat_id"):
+            targets.add(int(entry["chat_id"]))
+
     for raw in (RAW_CHANNEL_ID or "").split(","):
         raw = raw.strip()
         if not raw:
