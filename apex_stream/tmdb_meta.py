@@ -64,11 +64,40 @@ def _clean_check(text: str) -> str:
 
 
 def _strip_noise(text: str) -> str:
-    """Strip group tags ([...], @Handle) and collapse whitespace."""
+    """Strip group tags ([...], @Handle) and collapse whitespace.
+
+    Dots are release separators in filenames ("Movie.2021.720p.Pah") so they are
+    turned into spaces here; keeping them produces dotted folder names and
+    breaks both Jellyfin matching and TMDB search queries.
+    """
     t = re.sub(r"\[[^\]]*\]", " ", text)
     t = re.sub(r"@[\w.\-]+", " ", t)
+    t = re.sub(r"\.", " ", t)
     t = re.sub(r"[\s_]+", " ", t)
     return t.strip()
+
+
+# Words that legitimately follow a dash in series titles ("Dead Reckoning",
+# "Chapter 2") must never be dropped as if they were release groups.
+_KEEP_DASH_PARTS = {"chapter", "part", "volume", "special", "collection"}
+
+
+def _drop_group_tags(text: str) -> str:
+    """Drop trailing uploader/release-group segments like ' -Pah' / ' -Tinymkv Xyz'.
+
+    Only removes a whitespace-dash-whitespace run when the surviving title still
+    has at least 3 significant tokens, so real hyphenated series parts like
+    "Mission Impossible - Dead Reckoning" are preserved.
+    """
+    m = re.search(r"\s+-\s*([A-Za-z][A-Za-z0-9]*)(?:\s+\w+)*\s*$", text)
+    if not m:
+        return text
+    if m.group(1).lower() in _KEEP_DASH_PARTS:
+        return text
+    head = text[: m.start()].strip(" -.,")
+    if len(re.findall(r"[a-z0-9]+", head.lower())) < 3:
+        return text
+    return head
 
 
 def _remove_tokens(text: str, tokens: set) -> str:
@@ -93,7 +122,9 @@ def _clean_search_title(text: str) -> str:
     """A title ready to send to the TMDB search API (no year/release tags)."""
     text = _strip_noise(text or "")
     text = YEAR_RE.sub(" ", text)
+    text = re.sub(r"\(\s*\)", " ", text)
     text = _remove_tokens(text, _ALL_STOP)
+    text = _drop_group_tags(text)
     return " ".join(text.lower().split())
 
 

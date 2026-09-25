@@ -63,6 +63,30 @@ class TestParseMediaMeta:
         assert "apexstore" not in meta["search_title"]
         assert meta["year"] == 2021
 
+    def test_dots_become_spaces(self):
+        meta = parse_media_meta("Spider-Man.Far.From.Home.2021.1080p.WEB-DL")
+        assert meta["is_tv"] is False
+        assert meta["year"] == 2021
+        assert meta["clean_title"] == "Spider-Man Far From Home"
+        assert meta["search_title"] == "spider-man far from home"
+
+    def test_dot_run_and_release_group(self):
+        meta = parse_media_meta("Spider-Man.No.Way.Home. . . . -Tinymkv.Xyz (2021).mkv")
+        assert meta["is_tv"] is False
+        assert meta["year"] == 2021
+        assert meta["clean_title"] == "Spider-Man No Way Home"
+        assert meta["search_title"] == "spider-man no way home"
+
+    def test_trailing_dash_group_stripped(self):
+        meta = parse_media_meta("Spider-Man Far From Home -Pah")
+        assert meta["clean_title"] == "Spider-Man Far From Home"
+        assert meta["search_title"] == "spider-man far from home"
+
+    def test_hyphenated_series_part_kept(self):
+        meta = parse_media_meta("Mission Impossible - Dead Reckoning Part 1 2023")
+        assert meta["year"] == 2023
+        assert "dead reckoning" in meta["search_title"]
+
 
 class TestBestTmdbMatch:
     def test_exact_film(self):

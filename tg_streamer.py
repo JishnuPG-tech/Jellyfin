@@ -877,12 +877,8 @@ async def enrich_media_metadata(entry):
             if os.path.exists(os.path.join(target_dir, "movie.nfo")) and os.path.exists(os.path.join(target_dir, "poster.jpg")):
                 return True
 
-        if is_tv:
-            query = entry.get("show_name") or entry.get("title")
-            results = await _tmdb_search("tv", query, entry.get("year"))
-        else:
-            query = entry.get("title")
-            results = await _tmdb_search("movie", query, entry.get("year"))
+        query = entry.get("search_title") or entry.get("show_name") or entry.get("title")
+        results = await _tmdb_search("tv" if is_tv else "movie", query, entry.get("year"))
         hit = best_tmdb_match(results, query, "tv" if is_tv else "movie", entry.get("year"))
         if not hit:
             logger.info(f"[TMDB] No match for '{query}' (tv={is_tv})")
