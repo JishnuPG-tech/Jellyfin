@@ -46,15 +46,17 @@ def _make_driver(
     run_size=8,
     max_retries=1,
     num_clients=1,
+    max_global=32,
+    max_per_source=8,
 ):
     cfg = Config(
         {
             "APEX_STREAM_CHUNK_SIZE": "1048576",
             "APEX_STREAM_RUN_CHUNKS": str(run_size),
             "APEX_STREAM_RUN_WINDOW": "4",
-            "APEX_STREAM_MAX_GLOBAL": "32",
+            "APEX_STREAM_MAX_GLOBAL": str(max_global),
             "APEX_STREAM_MAX_PER_CLIENT": str(num_clients * 4),
-            "APEX_STREAM_MAX_PER_SOURCE": "8",
+            "APEX_STREAM_MAX_PER_SOURCE": str(max_per_source),
             "APEX_STREAM_MAX_INFLIGHT": "16",
             "APEX_STREAM_CACHE_ENABLED": "true",
             "APEX_STREAM_CACHE_MB": str(cache_mb),
@@ -207,3 +209,92 @@ class TestFailover:
         # the client's stream counters should be back to 0
         assert pool.snapshot()["clients"][0]["active_streams"] == 0
         assert pool.snapshot()["clients"][0]["active_requests"] == 0
+
+
+class TestAdmission:
+    """Global + per-source concurrency caps are actually enforced."""
+
+    async def test_global_limit_blocks_third_stream(self):
+        driver, pool, *_ = _make_driver(
+            file_size=1024 * 1024, max_global=2, max_per_source=8, num_clients=1
+        )
+        await pool.register(1, _FakeTelegram(file_size=1024 * 1024))
+
+        async def _first_chunk(gen):
+            async for _chunk in gen:
+                return
+
+        g1 = driver.generate(await driver.plan(1, 1, None))
+        g2 = driver.generate(await driver.plan(2, 1, None))
+        g3 = driver.generate(await driver.plan(3, 1, None))
+
+        await asyncio.wait_for(_first_chunk(g1), 1.0)
+        await asyncio.wait_for(_first_chunk(g2), 1.0)
+
+        # a third concurrent stream must stay pending on the global gate.
+        # Spawn it as a background task and verify it has not started the
+        # generator body before a short deadline (without cancelling it).
+        t3 = asyncio.ensure_future(_first_chunk(g3))
+        done, _ = await asyncio.wait({t3}, timeout=0.2)
+        assert t3 not in done, "third stream ran despite max_global_streams=2"
+        assert driver.status_snapshot()["admission"]["active_streams"] == 2
+        t3.cancel()
+        try:
+            await t3
+        except asyncio.CancelledError:
+            pass
+        await g1.aclose()
+        await g2.aclose()
+
+    async def test_global_limit_releases_on_cancel(self):
+        driver, pool, *_ = _make_driver(
+            file_size=1024 * 1024, max_global=1, max_per_source=8, num_clients=1
+        )
+        await pool.register(1, _FakeTelegram(file_size=1024 * 1024))
+
+        async def _first_chunk(gen):
+            async for _chunk in gen:
+                return
+
+        g1 = driver.generate(await driver.plan(1, 1, None))
+        g2 = driver.generate(await driver.plan(2, 1, None))
+
+        await asyncio.wait_for(_first_chunk(g1), 1.0)
+        t2 = asyncio.ensure_future(_first_chunk(g2))
+        done, _ = await asyncio.wait({t2}, timeout=0.2)
+        assert t2 not in done, "second stream ran despite max_global_streams=1"
+
+        # cancelling g1 (e.g. ffmpeg stop) frees the global slot for g2
+        await g1.aclose()
+        await asyncio.wait_for(t2, 1.0)
+        assert driver.status_snapshot()["admission"]["active_streams"] == 1
+        await g2.aclose()
+
+    async def test_per_source_limit_independent_of_other_sources(self):
+        driver, pool, *_ = _make_driver(
+            file_size=1024 * 1024, max_global=8, max_per_source=1, num_clients=1
+        )
+        await pool.register(1, _FakeTelegram(file_size=1024 * 1024))
+
+        async def _first_chunk(gen):
+            async for _chunk in gen:
+                return
+
+        # two different sources stream concurrently (per-source cap is 1, but
+        # global cap permits both)
+        ga = driver.generate(await driver.plan(10, 1, None))
+        gb = driver.generate(await driver.plan(11, 1, None))
+        await asyncio.wait_for(_first_chunk(ga), 1.0)
+        await asyncio.wait_for(_first_chunk(gb), 1.0)
+        assert driver.status_snapshot()["admission"]["active_streams"] == 2
+
+        # a second stream on the same source must wait for the first
+        gb2 = driver.generate(await driver.plan(11, 1, None))
+        tb2 = asyncio.ensure_future(_first_chunk(gb2))
+        done, _ = await asyncio.wait({tb2}, timeout=0.2)
+        assert tb2 not in done, "second source stream ran despite max_per_source=1"
+
+        await gb.aclose()
+        await asyncio.wait_for(tb2, 1.0)
+        await ga.aclose()
+        await gb2.aclose()

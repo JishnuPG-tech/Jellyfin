@@ -60,7 +60,7 @@ The Telegram streamer:
 1. Receives channel posts (via `setWebhook` or the in-app webhook route).
 2. Indexes the message `file_id` into `/data/jellyfin/file_ids.json`.
 3. Writes lightweight `.strm` pointers into `/data/jellyfin/media/` that point at the
-   internal streaming endpoint (`http://127.0.0.1:8080/stream_file?...`).
+   internal streaming endpoint (`http://127.0.0.1:8080/stream/{chat_id}/{message_id}/video.mp4`).
 4. Fetches TMDB poster art and triggers a Jellyfin library refresh.
 
 Obsolete Go-era `.strm` files (containing `8084` / `apx_`) are purged automatically on boot.

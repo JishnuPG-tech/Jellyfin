@@ -206,7 +206,7 @@ def index_media(msg_id, chat_id, file_id, file_size, file_name):
     }
     save_cache()
 
-    strm_name = create_strm_file(msg_id, file_id, title, is_tv, show_name, season, episode)
+    strm_name = create_strm_file(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id)
     logger.info(f"[INGEST] Media indexed from Telegram: {strm_name} (chat={chat_id})")
     return strm_name
 
@@ -368,7 +368,7 @@ async def fetch_tmdb_poster(title, target_dir, filename_prefix):
     except Exception as e:
         logger.warning(f"[TMDB] Poster fetch notice for '{title}': {e}")
 
-def _create_strm_file_sync(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None):
+def _create_strm_file_sync(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None):
     if is_tv and show_name:
         season_num = season if season else 1
         target_dir = os.path.join(SHOWS_DIR, show_name, f"Season {season_num:02d}")
@@ -379,7 +379,10 @@ def _create_strm_file_sync(msg_id, file_id, clean_title, is_tv=False, show_name=
         strm_filename = f"{clean_title}.strm"
 
     strm_path = os.path.join(target_dir, strm_filename)
-    stream_url = f"http://127.0.0.1:8080/stream_file?file_id={file_id}&message_id={msg_id}&filename={clean_title}.mp4"
+    if chat_id:
+        stream_url = f"http://127.0.0.1:8080/stream/{chat_id}/{msg_id}/video.mp4"
+    else:
+        stream_url = f"http://127.0.0.1:8080/stream_file?file_id={file_id}&message_id={msg_id}&filename={clean_title}.mp4"
 
     with open(strm_path, "w") as f:
         f.write(stream_url)
@@ -387,13 +390,13 @@ def _create_strm_file_sync(msg_id, file_id, clean_title, is_tv=False, show_name=
     logger.info(f"[AUTO-SYNC] 🎉 Created .strm file: {strm_filename} -> {strm_path}")
     return strm_filename, target_dir
 
-async def create_strm_file_async(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None):
-    strm_filename, target_dir = await asyncio.to_thread(_create_strm_file_sync, msg_id, file_id, clean_title, is_tv, show_name, season, episode)
+async def create_strm_file_async(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None):
+    strm_filename, target_dir = await asyncio.to_thread(_create_strm_file_sync, msg_id, file_id, clean_title, is_tv, show_name, season, episode, chat_id)
     asyncio.create_task(fetch_tmdb_poster(show_name if is_tv else clean_title, target_dir, clean_title))
     return strm_filename
 
-def create_strm_file(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None):
-    strm_filename, target_dir = _create_strm_file_sync(msg_id, file_id, clean_title, is_tv, show_name, season, episode)
+def create_strm_file(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None):
+    strm_filename, target_dir = _create_strm_file_sync(msg_id, file_id, clean_title, is_tv, show_name, season, episode, chat_id)
     try:
         asyncio.create_task(fetch_tmdb_poster(show_name if is_tv else clean_title, target_dir, clean_title))
     except Exception:
@@ -562,7 +565,7 @@ async def telegram_webhook(request):
             }
             await save_cache_async()
 
-            strm_name = await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode)
+            strm_name = await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id)
             logger.info(f"[WEBHOOK] 🎉 Successfully indexed media from Webhook: {strm_name}")
             await trigger_jellyfin_scan()
 
@@ -709,6 +712,12 @@ async def stream_file(request):
     response = web.StreamResponse(status=plan.status, headers=headers)
     await response.prepare(request)
 
+    if request.method == "HEAD":
+        # Jellyfin / ffprobe probes hit HEAD to learn the size before starting a
+        # play; don't burn Telegram bandwidth generating a body that aiohttp
+        # would drop anyway.
+        return response
+
     started_at = time.monotonic()
     bytes_written = 0
     try:
@@ -749,6 +758,7 @@ async def stream_file(request):
 async def status(request):
     snap = apex_driver.status_snapshot()
     snap["cached_files"] = len(FILE_ID_CACHE)
+    snap["cache"] = apex_cache.stats()
     return web.json_response(snap)
 
 
@@ -788,7 +798,8 @@ async def restore_cached_strm_files():
             episode = data.get("episode")
 
             if file_id and title:
-                await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode)
+                chat_id = data.get("chat_id")
+                await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id)
                 count += 1
     if count > 0:
         logger.info(f"[RESTORE] Restored {count} .strm file(s) from persistent disk cache.")
