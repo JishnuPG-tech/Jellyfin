@@ -13,6 +13,40 @@ import pytest
 
 SRC = Path(__file__).resolve().parents[1] / "tg_streamer.py"
 
+# Stub pyrogram.raw so AST-extracted _warm_channel_peer can resolve
+# raw.functions.channels / raw.types without the real package installed.
+_pg = types.ModuleType("pyrogram")
+_raw = types.ModuleType("pyrogram.raw")
+_funcs = types.ModuleType("pyrogram.raw.functions")
+_channels = types.ModuleType("pyrogram.raw.functions.channels")
+_rtypes = types.ModuleType("pyrogram.raw.types")
+
+
+class _Stub:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _GetChannels(_Stub):
+    pass
+
+
+class _InputChannel(_Stub):
+    pass
+
+
+_channels.GetChannels = _GetChannels
+_rtypes.InputChannel = _InputChannel
+_funcs.channels = _channels
+_raw.functions = _funcs
+_raw.types = _rtypes
+_pg.raw = _raw
+sys.modules["pyrogram"] = _pg
+sys.modules["pyrogram.raw"] = _raw
+sys.modules["pyrogram.raw.functions"] = _funcs
+sys.modules["pyrogram.raw.functions.channels"] = _channels
+sys.modules["pyrogram.raw.types"] = _rtypes
+
 MIB = 1024 * 1024
 FILE_SIZE = 895_849_434
 TAIL_EXPECT = FILE_SIZE - 848 * MIB  # 6,656,986
@@ -40,6 +74,7 @@ def tc():
     names = {
         "_fetch_chunks",
         "_refresh_file_reference",
+        "_warm_channel_peer",
         "_cache_lookup",
         "_cache_key",
         "_is_expired_reference",
@@ -161,3 +196,62 @@ def test_refresh_failure_ends_cleanly_no_raise(tc):
 
     out = _run(tc, Down(), -1003907801136, 9, 848, 7, cache)
     assert sum(len(v) for v in out.values()) == TAIL_EXPECT - 1083
+
+
+def test_refresh_peer_warm_retries_on_valueerror(tc):
+    """A client with an empty peer cache raises ValueError (Peer id invalid);
+    the warm-up resolves the channel and the retried get_messages succeeds."""
+    cache = {"-1003907801136:9": {"file_id": "OLD:9", "file_size": FILE_SIZE}}
+
+    class ColdPeer(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.get_messages_calls = 0
+            self.invoked = []
+
+        async def get_messages(self, chat_id, message_id):
+            self.get_messages_calls += 1
+            if self.get_messages_calls == 1 and not self.invoked:
+                raise ValueError(f"Peer id invalid: {chat_id}")
+            return await super().get_messages(chat_id, message_id)
+
+        async def invoke(self, rpc, **kwargs):
+            self.invoked.append(rpc)
+            return types.SimpleNamespace(chats=[object()])
+
+    client = ColdPeer()
+
+    async def drain():
+        return await tc["_refresh_file_reference"](client, -1003907801136, 9)
+
+    f_id, f_size = asyncio_run(drain())
+    assert f_id == "NEW:9"
+    assert f_size == FILE_SIZE
+    assert client.get_messages_calls == 2
+    assert len(client.invoked) == 1
+
+
+def test_refresh_peer_warm_failure_returns_none(tc):
+    cache = {"-1003907801136:9": {"file_id": "OLD:9", "file_size": FILE_SIZE}}
+
+    class ColdPeerDown(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.get_messages_calls = 0
+
+        async def get_messages(self, chat_id, message_id):
+            self.get_messages_calls += 1
+            if self.get_messages_calls == 1:
+                raise ValueError(f"Peer id invalid: {chat_id}")
+            return await super().get_messages(chat_id, message_id)
+
+        async def invoke(self, rpc, **kwargs):
+            raise RuntimeError("GetChannels down")
+
+    client = ColdPeerDown()
+
+    async def drain():
+        return await tc["_refresh_file_reference"](client, -1003907801136, 9)
+
+    assert asyncio_run(drain()) is None
+    assert client.get_messages_calls == 1

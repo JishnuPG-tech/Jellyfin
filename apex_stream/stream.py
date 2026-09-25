@@ -40,6 +40,7 @@ class FileInfo:
     name: str
     mime_type: Optional[str] = None
     file_id: Optional[str] = None
+    dc_id: Optional[int] = None
 
 
 @dataclass
@@ -54,6 +55,7 @@ class StreamPlan:
     file_size: int = 0
     start: int = 0
     end: int = 0
+    dc_id: Optional[int] = None
     layout: Optional[ChunkLayout] = field(default=None, init=False)
 
 
@@ -127,6 +129,7 @@ class StreamDriver:
             file_size=info.size,
             start=start,
             end=end,
+            dc_id=info.dc_id,
         )
         plan.layout = chunk_layout(
             start,
@@ -223,7 +226,9 @@ class StreamDriver:
             try:
                 while active_client is None:
                     try:
-                        active_client = await self.pool.select(avoid=retry_avoid)
+                        active_client = await self.pool.select(
+                            avoid=retry_avoid, dc_id=plan.dc_id
+                        )
                     except NoClientAvailable:
                         await asyncio.sleep(0.05)
                 retry_avoid = None  # a fresh client is bound; clear the skip hint

@@ -101,6 +101,43 @@ class TestPoolSelection:
         assert pool.snapshot()["clients"][0]["consecutive_failures"] == 0
 
 
+class TestPoolDcPreference:
+    async def test_prefers_matching_dc_client(self):
+        pool = ClientPool(max_streams_per_client=4)
+        await pool.register(1, _client(name="dc2"), dc_id=2)
+        await pool.register(2, _client(name="dc5"), dc_id=5)
+        h = await pool.select(dc_id=5)
+        assert h.client_id == 2
+
+    async def test_falls_back_when_no_dc_match(self):
+        pool = ClientPool(max_streams_per_client=2)
+        await pool.register(1, _client(name="dc2"), dc_id=2)
+        h = await pool.select(dc_id=4)
+        assert h.client_id == 1
+
+    async def test_matching_dc_beats_lower_load(self):
+        pool = ClientPool(max_streams_per_client=8)
+        await pool.register(2, _client(name="dc5-lite"), dc_id=5)
+        await pool.register(1, _client(name="dc2-busy"), dc_id=2)
+        h = await pool.select(dc_id=5)
+        assert h.client_id == 2
+
+    async def test_avoid_still_respected_among_matching(self):
+        pool = ClientPool(max_streams_per_client=4)
+        await pool.register(2, _client(name="dc5-b"), dc_id=5)
+        await pool.register(3, _client(name="dc5-c"), dc_id=5)
+        await pool.register(1, _client(name="dc2"), dc_id=2)
+        h = await pool.select(dc_id=5, avoid=2)
+        assert h.client_id == 3
+
+    async def test_dc_field_in_snapshot_and_register_roundtrip(self):
+        pool = ClientPool(max_streams_per_client=1)
+        await pool.register(7, _client(), dc_id=3)
+        h = await pool.select()
+        assert h.dc_id == 3
+        assert pool.snapshot()["clients"][0]["dc_id"] == 3
+
+
 class TestPoolCooldown:
     async def test_cooldown_after_threshold(self):
         pool = ClientPool(failure_threshold=3, cooldown_seconds=60)

@@ -44,6 +44,7 @@ class ClientHandle:
     last_failure_ts: float = 0.0
     cooldown_until: float = 0.0
     created_ts: float = field(default_factory=time.monotonic)
+    dc_id: Optional[int] = None
 
     def is_available(self, now: float) -> bool:
         if self.state == UNAVAILABLE:
@@ -75,13 +76,14 @@ class ClientPool:
     def __len__(self) -> int:
         return len(self._clients)
 
-    async def register(self, client_id: int, client: Any, *, ready: bool = True) -> ClientHandle:
+    async def register(self, client_id: int, client: Any, *, ready: bool = True, dc_id: Optional[int] = None) -> ClientHandle:
         async with self._lock:
             handle = ClientHandle(
                 client_id=client_id,
                 client=client,
                 max_streams=self.max_streams_per_client,
                 state=HEALTHY if ready else DEGRADED,
+                dc_id=dc_id,
             )
             self._clients[client_id] = handle
             return handle
@@ -109,11 +111,17 @@ class ClientPool:
             out.append(handle)
         return out
 
-    async def select(self, avoid: Optional[int] = None) -> ClientHandle:
+    async def select(self, avoid: Optional[int] = None, dc_id: Optional[int] = None) -> ClientHandle:
         """Pick the least-loaded eligible client, or raise NoClientAvailable.
 
         When `avoid` is set and another eligible client exists, that client is
         skipped so a failed run reconnects to a *different* pool member.
+
+        When `dc_id` is set, clients whose primary DC equals it are preferred:
+        a same-DC client can fetch 1 MiB chunks without an auth.ExportAuthorization
+        RPC (that RPC flood-waits the account when repeated), so a matching
+        client is picked even if it is busier than a non-matching one. Clients
+        on other DCs are still used as a fallback (fewer exports > none).
         """
         now = time.monotonic()
         async with self._lock:
@@ -122,6 +130,18 @@ class ClientPool:
                 raise NoClientAvailable(
                     "all Telegram clients at capacity or in cooldown"
                 )
+            if dc_id is not None:
+                preferred = [h for h in eligible if h.dc_id == dc_id]
+                if len(preferred) >= 1 and (
+                    len(preferred) > 1 or len(eligible) > len(preferred)
+                ):
+                    if len(preferred) > 1:
+                        eligible = preferred
+                    else:
+                        # a single preferred client exists: use it only when it
+                        # is not the avoided one or when no alternative exists
+                        if preferred[0].client_id != avoid:
+                            eligible = preferred
             candidates = eligible
             if avoid is not None and len(eligible) > 1:
                 others = [h for h in eligible if h.client_id != avoid]
@@ -188,6 +208,7 @@ class ClientPool:
                     "last_failure_ts": round(h.last_failure_ts, 2),
                     "cooldown_remaining": max(0.0, h.cooldown_until - now),
                     "max_streams": h.max_streams,
+                    "dc_id": h.dc_id,
                 }
                 for h in self._clients.values()
             ],

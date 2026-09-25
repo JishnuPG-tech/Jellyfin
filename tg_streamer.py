@@ -230,12 +230,54 @@ async def _resolve_source(chat_id, message_id):
     entry = _cache_lookup(message_id, chat_id)
     if not isinstance(entry, dict):
         return None
+    dc_id = 0
+    file_id = entry.get("file_id")
+    if file_id:
+        try:
+            from pyrogram.file_id import FileId
+
+            dc_id = FileId.decode(file_id).dc_id
+        except Exception:
+            dc_id = 0
     return FileInfo(
         size=int(entry.get("file_size") or 0),
         name=entry.get("title") or f"Media_{message_id}",
-        file_id=entry.get("file_id"),
+        file_id=file_id,
         mime_type="video/mp4",
+        dc_id=dc_id or None,
     )
+
+
+async def _warm_channel_peer(client, chat_id):
+    """Resolve a channel peer Pyrogram's get_peer_type() would reject.
+
+    utils.get_peer_type() only accepts channel ids in the legacy signed-int32
+    range, so a fresh session cannot resolve this chat via get_messages() (the
+    "ValueError: Peer id invalid" seen for -1003907801136). Pyrogram's own
+    resolve_peer() channel branch invokes raw channels.GetChannels with an
+    InputChannel(access_hash=0) and lets Client.invoke()'s fetch_peers() write
+    the peer (and its real access_hash) into the client storage; afterwards the
+    normal get_messages() resolution path succeeds.
+    """
+    try:
+        from pyrogram import raw as _raw
+    except Exception:
+        return False
+    if not (isinstance(chat_id, int) and chat_id < 0):
+        return False
+    channel_id = -chat_id - 1000000000000  # peer_id = MAX_CHANNEL_ID - channel_id
+    if channel_id <= 0:
+        return False
+    try:
+        r = await client.invoke(
+            _raw.functions.channels.GetChannels(
+                id=[_raw.types.InputChannel(channel_id=channel_id, access_hash=0)]
+            )
+        )
+        return bool(getattr(r, "chats", None))
+    except Exception as e:
+        logger.warning(f"[REFRESH] channel warm failed for {chat_id}: {type(e).__name__}: {e}")
+        return False
 
 
 async def _refresh_file_reference(client, chat_id, message_id):
@@ -253,7 +295,20 @@ async def _refresh_file_reference(client, chat_id, message_id):
         logger.warning(
             f"[REFRESH] get_messages({chat_id}, {message_id}) failed: {type(e).__name__}: {e}"
         )
-        return None
+        # Pyrogram's get_peer_type() rejects channel ids wider than the legacy
+        # signed-int32 range ("Peer id invalid"), so a fresh client cannot
+        # resolve the chat. Warm the client's peer cache via raw
+        # channels.GetChannels, then retry once.
+        if not (isinstance(e, ValueError) and await _warm_channel_peer(client, chat_id)):
+            return None
+        try:
+            message = await client.get_messages(chat_id, message_id)
+        except Exception as e2:
+            logger.warning(
+                f"[REFRESH] get_messages({chat_id}, {message_id}) retry failed: "
+                f"{type(e2).__name__}: {e2}"
+            )
+            return None
     media = (
         (message.video or message.document or message.audio or message.animation)
         if message else None
@@ -1355,14 +1410,28 @@ async def restore_cached_strm_files():
         if still:
             logger.info(f"[RESTORE] {still} subtitle(s) still awaiting a video match.")
 
+async def _client_dc_id(client):
+    """Primary DC for a connected Pyrogram client, or None."""
+    try:
+        storage = getattr(client, "storage", None)
+        if storage is None:
+            return None
+        dc_id = await storage.dc_id()
+        return int(dc_id) if dc_id else None
+    except Exception as e:
+        logger.warning(f"[POOL] primary dc unavailable for {type(client).__name__}: {type(e).__name__}: {e}")
+        return None
+
+
 async def _register_main_client():
     """Register the primary client in the pool once it is connected."""
     if tg_app is None:
         return
     clients = apex_pool.snapshot()["clients"]
     if not any(c["id"] == 1 for c in clients):
-        await apex_pool.register(1, tg_app, ready=True)
-        logger.info("[POOL] primary client registered")
+        dc_id = await _client_dc_id(tg_app)
+        await apex_pool.register(1, tg_app, ready=True, dc_id=dc_id)
+        logger.info(f"[POOL] primary client registered (dc={dc_id})")
 
 
 async def _start_extra_clients():
@@ -1373,8 +1442,9 @@ async def _start_extra_clients():
                 continue
             await client.start()
             logger.info(f"[PYROGRAM] extra client {idx} started")
-            await apex_pool.register(idx, client, ready=True)
-            logger.info(f"[POOL] extra client {idx} registered")
+            dc_id = await _client_dc_id(client)
+            await apex_pool.register(idx, client, ready=True, dc_id=dc_id)
+            logger.info(f"[POOL] extra client {idx} registered (dc={dc_id})")
         except Exception as e:
             logger.warning(f"[PYROGRAM] extra client {idx} failed to start: {type(e).__name__}: {e}")
             try:
