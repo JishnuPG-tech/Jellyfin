@@ -106,6 +106,38 @@ async def ops_tree(path: str = "/data", request: Request = None):
     return JSONResponse(_build_tree(path))
 
 
+READ_ROOTS = ("/data", "/opt/jellyfin-local")
+
+@router.get("/apex/ops/read")
+async def ops_read(path: str, tail: int = 0, lines: int = 200, request: Request = None):
+    if not _is_admin(request):
+        return _denied()
+
+    normalized = os.path.abspath(path)
+    if not any(normalized == root or normalized.startswith(root + os.sep) for root in READ_ROOTS):
+        return JSONResponse({"ok": False, "error": f"path not allow-listed ({READ_ROOTS})"}, status_code=403)
+    if not os.path.isfile(normalized):
+        return JSONResponse({"ok": False, "error": "not a file or missing"}, status_code=404)
+
+    try:
+        size = os.path.getsize(normalized)
+        if tail > 0:
+            with open(normalized, "rb") as f:
+                f.seek(max(0, size - tail))
+                content = f.read()
+        else:
+            with open(normalized, "rb") as f:
+                content = f.read()
+    except OSError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+    text = content.decode("utf-8", errors="replace")
+    if tail <= 0 and lines > 0:
+        part = text.splitlines()
+        text = "\n".join(part[-lines:])
+    return JSONResponse({"ok": True, "path": normalized, "size": size, "content": text})
+
+
 @router.post("/apex/ops/jellyfin/reset")
 async def ops_jellyfin_reset(request: Request):
     """Remove everything under /data/jellyfin and lay down a clean directory skeleton."""

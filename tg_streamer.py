@@ -202,6 +202,7 @@ async def health(request):
     return web.json_response({
         "status": "ok",
         "service": "TG-Drive High-Speed 5G Streamer",
+        "pyrogram_configured": bool(tg_app),
         "pyrogram_connected": is_ready,
         "cached_files": len(FILE_ID_CACHE),
         "movies_dir": MOVIES_DIR,
