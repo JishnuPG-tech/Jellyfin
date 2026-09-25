@@ -16,7 +16,16 @@ from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, RPCError, AuthKeyDuplicated, FILE_REFERENCE_EXPIRED
+from pyrogram.errors import FloodWait, RPCError, AuthKeyDuplicated
+
+# Telegram's FILE_REFERENCE_EXPIRED (a stored media reference that has expired)
+# surfaces in Pyrogram as the pascal-cased `FileReferenceExpired`, but the exact
+# top-level export name varies across pyrogram builds. Import defensively and
+# fall back to an ID / name / text match on RPCError (see _is_expired_reference).
+try:
+    from pyrogram.errors import FileReferenceExpired
+except ImportError:  # pragma: no cover - depends on installed pyrogram
+    FileReferenceExpired = None
 
 # Apex streaming core (telegram-free; wired to Pyrogram below)
 from apex_stream import Config, BoundedChunkCache, ClientPool, InFlightRegistry, StreamMetrics, StreamDriver, FileInfo, RangeNotSatisfiable, NoClientAvailable, SourceReferenceExpired
@@ -259,6 +268,34 @@ async def _refresh_file_reference(client, chat_id, message_id):
     return file_id, int(getattr(media, "file_size", 0) or 0)
 
 
+def _is_expired_reference(exc):
+    """True when `exc` is Telegram's FILE_REFERENCE_EXPIRED (any pyrogram layout).
+
+    Pyrogram has historically raised the pascal-cased ``FileReferenceExpired``
+    (an ``RPCError`` with ``ID == "FILE_REFERENCE_EXPIRED"``), but the symbol is
+    exported at different paths across versions/builds, so match defensively:
+    the concrete class when importable, then the RPC error ID, class name, raw
+    value, or rendered text via an underscore-insensitive comparison.
+    """
+    if not isinstance(exc, RPCError):
+        return False
+    if FileReferenceExpired is not None and isinstance(exc, FileReferenceExpired):
+        return True
+    probes = (
+        getattr(exc, "ID", None),
+        type(exc).__name__,
+        getattr(exc, "value", None),
+        str(exc),
+    )
+    for probe in probes:
+        if not probe:
+            continue
+        normalized = str(probe).upper().replace("_", "")
+        if "FILEREFERENCEEXPIRED" in normalized:
+            return True
+    return False
+
+
 async def _fetch_chunks(client, chat_id, message_id, run_start, chunk_count):
     """Yield (offset_in_run, chunk) 1 MiB chunks from one client via MTProto.
 
@@ -283,7 +320,9 @@ async def _fetch_chunks(client, chat_id, message_id, run_start, chunk_count):
                 yield (i, chunk)
                 i += 1
             return
-        except FILE_REFERENCE_EXPIRED as exc:
+        except Exception as exc:
+            if not _is_expired_reference(exc):
+                raise
             if attempt >= 2:
                 logger.warning(
                     f"[STREAM] source {chat_id}:{message_id} reference expired again "
