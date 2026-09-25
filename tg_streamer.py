@@ -722,6 +722,7 @@ async def reindex_route(request):
         return web.json_response({"ok": False, "error": "no target chats resolved (configure TELEGRAM_ALLOWED_CHAT_IDS or visit the configured channel/dialog)"}, status=404)
 
     results = []
+    failures = []
     for chat_id in targets:
         try:
             await _scan_chat_history(chat_id, limit, results)
@@ -732,14 +733,16 @@ async def reindex_route(request):
                 await _scan_chat_history(chat_id, limit, results)
             except Exception as e2:
                 logger.warning(f"[REINDEX] chat {chat_id} retry failed: {e2}")
+                failures.append({"chat_id": chat_id, "error": f"{type(e2).__name__}: {e2}"})
         except Exception as e:
             logger.warning(f"[REINDEX] chat {chat_id} failed: {type(e).__name__}: {e}")
+            failures.append({"chat_id": chat_id, "error": f"{type(e).__name__}: {e}"})
 
     await save_cache_async()
     await restore_cached_strm_files()
     await trigger_jellyfin_scan()
     total = sum(r["indexed"] for r in results)
-    return web.json_response({"ok": True, "chats": results, "total_indexed": total, "cache_now": len(FILE_ID_CACHE)})
+    return web.json_response({"ok": True, "targets": targets, "chats": results, "failures": failures, "total_indexed": total, "cache_now": len(FILE_ID_CACHE)})
 
 
 def _source_path_from_request(request):
