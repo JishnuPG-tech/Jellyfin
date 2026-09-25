@@ -299,10 +299,12 @@ def _is_expired_reference(exc):
 async def _fetch_chunks(client, chat_id, message_id, run_start, chunk_count):
     """Yield (offset_in_run, chunk) 1 MiB chunks from one client via MTProto.
 
-    When the stored Telegram file reference has expired mid-run, the reference
-    is refreshed through THAT SAME client, the cache is updated, and the whole
-    run is replayed against the fresh reference. Re-delivered chunks are
-    deduplicated by the inflight registry against consumer positions, so a
+    Pyrogram's ``get_file()`` logs-and-swallows RPC/transport failures, so an
+    expired Telegram file reference (FILE_REFERENCE_EXPIRED) surfaces as a run
+    that ends EARLY instead of an exception. Detect a byte-short run against the
+    expected span (derived from the cached file_size), refresh the reference
+    through THAT SAME client, and replay the whole run once. Re-delivered chunks
+    are deduplicated by the inflight registry against consumer positions, so a
     refresh never re-serves bytes already consumed.
     """
     entry = _cache_lookup(message_id, chat_id)
@@ -312,43 +314,63 @@ async def _fetch_chunks(client, chat_id, message_id, run_start, chunk_count):
     if not file_id:
         return
 
-    # Attempt 1: current reference. Attempt 2: after a fresh reference refresh.
+    chunk_bytes = 1024 * 1024
+    run_expected = chunk_bytes * chunk_count
+    stored_size = int(entry.get("file_size") or 0)
+    if stored_size:
+        remaining = stored_size - run_start * chunk_bytes
+        if remaining < run_expected:
+            run_expected = max(remaining, 0)
+
     for attempt in (1, 2):
         try:
             i = 0
+            bytes_yielded = 0
             async for chunk in client.stream_media(file_id, offset=run_start, limit=chunk_count):
                 yield (i, chunk)
                 i += 1
-            return
+                bytes_yielded += len(chunk)
+            if bytes_yielded >= run_expected:
+                return
+            logger.warning(
+                f"[STREAM] short run {chat_id}:{message_id} ch{run_start}+{chunk_count} "
+                f"attempt {attempt}: yielded {bytes_yielded}/{run_expected} bytes "
+                f"(client {getattr(client, 'name', '?')})"
+            )
         except Exception as exc:
             if not _is_expired_reference(exc):
                 raise
+            logger.warning(
+                f"[STREAM] expired reference {chat_id}:{message_id} ch{run_start}+{chunk_count} "
+                f"attempt {attempt} (client {getattr(client, 'name', '?')}): "
+                f"{type(exc).__name__}: {exc}"
+            )
             if attempt >= 2:
-                logger.warning(
-                    f"[STREAM] source {chat_id}:{message_id} reference expired again "
-                    f"after refresh (client {getattr(client, 'name', '?')})"
-                )
-                raise SourceReferenceExpired(
-                    f"file reference for {chat_id}:{message_id} expired and refresh failed"
-                ) from exc
-            refreshed = await _refresh_file_reference(client, chat_id, message_id)
-            if refreshed is None:
-                raise SourceReferenceExpired(
-                    f"could not refresh expired reference for {chat_id}:{message_id}"
-                ) from exc
-            new_file_id, new_size = refreshed
-            changed = new_file_id != file_id
-            if changed or (new_size and int(entry.get("file_size") or 0) != new_size):
-                entry["file_id"] = new_file_id
-                if new_size:
-                    entry["file_size"] = new_size
-                await save_cache_async()
-                logger.info(
-                    f"[REFRESH] refreshed expired reference {chat_id}:{message_id} "
-                    f"for client {getattr(client, 'name', '?')}"
-                )
-            file_id = new_file_id
-            # loop back and replay the same run against the fresh reference
+                return
+        refreshed = await _refresh_file_reference(client, chat_id, message_id)
+        if refreshed is None:
+            logger.warning(
+                f"[REFRESH] could not refresh {chat_id}:{message_id} "
+                f"(client {getattr(client, 'name', '?')})"
+            )
+            return
+        new_file_id, new_size = refreshed
+        if new_file_id != file_id:
+            entry["file_id"] = new_file_id
+        if new_size and int(entry.get("file_size") or 0) != new_size:
+            entry["file_size"] = new_size
+        if new_size:
+            remaining = int(new_size) - run_start * chunk_bytes
+            run_expected = min(run_expected, max(remaining, 0))
+        await save_cache_async()
+        logger.info(
+            f"[REFRESH] refreshed expired reference {chat_id}:{message_id} "
+            f"(client {getattr(client, 'name', '?')})"
+        )
+        file_id = new_file_id
+        if attempt >= 2:
+            return
+        # loop back and replay the same run against the fresh reference
 
 
 apex_driver = StreamDriver(
