@@ -862,6 +862,21 @@ async def enrich_media_metadata(entry):
     key = entry.get("_cache_key") or ""
     try:
         is_tv = bool(entry.get("is_tv"))
+        target_dir = entry.get("target_dir")
+        show_root = entry.get("show_root")
+        if not target_dir:
+            logger.info(f"[TMDB] No target_dir for '{entry.get('title')}' - skipping enrich")
+            return False
+
+        # Idempotency gate: if the metadata is already on disk, avoid re-hitting
+        # the TMDB API on every restart.
+        if is_tv and show_root:
+            if os.path.exists(os.path.join(show_root, "tvshow.nfo")) and os.path.exists(os.path.join(show_root, "poster.jpg")):
+                return True
+        elif not is_tv:
+            if os.path.exists(os.path.join(target_dir, "movie.nfo")) and os.path.exists(os.path.join(target_dir, "poster.jpg")):
+                return True
+
         if is_tv:
             query = entry.get("show_name") or entry.get("title")
             results = await _tmdb_search("tv", query, entry.get("year"))
@@ -881,12 +896,6 @@ async def enrich_media_metadata(entry):
 
         if not detail:
             logger.info(f"[TMDB] No detail for tmdb_id={tmdb_id} ({query})")
-            return False
-
-        target_dir = entry.get("target_dir")
-        show_root = entry.get("show_root")
-        if not target_dir:
-            logger.info(f"[TMDB] No target_dir for '{query}' - skipping enrich")
             return False
 
         os.makedirs(target_dir, exist_ok=True)
@@ -1678,6 +1687,41 @@ async def status(request):
 async def metrics(request):
     return web.json_response(apex_metrics.snapshot())
 
+async def _prune_orphan_strms(movies_dir, shows_dir, keep):
+    """Delete .strm files that point at our streamer but aren't in `keep`.
+
+    During a folder-layout migration Jellyfin indexes both the stale flat .strm
+    and the new per-title folder .strm for the same Telegram file -> duplicates.
+    Only files whose contents reference our own streamer are touched, so
+    unrelated .strm files are never removed.
+    """
+    removed = 0
+    for root_dir in (movies_dir, shows_dir):
+        if not os.path.isdir(root_dir):
+            continue
+        for root, _, files in os.walk(root_dir):
+            for f in files:
+                if not f.lower().endswith(".strm"):
+                    continue
+                path = os.path.normpath(os.path.join(root, f))
+                if path in keep:
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                        content = fh.read(256)
+                except OSError:
+                    continue
+                if "127.0.0.1:8080" not in content and "8080/stream" not in content:
+                    continue
+                try:
+                    os.remove(path)
+                    removed += 1
+                    logger.info(f"[RESTORE] Pruned orphaned .strm: {path}")
+                except OSError as e:
+                    logger.warning(f"[RESTORE] Could not prune {path}: {e}")
+    return removed
+
+
 async def restore_cached_strm_files():
     """Removes obsolete Go-era .strm files and restores every cached movie & TV show from disk."""
     logger.info('[MIGRATION] Cleaning up old Go .strm files...')
@@ -1700,6 +1744,7 @@ async def restore_cached_strm_files():
         logger.info(f"[MIGRATION] Removed {removed} obsolete Go-era .strm file(s)")
 
     count = 0
+    expected_paths = set()
     for key, data in FILE_ID_CACHE.items():
         if isinstance(data, dict):
             _chat_from_key, msg_id = _split_cache_key(key)
@@ -1720,9 +1765,22 @@ async def restore_cached_strm_files():
                     "_cache_key": key,
                 })
                 await create_strm_file_async(entry)
+                if entry.get("target_dir") and entry.get("strm_base"):
+                    expected_paths.add(os.path.normpath(
+                        os.path.join(entry["target_dir"], f"{entry['strm_base']}.strm")
+                    ))
                 count += 1
     if count > 0:
         logger.info(f"[RESTORE] Restored {count} .strm file(s) from persistent disk cache.")
+        await trigger_jellyfin_scan()
+
+    # Layout migration: an old flat-layout .strm (Movies/<Lang>/X.strm or
+    # TV Shows/<Lang>/<Show>/Season NN/X.strm) duplicates a per-title folder one,
+    # so Jellyfin shows both. Prune any .strm that points at our streamer but is
+    # NOT the freshly-restored per-title path.
+    pruned = await _prune_orphan_strms(movies_dir=MOVIES_DIR, shows_dir=SHOWS_DIR, keep=expected_paths)
+    if pruned:
+        logger.info(f"[RESTORE] Pruned {pruned} orphaned .strm file(s) from the old layout.")
         await trigger_jellyfin_scan()
 
     # Queued subtitles may now resolve against the restored media index.
