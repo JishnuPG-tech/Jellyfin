@@ -5,8 +5,9 @@ lands on disk and how subtitles are matched/renamed:
 
 - `detect_language(text)`   -> canonical language name (e.g. "Malayalam")
 - `language_code(name)`     -> ISO 639-2/B subtitle code (e.g. "mal")
-- `movie_target_dir(...)`   -> Movies/<Language>
-- `tv_target_dir(...)`      -> TV Shows/<Language>/<Show>/Season NN
+- `movie_target_dir(...)`   -> Movies/<Language>/<Title> (<Year>)
+- `tv_show_root(...)`       -> TV Shows/<Language>/<Show> (<Year>)
+- `tv_target_dir(...)`      -> TV Shows/<Language>/<Show> (<Year>)/Season NN
 - `match_subtitle_media()`  -> best FILE_ID_CACHE entry for a subtitle base
 
 Default language ("English") is used when no explicit tag is found, so plain
@@ -99,8 +100,33 @@ def safe_folder(name: str) -> str:
     return cleaned[:120] or "Unknown"
 
 
-def movie_target_dir(movies_dir: str, language: str = DEFAULT_LANGUAGE) -> str:
-    return os.path.join(movies_dir, safe_folder(language))
+def folder_name(title: Optional[str], year: Optional[int] = None) -> str:
+    """Jellyfin folder name for a title, e.g. `Spider-Man (2017)`."""
+    name = safe_folder(title) if title else "Unknown"
+    if year:
+        name = f"{name} ({year})"
+    return name
+
+
+def movie_target_dir(
+    movies_dir: str,
+    language: str = DEFAULT_LANGUAGE,
+    title: Optional[str] = None,
+    year: Optional[int] = None,
+) -> str:
+    """Per-movie folder: `Movies/<Language>/<Title> (<Year>)`."""
+    return os.path.join(movies_dir, safe_folder(language), folder_name(title, year))
+
+
+def tv_show_root(
+    shows_dir: str,
+    language: str = DEFAULT_LANGUAGE,
+    show_name: Optional[str] = None,
+    year: Optional[int] = None,
+) -> str:
+    """Series root folder: `TV Shows/<Language>/<Show> (<Year>)`."""
+    show = folder_name(show_name, year) if show_name else "Unknown_Show"
+    return os.path.join(shows_dir, safe_folder(language), show)
 
 
 def tv_target_dir(
@@ -108,12 +134,41 @@ def tv_target_dir(
     language: str = DEFAULT_LANGUAGE,
     show_name: Optional[str] = None,
     season: Optional[int] = None,
+    year: Optional[int] = None,
 ) -> str:
-    show = safe_folder(show_name) if show_name else "Unknown_Show"
+    """Season folder under the series root: `.../<Show> (<Year>)/Season NN`."""
     season_num = int(season) if season else 1
     return os.path.join(
-        shows_dir, safe_folder(language), show, f"Season {season_num:02d}"
+        tv_show_root(shows_dir, language, show_name, year),
+        f"Season {season_num:02d}",
     )
+
+
+def strm_base(entry: Dict) -> str:
+    """Filename base (no extension) a .strm / .nfo / subtitle sidecar must use.
+
+    Mirrors the folder layout: movies use the `Title (Year)` folder name, TV uses
+    `Show - SxxEyy`, so sidecars always sit byte-for-byte next to the .strm.
+    """
+    if entry.get("is_tv"):
+        show = entry.get("show_name") or entry.get("title") or "Unknown_Show"
+        season = int(entry.get("season") or 1)
+        episode = int(entry.get("episode") or 1)
+        return safe_folder(f"{show} - S{season:02d}E{episode:02d}")
+    title = entry.get("title") or "Unknown"
+    return folder_name(title, entry.get("year"))
+
+
+def strm_dir(movies_dir: str, shows_dir: str, entry: Dict) -> str:
+    """Folder a .strm / subtitle for this cache entry must live in."""
+    language = entry.get("language") or DEFAULT_LANGUAGE
+    if entry.get("is_tv"):
+        show = entry.get("show_name") or entry.get("title")
+        return tv_target_dir(
+            shows_dir, language, show, entry.get("season"), entry.get("year")
+        )
+    title = entry.get("title") or "Unknown"
+    return movie_target_dir(movies_dir, language, title, entry.get("year"))
 
 
 def subtitle_lang_hint(base_name: str) -> str:

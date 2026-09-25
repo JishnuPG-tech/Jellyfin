@@ -11,8 +11,11 @@ from apex_stream.organize import (
     match_subtitle_media,
     movie_target_dir,
     safe_folder,
+    strm_base,
+    strm_dir,
     subtitle_is_document,
     subtitle_lang_hint,
+    tv_show_root,
     tv_target_dir,
 )
 
@@ -64,20 +67,44 @@ class TestLanguageCode:
 
 class TestFolders:
     def test_movie_target_dir(self):
-        assert movie_target_dir("/m/Movies", "English") == os.path.join("/m/Movies", "English")
-        assert movie_target_dir("/m/Movies", "Malayalam") == os.path.join("/m/Movies", "Malayalam")
+        assert movie_target_dir("/m/Movies", "English") == os.path.join("/m/Movies", "English", "Unknown")
+        assert movie_target_dir("/m/Movies", "Malayalam") == os.path.join("/m/Movies", "Malayalam", "Unknown")
+
+    def test_movie_target_dir_with_title_and_year(self):
+        assert movie_target_dir("/m/Movies", "English", "SpiderMan Homecoming", 2017) == os.path.join(
+            "/m/Movies", "English", "SpiderMan Homecoming (2017)"
+        )
 
     def test_tv_target_dir(self):
-        assert tv_target_dir("/m/TV", "Hindi", "Pathaan", 1) == os.path.join("/m/TV", "Hindi", "Pathaan", "Season 01")
-        assert tv_target_dir("/m/TV", "English", "Breaking Bad", 2) == os.path.join("/m/TV", "English", "Breaking Bad", "Season 02")
+        assert tv_target_dir("/m/TV", "Hindi", "Pathaan", 1, 2023) == os.path.join("/m/TV", "Hindi", "Pathaan (2023)", "Season 01")
+        assert tv_target_dir("/m/TV", "English", "Breaking Bad", 2, 2008) == os.path.join("/m/TV", "English", "Breaking Bad (2008)", "Season 02")
 
     def test_tv_no_season_defaults_one(self):
-        assert tv_target_dir("/m/TV", "Malayalam", "Manjummel Boys", None).endswith("Season 01")
+        assert tv_target_dir("/m/TV", "Malayalam", "Manjummel Boys", None, 2023).endswith("Season 01")
+
+    def test_tv_show_root(self):
+        assert tv_show_root("/m/TV", "English", "Breaking Bad", 2008) == os.path.join("/m/TV", "English", "Breaking Bad (2008)")
 
     def test_safe_folder(self):
         assert safe_folder("Spider-Man: No Way Home (2021)") == "Spider-Man No Way Home (2021)"
         assert safe_folder(None) == "Unknown"
         assert safe_folder("") == "Unknown"
+
+    def test_strm_base_movie_uses_folder_name(self):
+        entry = {"title": "Dune", "is_tv": False, "year": 2021, "language": "English"}
+        assert strm_base(entry) == "Dune (2021)"
+
+    def test_strm_base_tv_uses_season_episode(self):
+        entry = {"title": "Breaking Bad - S01E01", "is_tv": True, "show_name": "Breaking Bad", "season": 1, "episode": 1}
+        assert strm_base(entry) == "Breaking Bad - S01E01"
+
+    def test_strm_dir_movie(self):
+        entry = {"title": "Dune", "is_tv": False, "year": 2021, "language": "English"}
+        assert strm_dir("/m/Movies", "/m/TV", entry) == os.path.join("/m/Movies", "English", "Dune (2021)")
+
+    def test_strm_dir_tv(self):
+        entry = {"title": "Breaking Bad - S01E01", "is_tv": True, "show_name": "Breaking Bad", "season": 1, "episode": 1, "year": 2008, "language": "English"}
+        assert strm_dir("/m/Movies", "/m/TV", entry) == os.path.join("/m/TV", "English", "Breaking Bad (2008)", "Season 01")
 
 
 class TestSubtitles:

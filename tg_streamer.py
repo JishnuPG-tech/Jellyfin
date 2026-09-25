@@ -34,11 +34,18 @@ from apex_stream.organize import (
     detect_language,
     language_code,
     match_subtitle_media,
-    movie_target_dir,
-    safe_folder,
+    strm_base,
+    strm_dir,
     subtitle_is_document,
     subtitle_lang_hint,
-    tv_target_dir,
+    tv_show_root,
+)
+from apex_stream.tmdb_meta import (
+    best_tmdb_match,
+    build_episode_nfo,
+    build_movie_nfo,
+    build_tvshow_nfo,
+    parse_media_meta,
 )
 
 logger = logging.getLogger("TG_Drive_Streamer")
@@ -655,23 +662,12 @@ def index_media(msg_id, chat_id, file_id, file_size, file_name):
     if isinstance(cached, dict) and cached.get("file_id") == file_id:
         return cached.get("title") or True
 
-    is_tv, title, show_name, season, episode = parse_media_type(file_name)
-    language = detect_language(file_name)
+    entry = _meta_to_entry(msg_id, chat_id, file_id, file_size, file_name)
 
-    FILE_ID_CACHE[_cache_key(chat_id, msg_id)] = {
-        "file_id": file_id,
-        "chat_id": chat_id,
-        "file_size": file_size,
-        "title": title,
-        "is_tv": is_tv,
-        "show_name": show_name,
-        "season": season,
-        "episode": episode,
-        "language": language
-    }
+    FILE_ID_CACHE[_cache_key(chat_id, msg_id)] = entry
     save_cache()
 
-    strm_name = create_strm_file(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id, language)
+    strm_name = create_strm_file(entry)
     logger.info(f"[INGEST] Media indexed from Telegram: {strm_name} (chat={chat_id})")
     return strm_name
 
@@ -783,7 +779,7 @@ async def health(request):
         "placed_subtitles": sum(1 for s in SUBTITLE_CACHE.values() if isinstance(s, dict) and s.get("placed")),
         "movies_dir": MOVIES_DIR,
         "shows_dir": SHOWS_DIR,
-        "organization": "language-based (Movies/<Language>, TV Shows/<Language>/<Show>/Season NN)",
+        "organization": "per-title (Movies/<Language>/<Title> (<Year>), TV Shows/<Language>/<Show> (<Year>)/Season NN) + TMDB nfo/poster/backdrop",
         "stream_concurrency_per_client": APEX_CFG.telegram_max_concurrent,
         "cache_ttl_seconds": APEX_CFG.cache_ttl_seconds,
     })
@@ -801,52 +797,183 @@ def parse_media_type(filename_or_caption):
     Detects if media is a TV Show episode or Movie.
     Returns: (is_tv, title, show_name, season_num, episode_num)
     """
-    clean_text = clean_title_str(filename_or_caption) or "Unknown_Media"
-    
-    pattern_s_e = re.search(r'(?i)(.*?)\b(?:S|Season)\s*(\d{1,2})\s*(?:E|Ep|Episode)\s*(\d{1,2})\b', clean_text)
-    if pattern_s_e:
-        show_name = pattern_s_e.group(1).strip()
-        season = int(pattern_s_e.group(2))
-        episode = int(pattern_s_e.group(3))
-        title = f"{show_name} - S{season:02d}E{episode:02d}"
-        return True, title, show_name, season, episode
+    meta = parse_media_meta(filename_or_caption)
+    return meta["is_tv"], meta["title"], meta["show_name"], meta["season"], meta["episode"]
 
-    pattern_ep = re.search(r'(?i)(.*?)\b(?:ep|episode)\s*(\d{1,3})\b', clean_text)
-    if pattern_ep:
-        show_name = pattern_ep.group(1).strip()
-        season = 1
-        episode = int(pattern_ep.group(2))
-        title = f"{show_name} - S{season:02d}E{episode:02d}"
-        return True, title, show_name, season, episode
-
-    return False, clean_text, clean_text, None, None
-
-async def fetch_tmdb_poster(title, target_dir, filename_prefix):
-    """Fetches high-resolution movie/show poster from TMDB and saves poster.jpg"""
-    if not TMDB_API_KEY or not title:
-        return
+async def _tmdb_get(path, params):
+    """GET https://api.themoviedb.org/3{path}?{params}&api_key=..."""
+    if not TMDB_API_KEY:
+        return None
+    qs = urllib.parse.urlencode({"api_key": TMDB_API_KEY, **params})
+    url = f"https://api.themoviedb.org/3{path}?{qs}"
     try:
-        search_title = re.sub(r'\b(19|20)\d{2}\b', '', title).strip()
-        url = f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={search_title}"
         connector = aiohttp.TCPConnector(family=socket.AF_INET)
         async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.get(url, timeout=5) as resp:
+            async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    results = data.get("results", [])
-                    if results:
-                        poster_path = results[0].get("poster_path")
-                        if poster_path:
-                            img_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
-                            async with session.get(img_url) as img_resp:
-                                if img_resp.status == 200:
-                                    img_data = await img_resp.read()
-                                    save_path = os.path.join(target_dir, f"{filename_prefix}-poster.jpg")
-                                    with open(save_path, "wb") as f:
-                                        f.write(img_data)
-                                    logger.info(f"[TMDB] 🖼️ Saved poster image: {save_path}")
+                    return await resp.json()
+                logger.warning(f"[TMDB] GET {path} -> {resp.status}")
     except Exception as e:
-        logger.warning(f"[TMDB] Poster fetch notice for '{title}': {e}")
+        logger.warning(f"[TMDB] request notice for '{path}': {e}")
+    return None
+
+
+async def _tmdb_search(media_type, query, year=None):
+    """Search TMDB for a movie or TV series; returns a list of candidate hits."""
+    params = {"query": query or "", "include_adult": "false"}
+    if year:
+        if media_type == "tv":
+            params["first_air_date_year"] = int(year)
+        else:
+            params["year"] = int(year)
+    data = await _tmdb_get(f"/search/{media_type}", params)
+    if data:
+        return data.get("results") or []
+    return []
+
+
+async def _download_image(session, url, save_path):
+    """Download an image (e.g. TMDB poster/backdrop) to save_path."""
+    try:
+        async with session.get(url, timeout=15) as resp:
+            if resp.status == 200:
+                data = await resp.read()
+                with open(save_path, "wb") as f:
+                    f.write(data)
+                return True
+    except Exception as e:
+        logger.warning(f"[TMDB] image download notice for '{url}': {e}")
+    return False
+
+
+async def enrich_media_metadata(entry):
+    """Fetch full TMDB details for a cache entry and write nfo + poster/backdrop.
+
+    Writes:
+      - movies: <target_dir>/{strm_base}.nfo + poster.jpg + backdrop.jpg
+      - tv:     <show_root>/tvshow.nfo + <show_root>/poster.jpg + <show_root>/backdrop.jpg
+                + <target_dir>/{strm_base}.nfo (episodedetails)
+
+    Idempotent: skips when the .nfo + poster already exist so restarts don't
+    hammer the API. Updates the cache entry's tmdb_id/tmdb fields.
+    """
+    if not TMDB_API_KEY or not isinstance(entry, dict) or not entry.get("title"):
+        return False
+    key = entry.get("_cache_key") or ""
+    try:
+        is_tv = bool(entry.get("is_tv"))
+        if is_tv:
+            query = entry.get("show_name") or entry.get("title")
+            results = await _tmdb_search("tv", query, entry.get("year"))
+        else:
+            query = entry.get("title")
+            results = await _tmdb_search("movie", query, entry.get("year"))
+        hit = best_tmdb_match(results, query, "tv" if is_tv else "movie", entry.get("year"))
+        if not hit:
+            logger.info(f"[TMDB] No match for '{query}' (tv={is_tv})")
+            return False
+
+        tmdb_id = hit.get("id")
+        if is_tv:
+            detail = await _tmdb_get(f"/tv/{tmdb_id}", {"append_to_response": f"season/{int(entry.get('season') or 1)}"})
+        else:
+            detail = await _tmdb_get(f"/movie/{tmdb_id}", {})
+
+        if not detail:
+            logger.info(f"[TMDB] No detail for tmdb_id={tmdb_id} ({query})")
+            return False
+
+        target_dir = entry.get("target_dir")
+        show_root = entry.get("show_root")
+        if not target_dir:
+            logger.info(f"[TMDB] No target_dir for '{query}' - skipping enrich")
+            return False
+
+        os.makedirs(target_dir, exist_ok=True)
+        connector = aiohttp.TCPConnector(family=socket.AF_INET)
+        async with aiohttp.ClientSession(connector=connector) as session:
+
+            def _best_image(detail_key):
+                base = detail.get(detail_key)
+                if not base:
+                    return None
+                return f"https://image.tmdb.org/t/p/original{base}"
+
+            if is_tv:
+                if not show_root:
+                    return False
+                os.makedirs(show_root, exist_ok=True)
+                nfo_path = os.path.join(show_root, "tvshow.nfo")
+                poster_path = os.path.join(show_root, "poster.jpg")
+                backdrop_path = os.path.join(show_root, "backdrop.jpg")
+                if not os.path.exists(nfo_path):
+                    with open(nfo_path, "w", encoding="utf-8") as f:
+                        f.write(build_tvshow_nfo(detail))
+                poster_url = _best_image("poster_path")
+                if poster_url and not os.path.exists(poster_path):
+                    await _download_image(session, _resize_tmdb_image(poster_url), poster_path)
+                backdrop_url = _best_image("backdrop_path")
+                if backdrop_url and not os.path.exists(backdrop_path):
+                    await _download_image(session, _resize_tmdb_image(backdrop_url, "w1280"), backdrop_path)
+
+                season_detail = None
+                a2r = detail.get("seasons") or []
+                for sd in a2r:
+                    if str(sd.get("season_number")) == str(int(entry.get("season") or 1)):
+                        season_detail = sd
+                        break
+                if season_detail:
+                    ep_detail = None
+                    for rd in season_detail.get("episodes") or []:
+                        if str(rd.get("episode_number")) == str(int(entry.get("episode") or 1)):
+                            ep_detail = rd
+                            break
+                    if ep_detail:
+                        ep_nfo = os.path.join(target_dir, f"{entry.get('strm_base', strm_base(entry))}.nfo")
+                        if not os.path.exists(ep_nfo):
+                            with open(ep_nfo, "w", encoding="utf-8") as f:
+                                f.write(build_episode_nfo(ep_detail))
+            else:
+                nfo_path = os.path.join(target_dir, "movie.nfo")
+                if not os.path.exists(nfo_path):
+                    with open(nfo_path, "w", encoding="utf-8") as f:
+                        f.write(build_movie_nfo(detail))
+                poster_url = _best_image("poster_path")
+                if poster_url and not os.path.exists(os.path.join(target_dir, "poster.jpg")):
+                    await _download_image(session, _resize_tmdb_image(poster_url), os.path.join(target_dir, "poster.jpg"))
+                backdrop_url = _best_image("backdrop_path")
+                if backdrop_url and not os.path.exists(os.path.join(target_dir, "backdrop.jpg")):
+                    await _download_image(session, _resize_tmdb_image(backdrop_url, "w1280"), os.path.join(target_dir, "backdrop.jpg"))
+
+        prev = FILE_ID_CACHE.get(key)
+        if isinstance(prev, dict):
+            prev["tmdb_id"] = tmdb_id
+            prev["tmdb_title"] = (
+                detail.get("name") or detail.get("title") or hit.get("name") or hit.get("title")
+            )
+            prev["tmdb_year"] = _tmdb_year(detail)
+            FILE_ID_CACHE[key] = prev
+            await save_cache_async()
+        logger.info(f"[TMDB] ✅ Enriched {'TV' if is_tv else 'Movie'} metadata for '{query}' (tmdb_id={tmdb_id})")
+        return True
+    except Exception as e:
+        logger.warning(f"[TMDB] enrich notice for '{entry.get('title')}': {e}")
+        return False
+
+
+def _tmdb_year(detail):
+    """Best-effort year from a TMDB detail payload."""
+    raw = detail.get("release_date") or detail.get("first_air_date") or ""
+    if len(raw) >= 4 and raw[:4].isdigit():
+        return int(raw[:4])
+    return None
+
+
+def _resize_tmdb_image(url, size="w500"):
+    """Rewrite a TMDB original image URL to a smaller requested size."""
+    if "image.tmdb.org/" not in url:
+        return url
+    return url.replace("/original", f"/{size}", 1)
 
 async def _download_subtitle_bytes(file_id):
     """Fetch a small subtitle document's bytes via the primary client."""
@@ -870,25 +997,20 @@ def _subtitle_target_path(entry, subtitle_ext, subtitle_file_name):
     """Resolve the sidecar path for a subtitle next to the matched video .strm.
 
     Jellyfin resolves external subtitles by base-name + language tag, e.g.
-    `Movie.eng.srt` beside `Movie.strm`. Returns None if the entry is unusable.
+    `Movie.eng.srt` beside `Movie.strm`. Uses the strm's stored layout fields
+    (or recomputes them) so the sidecar lands in the exact media folder.
+    Returns None if the entry is unusable.
     """
     if not isinstance(entry, dict) or not entry.get("title"):
         return None
     lang_name = subtitle_lang_hint(subtitle_file_name)
     code = language_code(lang_name) or "und"
-    base = safe_folder(entry.get("title"))
-    if entry.get("is_tv") and entry.get("show_name"):
-        target_dir = tv_target_dir(
-            SHOWS_DIR,
-            entry.get("language") or detect_language(entry.get("title") or ""),
-            entry.get("show_name"),
-            entry.get("season"),
-        )
-    else:
-        target_dir = movie_target_dir(
-            MOVIES_DIR,
-            entry.get("language") or detect_language(entry.get("title") or ""),
-        )
+    base = entry.get("strm_base") or strm_base(entry)
+    if not base:
+        return None
+    target_dir = entry.get("target_dir") or strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
+    if not target_dir:
+        return None
     return os.path.join(target_dir, f"{base}.{code}{subtitle_ext}")
 
 
@@ -979,18 +1101,46 @@ async def _retry_pending_subtitles():
     return placed
 
 
-def _create_strm_file_sync(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None, language=None):
-    # Base name normalized via safe_folder so Jellyfin can match external
+def _meta_to_entry(msg_id, chat_id, file_id, file_size, file_name):
+    """Parse a file name into a full cache/strm entry (single source of truth)."""
+    meta = parse_media_meta(file_name)
+    return {
+        "file_id": file_id,
+        "chat_id": chat_id,
+        "msg_id": msg_id,
+        "file_size": file_size,
+        "title": meta["title"],
+        "clean_title": meta["clean_title"],
+        "search_title": meta["search_title"],
+        "is_tv": meta["is_tv"],
+        "show_name": meta["show_name"],
+        "season": meta["season"],
+        "episode": meta["episode"],
+        "year": meta["year"],
+        "language": meta["language"],
+        "_cache_key": _cache_key(chat_id, msg_id),
+    }
+
+
+def _create_strm_file_sync(entry):
+    # Base name via the shared strm-layout helper so Jellyfin matches external
     # subtitle sidecars (base.<lang>.ext) against the .strm byte-for-byte.
-    strm_base = safe_folder(clean_title)
+    msg_id = entry.get("msg_id")
+    file_id = entry.get("file_id")
+    chat_id = entry.get("chat_id")
+    clean_title = entry.get("title") or "Unknown_Media"
+    is_tv = bool(entry.get("is_tv"))
+    show_name = entry.get("show_name")
+    year = entry.get("year")
+    language = entry.get("language") or DEFAULT_LANGUAGE
+    strm_base_name = strm_base(entry)
+    target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
+    show_root = None
     if is_tv and show_name:
-        target_dir = tv_target_dir(SHOWS_DIR, language or DEFAULT_LANGUAGE, show_name, season)
-        os.makedirs(target_dir, exist_ok=True)
-        strm_filename = f"{strm_base}.strm"
-    else:
-        target_dir = movie_target_dir(MOVIES_DIR, language or DEFAULT_LANGUAGE)
-        os.makedirs(target_dir, exist_ok=True)
-        strm_filename = f"{strm_base}.strm"
+        show_root = tv_show_root(SHOWS_DIR, language, show_name, year)
+        os.makedirs(show_root, exist_ok=True)
+    os.makedirs(target_dir, exist_ok=True)
+    strm_filename = f"{strm_base_name}.strm"
 
     strm_path = os.path.join(target_dir, strm_filename)
     if chat_id:
@@ -1001,18 +1151,21 @@ def _create_strm_file_sync(msg_id, file_id, clean_title, is_tv=False, show_name=
     with open(strm_path, "w") as f:
         f.write(stream_url)
 
+    entry["target_dir"] = target_dir
+    entry["show_root"] = show_root
+    entry["strm_base"] = strm_base_name
     logger.info(f"[AUTO-SYNC] 🎉 Created .strm file: {strm_filename} -> {strm_path}")
-    return strm_filename, target_dir
+    return strm_filename, target_dir, show_root
 
-async def create_strm_file_async(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None, language=None):
-    strm_filename, target_dir = await asyncio.to_thread(_create_strm_file_sync, msg_id, file_id, clean_title, is_tv, show_name, season, episode, chat_id, language)
-    asyncio.create_task(fetch_tmdb_poster(show_name if is_tv else clean_title, target_dir, clean_title))
+async def create_strm_file_async(entry):
+    strm_filename, target_dir, show_root = await asyncio.to_thread(_create_strm_file_sync, entry)
+    asyncio.create_task(enrich_media_metadata(entry))
     return strm_filename
 
-def create_strm_file(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None, language=None):
-    strm_filename, target_dir = _create_strm_file_sync(msg_id, file_id, clean_title, is_tv, show_name, season, episode, chat_id, language)
+def create_strm_file(entry):
+    strm_filename, target_dir, show_root = _create_strm_file_sync(entry)
     try:
-        asyncio.create_task(fetch_tmdb_poster(show_name if is_tv else clean_title, target_dir, clean_title))
+        asyncio.create_task(enrich_media_metadata(entry))
     except Exception:
         pass
     return strm_filename
@@ -1183,27 +1336,16 @@ async def telegram_webhook(request):
             logger.info(f"[WEBHOOK] subtitle document handled: {file_name} placed={placed}")
             return web.json_response({"ok": True})
 
-        is_tv, title, show_name, season, episode = parse_media_type(file_name)
-        language = detect_language(file_name)
+        entry = _meta_to_entry(msg_id, chat_id, file_id, file_size, file_name)
 
         if file_id and msg_id:
             if _cache_lookup(msg_id, chat_id):
                 return web.json_response({"ok": True, "dedup": True})
 
-            FILE_ID_CACHE[_cache_key(chat_id, msg_id)] = {
-                "file_id": file_id,
-                "chat_id": chat_id,
-                "file_size": file_size,
-                "title": title,
-                "is_tv": is_tv,
-                "show_name": show_name,
-                "season": season,
-                "episode": episode,
-                "language": language
-            }
+            FILE_ID_CACHE[_cache_key(chat_id, msg_id)] = entry
             await save_cache_async()
 
-            strm_name = await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id, language)
+            strm_name = await create_strm_file_async(entry)
             logger.info(f"[WEBHOOK] 🎉 Successfully indexed media from Webhook: {strm_name}")
             await request_jellyfin_scan()
             try:
@@ -1285,20 +1427,9 @@ async def _scan_chat_history(chat_id, limit, indexed_list):
             logger.info(f"[REINDEX] Subtitle handled: {file_name} placed={placed}")
             skipped += 1
             continue
-        is_tv, title, show_name, season, episode = parse_media_type(file_name)
-        language = detect_language(file_name)
-        FILE_ID_CACHE[_cache_key(msg_chat_id, msg_id)] = {
-            "file_id": media.file_id,
-            "chat_id": msg_chat_id,
-            "file_size": media.file_size or 0,
-            "title": title,
-            "is_tv": is_tv,
-            "show_name": show_name,
-            "season": season,
-            "episode": episode,
-            "language": language
-        }
-        strm_name = await create_strm_file_async(msg_id, media.file_id, title, is_tv, show_name, season, episode, msg_chat_id, language)
+        entry = _meta_to_entry(msg_chat_id, msg_id, media.file_id, media.file_size or 0, file_name)
+        FILE_ID_CACHE[_cache_key(msg_chat_id, msg_id)] = entry
+        strm_name = await create_strm_file_async(entry)
         logger.info(f"[REINDEX] Re-ingested '{strm_name}' (msg {msg_id}, chat {msg_chat_id})")
         indexed += 1
     indexed_list.append({"chat_id": chat_id, "indexed": indexed, "skipped": skipped})
@@ -1582,7 +1713,13 @@ async def restore_cached_strm_files():
 
             if file_id and title:
                 chat_id = data.get("chat_id") or _chat_from_key
-                await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id, language)
+                entry = _meta_to_entry(msg_id, chat_id, file_id, data.get("file_size") or 0, title)
+                entry.update({
+                    "language": language,
+                    "year": data.get("year"),
+                    "_cache_key": key,
+                })
+                await create_strm_file_async(entry)
                 count += 1
     if count > 0:
         logger.info(f"[RESTORE] Restored {count} .strm file(s) from persistent disk cache.")
