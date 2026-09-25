@@ -19,9 +19,17 @@ from pyrogram.errors import FloodWait, RPCError
 
 logger = logging.getLogger("TG_Drive_Streamer")
 if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    logger.addHandler(handler)
+    _fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    _con = logging.StreamHandler()
+    _con.setFormatter(_fmt)
+    logger.addHandler(_con)
+    try:
+        os.makedirs("/data/cache", exist_ok=True)
+        _file = logging.FileHandler("/data/cache/tg_streamer.log", encoding="utf-8")
+        _file.setFormatter(_fmt)
+        logger.addHandler(_file)
+    except Exception as _e:
+        logger.warning(f"[LOG] File logging unavailable: {_e}")
     logger.setLevel(logging.INFO)
 
 HOST = "127.0.0.1"
@@ -683,7 +691,12 @@ async def stop_pyrogram():
         await tg_app.stop()
 
 async def start_background_tasks(app):
-    app['pyrogram_task'] = asyncio.create_task(start_pyrogram())
+    async def _guard():
+        try:
+            await start_pyrogram()
+        except Exception as e:
+            logger.exception(f"[PYROGRAM] start_pyrogram crashed: {e}")
+    app['pyrogram_task'] = asyncio.create_task(_guard())
 
 async def cleanup_background_tasks(app):
     await stop_pyrogram()
