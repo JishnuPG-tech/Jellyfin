@@ -20,6 +20,17 @@ from pyrogram.errors import FloodWait, RPCError, AuthKeyDuplicated
 
 # Apex streaming core (telegram-free; wired to Pyrogram below)
 from apex_stream import Config, BoundedChunkCache, ClientPool, InFlightRegistry, StreamMetrics, StreamDriver, FileInfo, RangeNotSatisfiable, NoClientAvailable
+from apex_stream.organize import (
+    DEFAULT_LANGUAGE,
+    detect_language,
+    language_code,
+    match_subtitle_media,
+    movie_target_dir,
+    safe_folder,
+    subtitle_is_document,
+    subtitle_lang_hint,
+    tv_target_dir,
+)
 
 logger = logging.getLogger("TG_Drive_Streamer")
 if not logger.handlers:
@@ -67,6 +78,9 @@ os.makedirs(SHOWS_DIR, exist_ok=True)
 
 # Persistent mapping: message_id -> {file_id, chat_id, file_size, title, is_tv, show_name, season, episode}
 FILE_ID_CACHE = {}
+SUBTITLE_CACHE_FILE = os.path.join(DATA_DIR, "subtitle_ids.json")
+# Pending subtitle docs awaiting a video match (and byte mirror to /data)
+SUBTITLE_CACHE = {}
 DETECTED_CHANNEL_ID = None
 
 def load_cache():
@@ -95,6 +109,26 @@ def _save_cache_sync():
     except Exception as e:
         logger.warning(f"[CACHE] Error saving file_ids.json: {e}")
 
+def _load_subtitle_cache():
+    global SUBTITLE_CACHE
+    if os.path.exists(SUBTITLE_CACHE_FILE):
+        try:
+            with open(SUBTITLE_CACHE_FILE, "r") as f:
+                SUBTITLE_CACHE = json.load(f)
+                logger.info(f"[CACHE] Loaded {len(SUBTITLE_CACHE)} pending subtitles.")
+        except Exception as e:
+            logger.warning(f"[CACHE] Error loading subtitle_ids.json: {e}")
+
+def _save_subtitle_cache_sync():
+    try:
+        with open(SUBTITLE_CACHE_FILE, "w") as f:
+            json.dump(SUBTITLE_CACHE, f, indent=2)
+    except Exception as e:
+        logger.warning(f"[CACHE] Error saving subtitle_ids.json: {e}")
+
+async def save_subtitle_cache_async():
+    await asyncio.to_thread(_save_subtitle_cache_sync)
+
 async def save_cache_async():
     await asyncio.to_thread(_save_cache_sync)
 
@@ -102,6 +136,7 @@ def save_cache():
     _save_cache_sync()
 
 load_cache()
+_load_subtitle_cache()
 
 # ---------------------------------------------------------------------------
 # Apex streaming core singletons (wired to Pyrogram clients below).
@@ -180,6 +215,7 @@ for _ec_idx, _ec_token in enumerate(APEX_CFG.extra_tokens, start=2):
                 workdir=DATA_DIR,
                 in_memory=True,
                 no_updates=True,
+                max_concurrent_transmissions=APEX_CFG.telegram_max_concurrent,
             )))
         except Exception as e:
             logger.error(f"[PYROGRAM] Error initializing extra client {_ec_idx}: {e}")
@@ -194,6 +230,7 @@ def index_media(msg_id, chat_id, file_id, file_size, file_name):
         return cached.get("title") or True
 
     is_tv, title, show_name, season, episode = parse_media_type(file_name)
+    language = detect_language(file_name)
 
     FILE_ID_CACHE[str(msg_id)] = {
         "file_id": file_id,
@@ -203,11 +240,12 @@ def index_media(msg_id, chat_id, file_id, file_size, file_name):
         "is_tv": is_tv,
         "show_name": show_name,
         "season": season,
-        "episode": episode
+        "episode": episode,
+        "language": language
     }
     save_cache()
 
-    strm_name = create_strm_file(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id)
+    strm_name = create_strm_file(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id, language)
     logger.info(f"[INGEST] Media indexed from Telegram: {strm_name} (chat={chat_id})")
     return strm_name
 
@@ -248,10 +286,19 @@ async def process_telegram_media(message, is_channel_post):
             except Exception as e:
                 logger.warning(f"[CONFIG] Could not persist channel_id: {e}")
 
-        strm_name = index_media(message.id, chat_id, media.file_id, media.file_size or 0,
-                                media_file_name(message, media))
+        file_name = media_file_name(message, media)
+        if subtitle_is_document(file_name, getattr(media, "mime_type", None)):
+            placed = await _place_subtitle(message.id, chat_id, media.file_id, file_name)
+            logger.info(f"[PYROGRAM] 🎞️ Subtitle handled: {file_name} placed={placed}")
+            return
+
+        strm_name = index_media(message.id, chat_id, media.file_id, media.file_size or 0, file_name)
         if strm_name:
             logger.info(f"[PYROGRAM] 🎉 Ingested '{strm_name}' from chat {chat_id}")
+            try:
+                await _retry_pending_subtitles()
+            except Exception as e:
+                logger.warning(f"[PYROGRAM] subtitle retry failed: {e}")
             await trigger_jellyfin_scan()
     except Exception as e:
         logger.error(f"[PYROGRAM] Error handling update: {e}")
@@ -267,7 +314,8 @@ if API_ID and API_HASH and BOT_TOKEN:
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
             workdir=DATA_DIR,
-            in_memory=True
+            in_memory=True,
+            max_concurrent_transmissions=APEX_CFG.telegram_max_concurrent,
         )
         logger.info("[PYROGRAM] Pyrogram persistent client initialized.")
     except Exception as e:
@@ -305,8 +353,13 @@ async def health(request):
         "cache": apex_cache.stats(),
         "metrics": {k: v for k, v in apex_metrics.snapshot().items() if k != "recent_streams"},
         "cached_files": len(FILE_ID_CACHE),
+        "pending_subtitles": sum(1 for s in SUBTITLE_CACHE.values() if isinstance(s, dict) and not s.get("placed")),
+        "placed_subtitles": sum(1 for s in SUBTITLE_CACHE.values() if isinstance(s, dict) and s.get("placed")),
         "movies_dir": MOVIES_DIR,
-        "shows_dir": SHOWS_DIR
+        "shows_dir": SHOWS_DIR,
+        "organization": "language-based (Movies/<Language>, TV Shows/<Language>/<Show>/Season NN)",
+        "stream_concurrency_per_client": APEX_CFG.telegram_max_concurrent,
+        "cache_ttl_seconds": APEX_CFG.cache_ttl_seconds,
     })
 
 def clean_title_str(text):
@@ -369,15 +422,149 @@ async def fetch_tmdb_poster(title, target_dir, filename_prefix):
     except Exception as e:
         logger.warning(f"[TMDB] Poster fetch notice for '{title}': {e}")
 
-def _create_strm_file_sync(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None):
-    if is_tv and show_name:
-        season_num = season if season else 1
-        target_dir = os.path.join(SHOWS_DIR, show_name, f"Season {season_num:02d}")
-        os.makedirs(target_dir, exist_ok=True)
-        strm_filename = f"{clean_title}.strm"
+async def _download_subtitle_bytes(file_id):
+    """Fetch a small subtitle document's bytes via the primary client."""
+    if not tg_app or not tg_app.is_connected or not file_id:
+        return None
+    try:
+        data = await tg_app.download_media(file_id, in_memory=True)
+        if isinstance(data, (bytes, bytearray)):
+            return bytes(data)
+        buff = getattr(data, "getbuffer", None)
+        if buff is not None:
+            return bytes(buff)
+        raw = bytes(data)
+        return raw
+    except Exception as e:
+        logger.warning(f"[SUBTITLE] download_media failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _subtitle_target_path(entry, subtitle_ext, subtitle_file_name):
+    """Resolve the sidecar path for a subtitle next to the matched video .strm.
+
+    Jellyfin resolves external subtitles by base-name + language tag, e.g.
+    `Movie.eng.srt` beside `Movie.strm`. Returns None if the entry is unusable.
+    """
+    if not isinstance(entry, dict) or not entry.get("title"):
+        return None
+    lang_name = subtitle_lang_hint(subtitle_file_name)
+    code = language_code(lang_name) or "und"
+    base = safe_folder(entry.get("title"))
+    if entry.get("is_tv") and entry.get("show_name"):
+        target_dir = tv_target_dir(
+            SHOWS_DIR,
+            entry.get("language") or detect_language(entry.get("title") or ""),
+            entry.get("show_name"),
+            entry.get("season"),
+        )
     else:
-        target_dir = MOVIES_DIR
-        strm_filename = f"{clean_title}.strm"
+        target_dir = movie_target_dir(
+            MOVIES_DIR,
+            entry.get("language") or detect_language(entry.get("title") or ""),
+        )
+    return os.path.join(target_dir, f"{base}.{code}{subtitle_ext}")
+
+
+async def _place_subtitle(msg_id, chat_id, file_id, file_name):
+    """Match a subtitle document to an indexed video and write the sidecar file.
+
+    Stores metadata in SUBTITLE_CACHE for persistence across redeploys; a
+    subtitle without a video match yet is retried on every following ingest and
+    on cache restore.
+    """
+    subtitle_ext = os.path.splitext(file_name or "")[1].lower()
+    if not subtitle_ext:
+        subtitle_ext = ".srt"
+
+    SUBTITLE_CACHE[str(msg_id)] = {
+        "file_id": file_id,
+        "chat_id": chat_id,
+        "file_name": file_name,
+        "placed": False,
+        "target": None,
+    }
+    await save_subtitle_cache_async()
+
+    match = match_subtitle_media(file_name, FILE_ID_CACHE)
+    if not match:
+        return False
+
+    video_msg, video_entry, _score = match
+    target = _subtitle_target_path(video_entry, subtitle_ext, file_name)
+    if not target:
+        return False
+
+    data = await _download_subtitle_bytes(file_id)
+    if not data:
+        return False
+
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        logger.warning(f"[SUBTITLE] write failed for {target}: {e}")
+        return False
+
+    SUBTITLE_CACHE[str(msg_id)] = {
+        "file_id": file_id,
+        "chat_id": chat_id,
+        "file_name": file_name,
+        "placed": True,
+        "target": target,
+        "video_msg": video_msg,
+    }
+    await save_subtitle_cache_async()
+    logger.info(f"[SUBTITLE] ✅ Placed subtitle for {video_msg}: {target}")
+    return True
+
+
+async def _retry_pending_subtitles():
+    """Attempt to place any queued subtitles that now have a video match."""
+    placed = 0
+    for msg_id, sub in list(SUBTITLE_CACHE.items()):
+        if not isinstance(sub, dict) or sub.get("placed"):
+            continue
+        file_name = sub.get("file_name")
+        match = match_subtitle_media(file_name or "", FILE_ID_CACHE)
+        if not match:
+            continue
+        video_msg, video_entry, _score = match
+        ext = os.path.splitext(file_name or "")[1].lower() or ".srt"
+        target = _subtitle_target_path(video_entry, ext, file_name or "")
+        if not target or os.path.exists(target):
+            continue
+        data = await _download_subtitle_bytes(sub.get("file_id"))
+        if not data:
+            continue
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            logger.warning(f"[SUBTITLE] retry write failed {target}: {e}")
+            continue
+        SUBTITLE_CACHE[str(msg_id)] = {**sub, "placed": True, "target": target, "video_msg": video_msg}
+        placed += 1
+    if placed:
+        await save_subtitle_cache_async()
+        logger.info(f"[SUBTITLE] Placed {placed} previously-queued subtitle(s).")
+    return placed
+
+
+def _create_strm_file_sync(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None, language=None):
+    # Base name normalized via safe_folder so Jellyfin can match external
+    # subtitle sidecars (base.<lang>.ext) against the .strm byte-for-byte.
+    strm_base = safe_folder(clean_title)
+    if is_tv and show_name:
+        target_dir = tv_target_dir(SHOWS_DIR, language or DEFAULT_LANGUAGE, show_name, season)
+        os.makedirs(target_dir, exist_ok=True)
+        strm_filename = f"{strm_base}.strm"
+    else:
+        target_dir = movie_target_dir(MOVIES_DIR, language or DEFAULT_LANGUAGE)
+        os.makedirs(target_dir, exist_ok=True)
+        strm_filename = f"{strm_base}.strm"
 
     strm_path = os.path.join(target_dir, strm_filename)
     if chat_id:
@@ -391,13 +578,13 @@ def _create_strm_file_sync(msg_id, file_id, clean_title, is_tv=False, show_name=
     logger.info(f"[AUTO-SYNC] 🎉 Created .strm file: {strm_filename} -> {strm_path}")
     return strm_filename, target_dir
 
-async def create_strm_file_async(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None):
-    strm_filename, target_dir = await asyncio.to_thread(_create_strm_file_sync, msg_id, file_id, clean_title, is_tv, show_name, season, episode, chat_id)
+async def create_strm_file_async(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None, language=None):
+    strm_filename, target_dir = await asyncio.to_thread(_create_strm_file_sync, msg_id, file_id, clean_title, is_tv, show_name, season, episode, chat_id, language)
     asyncio.create_task(fetch_tmdb_poster(show_name if is_tv else clean_title, target_dir, clean_title))
     return strm_filename
 
-def create_strm_file(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None):
-    strm_filename, target_dir = _create_strm_file_sync(msg_id, file_id, clean_title, is_tv, show_name, season, episode, chat_id)
+def create_strm_file(msg_id, file_id, clean_title, is_tv=False, show_name=None, season=None, episode=None, chat_id=None, language=None):
+    strm_filename, target_dir = _create_strm_file_sync(msg_id, file_id, clean_title, is_tv, show_name, season, episode, chat_id, language)
     try:
         asyncio.create_task(fetch_tmdb_poster(show_name if is_tv else clean_title, target_dir, clean_title))
     except Exception:
@@ -548,7 +735,15 @@ async def telegram_webhook(request):
         file_name = media_obj.get("file_name") or post.get("caption") or f"Telegram_Media_{msg_id}"
         file_size = media_obj.get("file_size", 0)
 
+        # Subtitle documents (srt/ass/vtt) are placed beside the matching video
+        # .strm instead of being indexed as playable media themselves.
+        if subtitle_is_document(file_name, media_obj.get("mime_type")):
+            placed = await _place_subtitle(msg_id, chat_id, file_id, file_name)
+            logger.info(f"[WEBHOOK] subtitle document handled: {file_name} placed={placed}")
+            return web.json_response({"ok": True})
+
         is_tv, title, show_name, season, episode = parse_media_type(file_name)
+        language = detect_language(file_name)
 
         if file_id and msg_id:
             if FILE_ID_CACHE.get(str(msg_id)):
@@ -562,13 +757,18 @@ async def telegram_webhook(request):
                 "is_tv": is_tv,
                 "show_name": show_name,
                 "season": season,
-                "episode": episode
+                "episode": episode,
+                "language": language
             }
             await save_cache_async()
 
-            strm_name = await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id)
+            strm_name = await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id, language)
             logger.info(f"[WEBHOOK] 🎉 Successfully indexed media from Webhook: {strm_name}")
             await trigger_jellyfin_scan()
+            try:
+                await _retry_pending_subtitles()
+            except Exception as e:
+                logger.warning(f"[WEBHOOK] subtitle retry failed: {e}")
 
         return web.json_response({"ok": True})
     except Exception as e:
@@ -639,7 +839,13 @@ async def _scan_chat_history(chat_id, limit, indexed_list):
             skipped += 1
             continue
         file_name = media_file_name(message, media)
+        if subtitle_is_document(file_name, getattr(media, "mime_type", None)):
+            placed = await _place_subtitle(msg_id, msg_chat_id, media.file_id, file_name)
+            logger.info(f"[REINDEX] Subtitle handled: {file_name} placed={placed}")
+            skipped += 1
+            continue
         is_tv, title, show_name, season, episode = parse_media_type(file_name)
+        language = detect_language(file_name)
         FILE_ID_CACHE[str(msg_id)] = {
             "file_id": media.file_id,
             "chat_id": msg_chat_id,
@@ -648,9 +854,10 @@ async def _scan_chat_history(chat_id, limit, indexed_list):
             "is_tv": is_tv,
             "show_name": show_name,
             "season": season,
-            "episode": episode
+            "episode": episode,
+            "language": language
         }
-        strm_name = await create_strm_file_async(msg_id, media.file_id, title, is_tv, show_name, season, episode, msg_chat_id)
+        strm_name = await create_strm_file_async(msg_id, media.file_id, title, is_tv, show_name, season, episode, msg_chat_id, language)
         logger.info(f"[REINDEX] Re-ingested '{strm_name}' (msg {msg_id}, chat {msg_chat_id})")
         indexed += 1
     indexed_list.append({"chat_id": chat_id, "indexed": indexed, "skipped": skipped})
@@ -884,6 +1091,14 @@ async def status(request):
     snap = apex_driver.status_snapshot()
     snap["cached_files"] = len(FILE_ID_CACHE)
     snap["cache"] = apex_cache.stats()
+    languages = {}
+    for data in FILE_ID_CACHE.values():
+        if isinstance(data, dict):
+            lang = data.get("language") or "unknown"
+            languages[lang] = languages.get(lang, 0) + 1
+    snap["languages"] = languages
+    snap["pending_subtitles"] = sum(1 for s in SUBTITLE_CACHE.values() if isinstance(s, dict) and not s.get("placed"))
+    snap["placed_subtitles"] = sum(1 for s in SUBTITLE_CACHE.values() if isinstance(s, dict) and s.get("placed"))
     return web.json_response(snap)
 
 
@@ -921,14 +1136,26 @@ async def restore_cached_strm_files():
             show_name = data.get("show_name")
             season = data.get("season")
             episode = data.get("episode")
+            language = data.get("language") or detect_language(title) or DEFAULT_LANGUAGE
 
             if file_id and title:
                 chat_id = data.get("chat_id")
-                await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id)
+                await create_strm_file_async(msg_id, file_id, title, is_tv, show_name, season, episode, chat_id, language)
                 count += 1
     if count > 0:
         logger.info(f"[RESTORE] Restored {count} .strm file(s) from persistent disk cache.")
         await trigger_jellyfin_scan()
+
+    # Queued subtitles may now resolve against the restored media index.
+    if SUBTITLE_CACHE and tg_app and tg_app.is_connected:
+        try:
+            await _retry_pending_subtitles()
+        except Exception as e:
+            logger.warning(f"[RESTORE] subtitle retry failed: {e}")
+    if SUBTITLE_CACHE:
+        still = sum(1 for s in SUBTITLE_CACHE.values() if isinstance(s, dict) and not s.get("placed"))
+        if still:
+            logger.info(f"[RESTORE] {still} subtitle(s) still awaiting a video match.")
 
 async def _register_main_client():
     """Register the primary client in the pool once it is connected."""

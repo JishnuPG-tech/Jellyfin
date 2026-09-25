@@ -50,13 +50,18 @@ class Config:
         # Bounded hot-chunk cache
         self.cache_enabled = _bool("APEX_STREAM_CACHE_ENABLED", True, env)
         self.cache_size_bytes = _int("APEX_STREAM_CACHE_MB", 64, env) * 1024 * 1024
-        self.cache_ttl_seconds = _int("APEX_STREAM_CACHE_TTL_SECONDS", 30, env)
+        # Seek-friendly TTL: ~2× the seek window so recent runs are re-served
+        # from RAM instead of re-fetched over MTProto on scrubbing back/forward.
+        self.cache_ttl_seconds = _int("APEX_STREAM_CACHE_TTL_SECONDS", 300, env)
 
         # Telegram client pool
         self.extra_tokens = _str_or_list("APEX_TELEGRAM_EXTRA_TOKENS", [], env)
         self.client_cooldown_seconds = _int("APEX_TELEGRAM_CLIENT_COOLDOWN", 30, env)
         self.client_failure_threshold = _int("APEX_TELEGRAM_FAILURE_THRESHOLD", 3, env)
         self.max_telegram_retries = _int("APEX_TELEGRAM_MAX_RETRIES", 2, env)
+        # Per-client MTProto transmission parallelism. Pyrogram's default of 1
+        # serializes all downloads on one bot; raising this lets a single extra
+        # bot serve more concurrent streams. Bounded by Telegram's own limits.
         self.telegram_max_concurrent = _int("APEX_TELEGRAM_MAX_CONCURRENT", 4, env)
 
         # Tuning / response behaviour
