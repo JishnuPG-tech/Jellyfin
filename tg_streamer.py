@@ -668,8 +668,8 @@ async def telegram_api_call(method: str, **params):
                     return {"ok": False, "description": f"HTTP {resp.status_code}"}
             except Exception as e:
                 last_error = e
-                logger.warning(f"[TELEGRAM] {method} attempt {attempt+1} failed: {type(e).__name__}: {e}")
                 await asyncio.sleep(2)
+    logger.debug(f"[TELEGRAM] {method} failed after 3 attempts: {type(last_error).__name__}: {last_error}")
     return {"ok": False, "description": f"Telegram API error: {last_error}"}
 
 
@@ -691,10 +691,9 @@ async def register_telegram_webhook():
         result = await telegram_api_call("setWebhook", **params)
         last_result = result
         ok = bool(result and result.get("ok"))
-        desc = (result or {}).get("description", "no response")
-        logger.info(f"[WEBHOOK] setWebhook attempt {attempt+1}: ok={ok} desc={desc}")
         if ok:
-            return True, webhook_url, desc
+            logger.info(f"[WEBHOOK] setWebhook registered: {(result or {}).get('description', 'ok')}")
+            return True, webhook_url, (result or {}).get("description", "ok")
         await asyncio.sleep(3)
 
     return False, webhook_url, str((last_result or {}).get("description", "unknown error"))

@@ -50,12 +50,9 @@ def check_sqlite_integrity(db_path: str) -> bool:
         cur.execute("PRAGMA quick_check;")
         res = cur.fetchone()
         conn.close()
-        if res and res[0] == "ok":
-            return True
-        logger.warning(f"⚠️ Quick check failed for {db_path}: {res}")
-        return False
+        return bool(res and res[0] == "ok")
     except Exception as exc:
-        logger.error(f"❌ Error running quick_check on {db_path}: {exc}")
+        logger.warning(f"❌ Error running quick_check on {db_path}: {exc}")
         return False
 
 
@@ -325,15 +322,25 @@ def ensure_jellyfin_libraries():
     return all_present
 
 
+_last_db_status: dict = {}
+
+
 def run_health_check_cycle():
     logger.info("Starting health & database integrity diagnostic cycle...")
     
     for db_path in TARGET_DATABASES:
-        if os.path.exists(db_path):
-            ok = check_sqlite_integrity(db_path)
-            status = "HEALTHY" if ok else "CORRUPT"
-            size_mb = os.path.getsize(db_path) / (1024 * 1024)
-            logger.info(f"Database {os.path.basename(db_path)} ({size_mb:.2f} MB): {status}")
+        if not os.path.exists(db_path):
+            continue
+        ok = check_sqlite_integrity(db_path)
+        status = "HEALTHY" if ok else "CORRUPT"
+        # Only log when the status changes so a persistently unhealthy DB
+        # doesn't spam an ERROR/WARNING line every cycle.
+        if _last_db_status.get(db_path) == status:
+            continue
+        _last_db_status[db_path] = status
+        size_mb = os.path.getsize(db_path) / (1024 * 1024)
+        log = logger.info if ok else logger.warning
+        log(f"Database {os.path.basename(db_path)} ({size_mb:.2f} MB): {status}")
 
     check_disk_space()
     purge_old_backups()
