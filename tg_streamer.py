@@ -15,7 +15,7 @@ from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType
 from pyrogram.types import Message
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait, RPCError, AuthKeyDuplicated
 
 logger = logging.getLogger("TG_Drive_Streamer")
 if not logger.handlers:
@@ -672,19 +672,64 @@ async def restore_cached_strm_files():
         await trigger_jellyfin_scan()
 
 async def start_pyrogram():
-    """Starts Pyrogram Client and restores cached media"""
+    """Starts Pyrogram Client (retrying through transient session collisions) and restores cached media."""
     if not tg_app:
         logger.warning("[PYROGRAM] Pyrogram client not configured.")
         await restore_cached_strm_files()
         return
 
-    logger.info("[PYROGRAM] Starting Pyrogram MTProto Client...")
-    await tg_app.start()
-    me = await tg_app.get_me()
-    logger.info(f"[PYROGRAM] Pyrogram Client started successfully! Bot: @{getattr(me, 'username', '?')} (id={getattr(me, 'id', '?')})")
+    max_attempts = 12
+    session_path = os.path.join(DATA_DIR, "tg_jellyfin_session.session")
 
-    await restore_cached_strm_files()
-    await register_telegram_webhook()
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info(f"[PYROGRAM] Starting Pyrogram MTProto Client... (attempt {attempt}/{max_attempts})")
+            await tg_app.start()
+            me = await tg_app.get_me()
+            logger.info(f"[PYROGRAM] Pyrogram Client started successfully! Bot: @{getattr(me, 'username', '?')} (id={getattr(me, 'id', '?')})")
+            await restore_cached_strm_files()
+            await register_telegram_webhook()
+            return
+        except AuthKeyDuplicated as e:
+            logger.warning(f"[PYROGRAM] AUTH_KEY_DUPLICATED (attempt {attempt}): {e}")
+            try:
+                await tg_app.stop()
+            except Exception:
+                pass
+            if attempt < max_attempts:
+                await asyncio.sleep(15)
+        except Exception as e:
+            logger.warning(f"[PYROGRAM] start attempt {attempt} failed: {e}")
+            try:
+                await tg_app.stop()
+            except Exception:
+                pass
+            if attempt < max_attempts:
+                await asyncio.sleep(10)
+
+    # Still failing after retries: the session file is likely clobbered by a stale
+    # container/holdover auth key. Recreate a fresh one from the bot token.
+    logger.error("[PYROGRAM] Connection failed after retries — recreating fresh session from bot token.")
+    try:
+        await tg_app.stop()
+    except Exception:
+        pass
+    for suffix in (".session", ".session-journal"):
+        stale = session_path + suffix
+        if os.path.exists(stale):
+            try:
+                os.replace(stale, stale + ".stale")
+                logger.warning(f"[PYROGRAM] Backed up stale {stale} -> {stale}.stale")
+            except Exception as e:
+                logger.error(f"[PYROGRAM] Failed to back up {stale}: {e}")
+    try:
+        await tg_app.start()
+        me = await tg_app.get_me()
+        logger.info(f"[PYROGRAM] Pyrogram reconnected with fresh session! Bot: @{getattr(me, 'username', '?')} (id={getattr(me, 'id', '?')})")
+        await restore_cached_strm_files()
+        await register_telegram_webhook()
+    except Exception as e:
+        logger.error(f"[PYROGRAM] Fresh-session start failed: {e}")
 
 async def stop_pyrogram():
     if tg_app and tg_app.is_connected:
