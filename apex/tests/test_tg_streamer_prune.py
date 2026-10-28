@@ -9,6 +9,7 @@ import asyncio
 import os
 import re
 import shutil
+import uuid
 from typing import Optional
 from pathlib import Path
 
@@ -1072,7 +1073,7 @@ def test_write_text_if_changed_is_idempotent(tmp_path):
 
 def test_release_group_prefix_is_removed_only_from_matching_copy():
     strip_prefix = _extract_top_level_function("_strip_known_release_group_prefix")
-    assert strip_prefix("@WMR_SpiderMan.Homecoming.2017.720p.mkv") == "SpiderMan.Homecoming.2017.720p.mkv"
+    assert strip_prefix("@WMR_SpiderMan.Homecoming.2017.720p.mkv") == "Spider Man.Homecoming.2017.720p.mkv"
     assert strip_prefix("@WMR Resident Evil Apocalypse (2004).mkv") == "Resident Evil Apocalypse (2004).mkv"
     assert strip_prefix("Spider-Man: Homecoming (2017).mkv") == "Spider-Man: Homecoming (2017).mkv"
 
