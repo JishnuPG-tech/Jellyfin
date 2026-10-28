@@ -209,6 +209,10 @@ def load_cache():
     for key, data in list(FILE_ID_CACHE.items()):
         if not isinstance(data, dict):
             continue
+        # Snapshot before any healing so unchanged entries do not trigger durable
+        # writes or repeat artwork refreshes on every boot.
+        entry_snapshot = dict(data)
+        cache_updated_before_entry = cache_updated
         raw_name = data.get("file_name") or data.get("raw_name") or data.get("title") or ""
         raw_lower = raw_name.lower()
         tmdb_t = (data.get("tmdb_title") or "").lower()
@@ -459,21 +463,9 @@ def load_cache():
             data["show_root"] = show_root
             data["target_dir"] = os.path.join(show_root, f"Season {s_num:02d}")
             data["strm_base"] = f"It: Welcome to Derry - S{s_num:02d}E{e_num:02d}"
-            old_strm = data.get("strm_path")
-            new_strm = os.path.join(data["target_dir"], f"{data['strm_base']}.strm")
-            data["strm_path"] = new_strm
-            if old_strm and old_strm != new_strm and os.path.exists(old_strm):
-                try:
-                    os.makedirs(data["target_dir"], exist_ok=True)
-                    shutil.move(old_strm, new_strm)
-                    old_p = os.path.dirname(old_strm)
-                    if os.path.isdir(old_p) and not os.listdir(old_p):
-                        try:
-                            os.rmdir(old_p)
-                        except OSError:
-                            pass
-                except Exception:
-                    pass
+            # Preserve the old pointer here. The reconciliation pass owns path
+            # migration and can validate collisions, sidecars, and cache references.
+            # Moving a .strm during cache repair hides the source path from that pass.
             data["_force_art_refresh"] = True
             cache_updated = True
             logger.info(f"[CACHE-HEAL] Healed Derry from Summer I Turned Pretty collision -> '{new_strm}'")
@@ -497,6 +489,31 @@ def load_cache():
                 data["strm_path"] = new_strm
                 cache_updated = True
                 logger.info(f"[CACHE-HEAL] Cleaned size noise for '{raw_name}' -> '{meta['title']}'")
+
+        # Cache-heal rules may correct identity and language, but must not rewrite
+        # path/base pointers. Reindex owns that migration and has the original path.
+        for path_field in ("target_dir", "strm_path", "strm_base", "show_root"):
+            if path_field in entry_snapshot:
+                data[path_field] = entry_snapshot[path_field]
+            else:
+                data.pop(path_field, None)
+
+        identity_fields = (
+            "title", "clean_title", "year", "tmdb_id", "imdb_id",
+            "poster_url", "backdrop_url", "language", "is_tv", "show_name",
+            "season", "episode",
+        )
+        identity_changed = any(data.get(field) != entry_snapshot.get(field) for field in identity_fields)
+        if identity_changed:
+            data["_force_art_refresh"] = True
+        else:
+            # Remove sticky one-shot flags left by older cache-heal code.
+            data.pop("_force_art_refresh", None)
+
+        if data != entry_snapshot:
+            cache_updated = True
+        else:
+            cache_updated = cache_updated_before_entry
 
     if cache_updated:
         _save_cache_sync()
