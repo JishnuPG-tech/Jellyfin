@@ -3468,18 +3468,11 @@ async def purge_media_item(
 
 
 async def refresh_jellyfin_item_by_path(strm_path, alt_paths=None, retries=12, delay=5.0):
-    """Locate the Jellyfin item for a given `.strm` path and trigger a full
-    metadata refresh so the NFO/poster written by TMDB enrichment are re-read.
+    """Refresh only the Jellyfin record proven to refer to this .strm path.
 
-    A plain /Library/Refresh does NOT re-identify an already-indexed item (its
-    name is stable), so Jellyfin keeps the provisional folder-based identity.
-    This forces an item-level FullRefresh which consumes the local .nfo.
-
-    The item may not be indexed yet (the .strm can be created and even moved to
-    its language folder seconds before this runs), so we poll. Matching is by
-    exact path, by any `alt_paths` (e.g. the pre-move path), and finally by the
-    .strm basename so a Jellyfin-side folder move still resolves. Every few
-    attempts a library scan is nudged so a freshly moved file gets indexed.
+    Identity fallback is intentionally fail-closed: it may normalize punctuation
+    and duplicate year suffixes, but never removes sequel/part numbers and never
+    uses substring title matches. Ambiguous candidates are reported, not guessed.
     """
     if not strm_path:
         return False
@@ -3487,19 +3480,36 @@ async def refresh_jellyfin_item_by_path(strm_path, alt_paths=None, retries=12, d
     if not headers:
         return False
     api_key = _read_jellyfin_api_key()
-    base = os.path.basename(strm_path).lower()
+
+    expected_root = os.path.normcase(os.path.abspath(SHOWS_DIR if os.path.commonpath(
+        [os.path.abspath(strm_path), os.path.abspath(SHOWS_DIR)]
+    ) == os.path.abspath(SHOWS_DIR) else MOVIES_DIR))
+    expected_type = "Episode" if expected_root == os.path.normcase(os.path.abspath(SHOWS_DIR)) else "Movie"
+
+    def _norm_path(value):
+        return os.path.normcase(os.path.abspath(os.path.normpath(str(value or ""))))
+
+    def _base_key(value):
+        stem = os.path.splitext(os.path.basename(str(value or "")))[0].lower()
+        # Normalize duplicate-year drift only. Keep "Part 1", sequel numbers,
+        # and all other meaningful title tokens intact.
+        stem = re.sub(r"\((\d{4})\)\s*\(\1\)", r"(\1)", stem)
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", stem)).strip()
+
     paths = [strm_path]
     if alt_paths:
-        paths.extend(alt_paths)
-    norm_paths = {os.path.normpath(p).lower() for p in paths if p}
-    for attempt in range(retries):
+        paths.extend(p for p in alt_paths if p)
+    norm_paths = {_norm_path(p) for p in paths if p}
+    target_key = _base_key(strm_path)
+
+    for attempt in range(max(1, int(retries))):
         try:
             connector = aiohttp.TCPConnector(family=socket.AF_INET)
             async with aiohttp.ClientSession(connector=connector) as session:
                 params = {
                     "Recursive": "true",
-                    "IncludeItemTypes": "Movie,Series,Episode",
-                    "Fields": "Path,SeriesId,SeasonId,Type",
+                    "IncludeItemTypes": "Movie,Episode",
+                    "Fields": "Path,Type,ProviderIds,ProductionYear,Name,ParentIndexNumber,IndexNumber",
                     "Limit": "10000",
                 }
                 if api_key:
@@ -3511,72 +3521,38 @@ async def refresh_jellyfin_item_by_path(strm_path, alt_paths=None, retries=12, d
                     timeout=30,
                 ) as response:
                     if response.status != 200:
+                        logger.warning(f"[JELLYFIN-REFRESH] Item lookup failed status={response.status} path='{strm_path}'")
+                        await asyncio.sleep(delay)
                         continue
                     payload = await response.json()
-                items = payload.get("Items") or []
-                matched_item = next(
-                    (
-                        it for it in items
-                        if os.path.normpath(str(it.get("Path") or "")).lower() in norm_paths
-                    ),
-                    None,
-                )
-                if not matched_item:
-                    # Fallback 1: match by basename
-                    matched_item = next(
-                        (
-                            it for it in items
-                            if os.path.basename(str(it.get("Path") or "")).lower() == base
-                        ),
-                        None,
-                    )
-                if not matched_item:
-                    # Fallback 2: alphanumeric normalized match (handles colon / hyphen differences like "It: Welcome to Derry" vs "IT Welcome to Derry")
-                    clean_target = re.sub(r"[^a-z0-9]+", "", os.path.splitext(base)[0])
-                    if clean_target:
-                        matched_item = next(
-                            (
-                                it for it in items
-                                if re.sub(r"[^a-z0-9]+", "", os.path.splitext(os.path.basename(str(it.get("Path") or "")))[0].lower()) == clean_target
-                            ),
-                            None,
+
+                items = [
+                    item for item in (payload.get("Items") or [])
+                    if item.get("Type") == expected_type and item.get("Id") and item.get("Path")
+                ]
+
+                # Exact path (including explicit old paths passed by the mover)
+                exact = [item for item in items if _norm_path(item.get("Path")) in norm_paths]
+                if exact:
+                    matched_items = exact
+                    match_reason = "exact_path"
+                else:
+                    # A basename is usable only if exactly one item of the expected
+                    # media type has that same normalized basename across the library.
+                    same_base = [item for item in items if target_key and _base_key(item.get("Path")) == target_key]
+                    if len(same_base) == 1:
+                        matched_items = same_base
+                        match_reason = "unique_normalized_basename"
+                    elif len(same_base) > 1:
+                        logger.warning(
+                            f"[JELLYFIN-REFRESH] Ambiguous basename '{os.path.basename(strm_path)}'; "
+                            f"candidates={[item.get('Path') for item in same_base[:8]]}; refusing to refresh"
                         )
-                if not matched_item:
-                    # Fallback 3: Double-year / Part normalization match
-                    # Handles legacy folder drift such as "Aadu 3 (2026) (2026)" vs "Aadu 3 Part 1 (2026)"
-                    def _strip_drift(p):
-                        fn = os.path.basename(str(p or "")).lower()
-                        s = re.sub(r"\((\d{4})\)\s*\(\1\)", r"(\1)", fn)
-                        s = re.sub(r"\bpart\s*\d+\b", "", s)
-                        return re.sub(r"[^a-z0-9]+", "", s)
-                    target_drift = _strip_drift(strm_path)
-                    if target_drift:
-                        matched_item = next(
-                            (
-                                it for it in items
-                                if _strip_drift(it.get("Path")) == target_drift
-                            ),
-                            None,
-                        )
-                if not matched_item:
-                    # Fallback 4: Core title + year matching
-                    parsed_target = parse_media_meta(os.path.splitext(base)[0])
-                    target_title = re.sub(r"[^a-z0-9]+", "", (parsed_target.get("clean_title") or "").lower())
-                    target_year = parsed_target.get("year")
-                    if target_title:
-                        for it in items:
-                            it_path = str(it.get("Path") or "")
-                            it_name = str(it.get("Name") or "")
-                            parsed_it = parse_media_meta(os.path.splitext(os.path.basename(it_path))[0] or it_name)
-                            it_title = re.sub(r"[^a-z0-9]+", "", (parsed_it.get("clean_title") or it_name).lower())
-                            it_year = it.get("ProductionYear") or parsed_it.get("year")
-                            if target_title in it_title or it_title in target_title:
-                                if (not target_year or not it_year) or abs(int(target_year) - int(it_year)) <= 1:
-                                    matched_item = it
-                                    break
-                if not matched_item:
-                    # Every few attempts, nudge a library scan so a freshly
-                    # created/moved .strm is indexed before the next lookup.
+                        return False
+                    else:
+                        matched_items = []
+
+                if not matched_items:
                     if attempt > 0 and attempt % 3 == 0:
                         try:
                             await request_jellyfin_scan()
@@ -3584,38 +3560,48 @@ async def refresh_jellyfin_item_by_path(strm_path, alt_paths=None, retries=12, d
                             pass
                     await asyncio.sleep(delay)
                     continue
+
+                # Do not refresh SeriesId/SeasonId for every episode. That causes
+                # a refresh storm where every episode repeatedly refreshes its
+                # parent series and season while a library scan is running.
                 refresh_params = {
                     "metadataRefreshMode": "FullRefresh",
                     "replaceAllMetadata": "true",
                     "replaceAllImages": "false",
                 }
-                refresh_ids = [matched_item.get("Id")]
-                series_id = matched_item.get("SeriesId")
-                season_id = matched_item.get("SeasonId")
-                if series_id and series_id not in refresh_ids:
-                    refresh_ids.append(series_id)
-                if season_id and season_id not in refresh_ids:
-                    refresh_ids.append(season_id)
-
-                for rid in refresh_ids:
+                all_ok = True
+                for item in matched_items:
+                    item_id = str(item["Id"])
                     try:
                         async with session.post(
-                            f"http://127.0.0.1:8096/Items/{rid}/Refresh",
+                            f"http://127.0.0.1:8096/Items/{item_id}/Refresh",
                             params=refresh_params,
                             headers=headers,
                             timeout=15,
                         ) as response:
-                            pass
-                    except Exception:
-                        pass
-                logger.info(f"[JELLYFIN] Full metadata refresh queued for {os.path.basename(strm_path)} (IDs: {refresh_ids})")
-                return True
+                            if response.status not in (200, 202, 204):
+                                all_ok = False
+                                logger.warning(
+                                    f"[JELLYFIN-REFRESH] Failed status={response.status} item_id={item_id} "
+                                    f"name='{item.get('Name')}' path='{item.get('Path')}'"
+                                )
+                            else:
+                                logger.info(
+                                    f"[JELLYFIN-REFRESH] Accepted item_id={item_id} match={match_reason} "
+                                    f"path='{item.get('Path')}'"
+                                )
+                    except Exception as exc:
+                        all_ok = False
+                        logger.warning(
+                            f"[JELLYFIN-REFRESH] Request failed item_id={item_id}: {type(exc).__name__}"
+                        )
+                return all_ok
         except Exception as exc:
-            logger.info(f"[JELLYFIN] Item refresh attempt {attempt + 1} failed: {type(exc).__name__}")
+            logger.warning(f"[JELLYFIN-REFRESH] Attempt {attempt + 1} failed: {type(exc).__name__}")
         await asyncio.sleep(delay)
-    logger.warning(f"[JELLYFIN] Could not locate/refresh Jellyfin item for {strm_path}")
-    return False
 
+    logger.warning(f"[JELLYFIN-REFRESH] No unambiguous Jellyfin item found for '{strm_path}'; left pending for retry")
+    return False
 
 def extract_version_tag(path: str) -> str:
     """Extract resolution and source edition tags from a media filename (e.g. 1080P BLURAY, 720P WEB-DL)."""
