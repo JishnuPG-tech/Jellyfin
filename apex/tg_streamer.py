@@ -1614,7 +1614,7 @@ async def _fetch_imdb_suggestion(query: str, year: Optional[int] = None, media_t
 
                         total_score = title_score + year_score + rank_score + has_img
                         # Strict confidence gate: require at least 3.2 total score
-                        if total_score >= 3.2:
+                        if total_score >= 4.2:
                             candidates.append((total_score, idx, s))
 
                     if candidates:
@@ -1623,7 +1623,7 @@ async def _fetch_imdb_suggestion(query: str, year: Optional[int] = None, media_t
                         if len(candidates) > 1:
                             top_score = candidates[0][0]
                             second_score = candidates[1][0]
-                            if (top_score - second_score) < 0.15 and candidates[0][2].get("id") != candidates[1][2].get("id"):
+                            if (top_score - second_score) < 0.35 and candidates[0][2].get("id") != candidates[1][2].get("id"):
                                 logger.info(
                                     f"[IMDB-SUGGEST] Ambiguous candidates for '{query}' "
                                     f"('{candidates[0][2].get('l')}' {top_score:.2f} vs '{candidates[1][2].get('l')}' {second_score:.2f}); held for review"
