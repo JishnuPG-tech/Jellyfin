@@ -5860,6 +5860,23 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             if not imdb_hit and parsed.get("title") and parsed["title"] != title:
                 imdb_hit = await _fetch_imdb_suggestion(parsed["title"], year, mtype)
 
+            # Do not rewrite an item from a low-confidence filename guess. A
+            # cached TMDB ID is eligible only after detail validation marked it
+            # _tmdb_verified. Uncertain entries remain playable and are reviewed.
+            if not imdb_hit and not data.get("_tmdb_verified"):
+                review_payload = dict(data)
+                review_payload["_cache_key"] = key
+                _record_review_job(
+                    review_payload,
+                    confidence=0.0,
+                    reason="reindex_identity_unverified",
+                )
+                logger.warning(
+                    f"[IMDB-REINDEX] Preserving existing metadata/path for '{raw_name}': "
+                    "no confident IMDb match and no verified TMDB identity; queued for review/enrichment"
+                )
+                continue
+
             official_title = (imdb_hit.get("l") if imdb_hit else None) or title
             official_year = (imdb_hit.get("y") if imdb_hit else None) or year
             imdb_id = (imdb_hit.get("id") if imdb_hit else None) or data.get("imdb_id")
@@ -6370,6 +6387,7 @@ async def _reconcile_and_upgrade_library():
             # Only enrich if truly missing TMDB identity or completely missing poster/backdrop
             needs_hd = (
                 not data.get("tmdb_id")
+                or not data.get("_tmdb_verified")
                 or not has_valid_poster
                 or not has_valid_backdrop
             )
