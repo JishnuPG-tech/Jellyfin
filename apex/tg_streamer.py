@@ -1938,6 +1938,99 @@ def _strip_known_release_group_prefix(name: str) -> str:
     return text
 
 
+def _move_tracked_strm_and_sidecars(old_strm_path: str, new_strm_path: str) -> bool:
+    """Move one tracked STRM and only its owned sidecars, never overwrite conflicts.
+
+    Shared artwork/NFO files move only when the source folder has one STRM.
+    In multi-episode / multi-version folders, only basename-specific NFOs and
+    subtitles move. A conflict stays in place and is sent to review.
+    """
+    old_path = os.path.normpath(str(old_strm_path or ""))
+    new_path = os.path.normpath(str(new_strm_path or ""))
+    if not old_path or not new_path or old_path == new_path or not os.path.isfile(old_path):
+        return False
+    if os.path.lexists(new_path):
+        logger.warning(f"[STRM-MIGRATE] Destination exists; preserving both paths: '{old_path}' -> '{new_path}'")
+        return False
+
+    old_dir, new_dir = os.path.dirname(old_path), os.path.dirname(new_path)
+    old_base = os.path.splitext(os.path.basename(old_path))[0]
+    new_base = os.path.splitext(os.path.basename(new_path))[0]
+    try:
+        siblings = os.listdir(old_dir)
+        sibling_strms = [
+            name for name in siblings
+            if name.lower().endswith(".strm") and os.path.isfile(os.path.join(old_dir, name))
+        ]
+    except OSError as exc:
+        logger.warning(f"[STRM-MIGRATE] Cannot inspect source directory '{old_dir}': {exc}")
+        return False
+
+    try:
+        os.makedirs(new_dir, exist_ok=True)
+        shutil.move(old_path, new_path)
+        logger.info(f"[STRM-MIGRATE] Moved tracked pointer '{old_path}' -> '{new_path}'")
+    except Exception as exc:
+        logger.warning(f"[STRM-MIGRATE] STRM move failed '{old_path}' -> '{new_path}': {exc}")
+        return False
+
+    shared_sidecars = {
+        "movie.nfo", "tvshow.nfo", "poster.jpg", "folder.jpg", "thumb.jpg",
+        "backdrop.jpg", "fanart.jpg", "landscape.jpg", "logo.png", "clearlogo.png",
+        "season01-poster.jpg", "season-all-poster.jpg", ".art-best-effort",
+    }
+    subtitle_exts = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".sbv"}
+    for filename in siblings:
+        source = os.path.join(old_dir, filename)
+        if not os.path.isfile(source):
+            continue
+        low = filename.casefold()
+        source_base, source_ext = os.path.splitext(filename)
+        basename_owned = (
+            source_base.casefold() == old_base.casefold()
+            or source_base.casefold().startswith(old_base.casefold() + ".")
+        )
+        shared_owned = len(sibling_strms) == 1 and (
+            low in shared_sidecars or re.fullmatch(r"backdrop\d+\.jpg", low)
+        )
+        if not basename_owned and not shared_owned:
+            continue
+        if basename_owned and source_ext.casefold() in subtitle_exts:
+            # Rename matching subtitles to the new STRM basename while preserving language/forced tags.
+            suffix = filename[len(old_base):]
+            destination_name = new_base + suffix
+        elif basename_owned and source_ext.casefold() == ".nfo":
+            destination_name = new_base + ".nfo"
+        else:
+            destination_name = filename
+        destination = os.path.join(new_dir, destination_name)
+        if os.path.normpath(source) == os.path.normpath(destination):
+            continue
+        if os.path.lexists(destination):
+            logger.warning(
+                f"[STRM-MIGRATE] Sidecar conflict; preserving both copies: '{source}' -> '{destination}'"
+            )
+            try:
+                _record_review_job(
+                    {"source_path": source, "destination_path": destination, "strm_path": new_path},
+                    confidence=0.0,
+                    reason="strm_sidecar_destination_conflict",
+                )
+            except Exception:
+                pass
+            continue
+        try:
+            shutil.move(source, destination)
+            logger.info(f"[STRM-MIGRATE] Moved sidecar '{source}' -> '{destination}'")
+        except Exception as exc:
+            logger.warning(f"[STRM-MIGRATE] Sidecar move failed '{source}' -> '{destination}': {exc}")
+    try:
+        os.rmdir(old_dir)
+    except OSError:
+        pass
+    return True
+
+
 def _move_legacy_folder_contents_preserving_conflicts(
     source_dir: str, target_dir: str, preferred_strm_name: Optional[str] = None
 ) -> Dict[str, str]:
