@@ -10,7 +10,7 @@ import os
 import re
 import shutil
 import uuid
-from typing import Optional
+from typing import Optional, Dict
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "tg_streamer.py"
