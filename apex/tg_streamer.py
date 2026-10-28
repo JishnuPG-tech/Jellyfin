@@ -5520,6 +5520,31 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
     files and directories to the review queue without deleting, and forces item-level Jellyfin refreshes.
     """
     logger.info(f"[IMDB-REINDEX] Starting full IMDb re-indexing pass (force_all={force_all})...")
+
+    def _write_text_if_changed(path, content):
+        """Atomically write a text file only when its contents actually change."""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        try:
+            with open(path, "r", encoding="utf-8") as current:
+                if current.read() == content:
+                    return False
+        except (OSError, UnicodeError):
+            pass
+        tmp_path = f"{path}.tmp.{os.getpid()}.{id(content)}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(tmp_path, path)
+            return True
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
     # Step 1: Scan untracked stream pointers and directories on disk (route to review queue; clean genuinely empty folders)
     valid_dirs = set()
     valid_strms = set()
@@ -5598,6 +5623,10 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
         for key, data in list(FILE_ID_CACHE.items()):
             if not isinstance(data, dict):
                 continue
+            previous_imdb_id = data.get("imdb_id")
+            previous_title = data.get("title") or data.get("clean_title") or ""
+            previous_year = data.get("year")
+            schema_needs_reconcile = data.get("_library_reconcile_version") != 2
             raw_name = data.get("file_name") or data.get("raw_name") or data.get("title") or ""
             raw_lower = raw_name.lower()
             parsed = parse_media_meta(raw_name)
@@ -5632,7 +5661,25 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             overview = (c_meta.get("description") if c_meta else None) or data.get("overview") or ""
             genres = (c_meta.get("genres") if c_meta else None) or []
 
-            # Update cache data
+            # Compare against the persisted identity BEFORE updating it. The old
+            # implementation read old_imdb after assigning the new ID, making
+            # identity changes invisible and allowing stale artwork to survive.
+            old_target = data.get("target_dir")
+            old_imdb = previous_imdb_id
+            identity_changed = bool(
+                schema_needs_reconcile
+                or (previous_imdb_id and imdb_id and str(previous_imdb_id) != str(imdb_id))
+                or (previous_title and official_title and str(previous_title).strip().casefold() != str(official_title).strip().casefold())
+                or (previous_year and official_year and str(previous_year) != str(official_year))
+            )
+
+            # A cached TMDB ID that has not been validated against the current
+            # IMDb identity must not be written into a new NFO as authoritative.
+            if previous_imdb_id and imdb_id and str(previous_imdb_id) != str(imdb_id):
+                data.pop("tmdb_id", None)
+                data.pop("tmdb_title", None)
+                data.pop("tmdb_year", None)
+                data.pop("_tmdb_verified", None)
             data["title"] = official_title
             data["clean_title"] = official_title
             data["language"] = lang
@@ -5644,9 +5691,6 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                 data["poster_url"] = str(poster_url)
             if backdrop_url:
                 data["backdrop_url"] = str(backdrop_url)
-
-            old_target = data.get("target_dir")
-            old_imdb = data.get("imdb_id")
             if is_tv:
                 s_num = int(season or data.get("season") or 1)
                 e_num = int(episode or data.get("episode") or 1)
@@ -5694,8 +5738,7 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             cid = data.get("chat_id") or _chat
             mid = data.get("msg_id") or _msg
             strm_content = _stream_url(cid, mid)
-            with open(new_strm_path, "w", encoding="utf-8") as sf:
-                sf.write(strm_content)
+            strm_changed = _write_text_if_changed(new_strm_path, strm_content)
 
             # Write NFO file
             nfo_detail = {
@@ -5708,7 +5751,8 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                 "year": official_year or "",
                 "overview": overview,
                 "imdb_id": imdb_id or "",
-                "id": data.get("tmdb_id") or "",
+                # Never serialize an unverified cache ID into an authoritative NFO.
+                "id": data.get("tmdb_id") if data.get("_tmdb_verified") else "",
                 "genres": [{"name": g} if isinstance(g, str) else g for g in genres] if genres else [],
             }
             if is_tv:
@@ -5726,24 +5770,18 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                 with open(ep_nfo, "w", encoding="utf-8") as nf:
                     nf.write(build_episode_nfo(ep_detail))
             else:
+                nfo_changed = False
                 for nfo_p in (os.path.join(target_dir, f"{new_strm_base}.nfo"), os.path.join(target_dir, "movie.nfo")):
-                    with open(nfo_p, "w", encoding="utf-8") as nf:
-                        nf.write(build_movie_nfo(nfo_detail))
+                    nfo_changed = _write_text_if_changed(nfo_p, build_movie_nfo(nfo_detail)) or nfo_changed
 
             # Download genuine Amazon poster & backdrop
             art_dir = show_root if is_tv else target_dir
-            if force_all or (old_imdb and imdb_id and old_imdb != imdb_id):
-                for stale_art in ("poster.jpg", "folder.jpg", "thumb.jpg", "backdrop.jpg", "fanart.jpg", "landscape.jpg", "season01-poster.jpg", "season-all-poster.jpg"):
-                    for check_dir in (art_dir, target_dir):
-                        stale_p = os.path.join(check_dir, stale_art)
-                        if os.path.exists(stale_p):
-                            try:
-                                os.remove(stale_p)
-                            except OSError:
-                                pass
+            # Preserve current artwork until a validated replacement downloads
+            # successfully. Deleting it before a network fetch can leave a good
+            # poster/backdrop permanently missing when the provider is unavailable.
             if poster_url:
                 p_dst = os.path.join(art_dir, "poster.jpg")
-                if force_all or not os.path.exists(p_dst) or os.path.getsize(p_dst) < 15000:
+                if force_all or identity_changed or not os.path.exists(p_dst) or os.path.getsize(p_dst) < 15000:
                     if await _download_image(session, poster_url, p_dst):
                         for copy_name in ("folder.jpg", "thumb.jpg"):
                             try:
@@ -5766,7 +5804,7 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                                     pass
             if backdrop_url:
                 b_dst = os.path.join(art_dir, "backdrop.jpg")
-                if force_all or not os.path.exists(b_dst) or os.path.getsize(b_dst) < 15000:
+                if force_all or identity_changed or not os.path.exists(b_dst) or os.path.getsize(b_dst) < 15000:
                     if await _download_image(session, backdrop_url, b_dst):
                         for copy_name in ("fanart.jpg", "landscape.jpg"):
                             try:
@@ -5775,27 +5813,48 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                             except Exception:
                                 pass
 
+            # Persist a schema marker and a durable refresh-pending bit. This makes
+            # a failed/ambiguous item refresh retry on the next reconciliation,
+            # while a stable file stops being rewritten on every restart.
+            data["_library_reconcile_version"] = 2
+            data["metadata_refresh_pending"] = bool(
+                data.get("metadata_refresh_pending")
+                or force_all
+                or schema_needs_reconcile
+                or identity_changed
+                or strm_changed
+                or nfo_changed
+            )
             FILE_ID_CACHE[key] = data
-            refreshed_paths.append(new_strm_path)
+            if data["metadata_refresh_pending"]:
+                refreshed_paths.append((new_strm_path, key))
             updated_count += 1
-            logger.info(f"[IMDB-REINDEX] Successfully re-indexed '{official_title}' ({official_year}) [{imdb_id}]")
+            logger.info(
+                f"[IMDB-REINDEX] Reconciled '{official_title}' ({official_year}) [{imdb_id}] "
+                f"strm_changed={strm_changed} nfo_changed={nfo_changed} identity_changed={identity_changed}"
+            )
 
         await save_cache_async()
 
-    # Step 3: Deduplicate & purge stale items from Jellyfin SQLite DB
-    await deduplicate_jellyfin_items()
-
-    # Step 4: Batch trigger single Jellyfin scan after reindexing completes
+    # Trigger one scan after filesystem writes. Do not deduplicate against
+    # Jellyfin's old path index before its scan has observed the new paths.
     await request_jellyfin_scan()
 
-    # Step 5: Refresh newly created / updated items with bounded concurrency
+    # Refresh only pending/changed items, with bounded concurrency. Clear the
+    # durable pending bit only when Jellyfin accepts the item refresh request.
     async def _bounded_refreshes():
         sem = asyncio.Semaphore(4)
-        async def _one(p):
+        async def _one(path_and_key):
+            path, cache_key = path_and_key
             async with sem:
-                await refresh_jellyfin_item_by_path(p, retries=2, delay=2.0)
-        await asyncio.gather(*(_one(p) for p in refreshed_paths), return_exceptions=True)
-    asyncio.create_task(_bounded_refreshes())
+                ok = await refresh_jellyfin_item_by_path(path, retries=2, delay=2.0)
+                if ok and isinstance(FILE_ID_CACHE.get(cache_key), dict):
+                    FILE_ID_CACHE[cache_key]["metadata_refresh_pending"] = False
+        await asyncio.gather(*(_one(pair) for pair in refreshed_paths), return_exceptions=True)
+        if refreshed_paths:
+            await save_cache_async()
+    if refreshed_paths:
+        asyncio.create_task(_bounded_refreshes())
 
     logger.info(f"[IMDB-REINDEX] Completed full IMDb re-indexing of {updated_count} media items.")
     return updated_count
