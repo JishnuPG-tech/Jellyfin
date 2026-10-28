@@ -2542,8 +2542,11 @@ async def _enrich_media_metadata(entry):
                     c_meta = await _fetch_cinemeta_meta(imdb_id, media_type)
                     poster_u = (imdb_cand.get("i") or {}).get("imageUrl") or (c_meta.get("poster") if c_meta else None)
                     backdrop_u = (c_meta.get("background") if c_meta else None) or poster_u
+                    # IMDb identifiers are not TMDB identifiers. If Cinemeta
+                    # has no TMDB cross-reference, keep it unset rather than
+                    # synthesizing a false numeric TMDB ID from the IMDb string.
                     hit = {
-                        "id": (c_meta.get("moviedb_id") if c_meta else None) or int(re.sub(r"\D", "", imdb_id)[:8]),
+                        "id": (c_meta.get("moviedb_id") if c_meta else None),
                         "imdb_id": imdb_id,
                         "title": (c_meta.get("name") if c_meta else None) or imdb_cand.get("l") or clean_search,
                         "original_title": imdb_cand.get("l") or clean_search,
@@ -2558,73 +2561,25 @@ async def _enrich_media_metadata(entry):
             except Exception as _exc:
                 logger.debug(f"[IMDB-FALLBACK] Notice: {_exc}")
 
-        # AI-tier-3: parsing + TMDB all failed but the AI resolved a canonical
-        # title. Publish a minimal NFO so Jellyfin shows the correct name instead
-        # of the release-junk folder name; posters are written only when TMDB
-        # data exists.
+        # Fail closed when no authoritative provider match exists. Do not create
+        # a locked NFO with blank IDs based solely on an AI-generated title: that
+        # turns an uncertain guess into persistent, apparently authoritative data.
         if not hit:
-            if ai_title and target_dir:
-                os.makedirs(target_dir, exist_ok=True)
-                base_date = f"{ai_year}-01-01" if ai_year else ""
-                minimal = {
-                    "title": ai_title,
-                    "original_title": ai_title,
-                    "release_date": base_date,
-                    "vote_average": "",
-                    "vote_count": "",
-                    "runtime": "",
-                    "overview": "",
-                    "tagline": "",
-                    "imdb_id": "",
-                    "id": "",
-                    "genres": [],
-                    "production_countries": [],
-                }
-                if is_tv:
-                    nfo_root = show_root or target_dir
-                    os.makedirs(nfo_root, exist_ok=True)
-                    nfo_path = os.path.join(nfo_root, "tvshow.nfo")
-                    if not os.path.exists(nfo_path):
-                        with open(nfo_path, "w", encoding="utf-8") as f:
-                            f.write(build_tvshow_nfo({
-                                **minimal,
-                                "name": ai_title,
-                                "original_name": ai_title,
-                                "first_air_date": base_date,
-                                "episode_run_time": [],
-                            }))
-                else:
-                    nfo_path = os.path.join(
-                        target_dir, f"{entry.get('strm_base', strm_base(entry))}.nfo"
-                    )
-                    if not os.path.exists(nfo_path):
-                        with open(nfo_path, "w", encoding="utf-8") as f:
-                            f.write(build_movie_nfo(minimal))
-                prev = FILE_ID_CACHE.get(key)
-                if isinstance(prev, dict):
-                    prev["tmdb_title"] = ai_title
-                    prev["tmdb_year"] = ai_year
-                    FILE_ID_CACHE[key] = prev
-                    await save_cache_async()
-                logger.info(f"[AI-FALLBACK] Published canonical title '{ai_title}' (no TMDB match)")
-                try:
-                    if entry.get("strm_path"):
-                        asyncio.create_task(
-                            refresh_jellyfin_item_by_path(
-                                entry.get("strm_path"),
-                                alt_paths=([entry["_prev_strm_path"]] if entry.get("_prev_strm_path") else []),
-                            )
-                        )
-                    else:
-                        asyncio.create_task(request_jellyfin_scan())
-                except Exception as scan_exc:
-                    logger.warning(f"[TMDB] Metadata published but Jellyfin refresh failed: {scan_exc}")
-                return True
-            _record_review_job(entry, confidence=0.0, reason=f"unmatched_query:{query}")
+            _record_review_job(
+                {
+                    **entry,
+                    "candidate_title": ai_title,
+                    "candidate_year": ai_year,
+                    "query": query,
+                    "candidate_results": candidates,
+                },
+                confidence=0.0,
+                reason="unverified_identity_no_provider_match",
+            )
             logger.warning(
-                f"[TMDB] No confident match for '{query}' (tv={is_tv}, year={entry.get('year')}, "
-                f"lang={entry.get('language') or '-'}, candidates={candidates}); "
-                "held in review queue to prevent incorrect library publication."
+                f"[TMDB] No authoritative provider match for '{query}' "
+                f"(tv={is_tv}, year={entry.get('year')}, lang={entry.get('language') or '-'}); "
+                "leaving existing NFO/artwork untouched and routing to review."
             )
             return False
 
@@ -2956,18 +2911,28 @@ async def _enrich_media_metadata(entry):
                 await save_subtitle_cache_async()
         except Exception as sub_exc:
             logger.warning(f"[SUBTITLE-AUTO] Notice injecting subtitles: {sub_exc}")
-        # The ingest scan may have happened before TMDB enrichment completed,
-        # and the debounced /Library/Refresh can be dropped by the 15s coalesce
-        # window. Force an item-level FullRefresh (by .strm path) so Jellyfin
-        # re-reads the freshly written NFO + poster instead of keeping the
-        # provisional folder-name identity. Runs in a background task so
-        # enrichment never waits on Jellyfin.
+        # The ingest scan may have happened before enrichment completed. Refresh
+        # only the exact item and verify its expected identity after Jellyfin
+        # accepts the refresh request. TV episodes are verified against parent
+        # series IDs and the episode/season indexes separately.
         try:
             if entry.get("strm_path"):
+                refresh_title = (
+                    detail.get("name") or detail.get("title")
+                    if is_tv else detail.get("title") or detail.get("name")
+                ) or entry.get("title")
+                refresh_year = _tmdb_year(detail) or entry.get("year")
                 asyncio.create_task(
                     refresh_jellyfin_item_by_path(
                         entry.get("strm_path"),
                         alt_paths=([entry["_prev_strm_path"]] if entry.get("_prev_strm_path") else []),
+                        expected_title=refresh_title,
+                        expected_year=refresh_year,
+                        expected_tmdb_id=tmdb_id,
+                        expected_imdb_id=imdb_id,
+                        expected_is_tv=is_tv,
+                        expected_season=entry.get("season") if is_tv else None,
+                        expected_episode=entry.get("episode") if is_tv else None,
                     )
                 )
             else:
