@@ -3020,6 +3020,8 @@ async def _enrich_media_metadata(entry):
                 ):
                     if _field in entry:
                         prev[_field] = entry[_field]
+                if "_force_art_refresh" not in entry:
+                    prev.pop("_force_art_refresh", None)
             prev["canonical_key"] = _canonical_media_key(prev)
             FILE_ID_CACHE[key] = prev
             await save_cache_async()
