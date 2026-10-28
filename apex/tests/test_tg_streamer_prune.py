@@ -1304,3 +1304,95 @@ def test_choose_safe_strm_path_preserves_existing_source_and_reuses_its_variant(
     assert path2 == path
     assert should_write2 is False
     assert canonical.read_text(encoding="utf-8") == original_url
+
+
+def test_refresh_tv_episode_verifies_parent_series_identity(tmp_path):
+    tree = ast.parse(SRC.read_text(encoding="utf-8"))
+    node = next(
+        n for n in tree.body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "refresh_jellyfin_item_by_path"
+    )
+    episode_path = tmp_path / "TV Shows" / "Loki" / "Season 02" / "Loki - S02E01.strm"
+    episode_path.parent.mkdir(parents=True)
+    episode_path.write_text("http://stream/-100/501", encoding="utf-8")
+    items = [{
+        "Id": "episode-1",
+        "Name": "Some Episode Name",
+        "Type": "Episode",
+        "Path": str(episode_path),
+        "SeriesId": "series-1",
+        "ParentIndexNumber": 2,
+        "IndexNumber": 1,
+        "ProviderIds": {},
+    }]
+    episode = dict(items[0])
+    series = {
+        "Id": "series-1",
+        "Name": "Loki",
+        "ProductionYear": 2023,
+        "ProviderIds": {"Tmdb": "84958", "Imdb": "tt9140554"},
+    }
+    posted = []
+
+    class MockResponse:
+        def __init__(self, status=200, json_data=None):
+            self.status = status
+            self._json = json_data or {}
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def json(self): return self._json
+
+    class MockSession:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url.endswith("/Items"):
+                return MockResponse(200, {"Items": items})
+            if url.endswith("/Items/episode-1"):
+                return MockResponse(200, episode)
+            if url.endswith("/Items/series-1"):
+                return MockResponse(200, series)
+            return MockResponse(404, {})
+        def post(self, url, params=None, headers=None, timeout=None):
+            posted.append(url)
+            return MockResponse(204)
+
+    class MockAiohttp:
+        class TCPConnector:
+            def __init__(self, *a, **k): pass
+        ClientSession = MockSession
+
+    import socket
+    ns = {
+        "logger": type("_Sink", (), {
+            "info": lambda *a, **k: None,
+            "warning": lambda *a, **k: None,
+            "error": lambda *a, **k: None,
+        })(),
+        "os": os,
+        "re": re,
+        "socket": socket,
+        "aiohttp": MockAiohttp(),
+        "asyncio": asyncio,
+        "_jellyfin_auth_header": lambda: {"X-Emby-Token": "test-token"},
+        "_read_jellyfin_api_key": lambda: "test-token",
+        "_record_review_job": lambda *a, **k: None,
+    }
+    exec(compile(ast.Module([node], []), "<ast>", "exec"), ns)
+    ok = asyncio.run(
+        ns["refresh_jellyfin_item_by_path"](
+            str(episode_path),
+            retries=1,
+            delay=0,
+            expected_title="Loki",
+            expected_year=2023,
+            expected_tmdb_id=84958,
+            expected_imdb_id="tt9140554",
+            expected_is_tv=True,
+            expected_season=2,
+            expected_episode=1,
+        )
+    )
+    assert ok is True
+    assert posted == ["http://127.0.0.1:8096/Items/episode-1/Refresh"]
