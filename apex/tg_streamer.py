@@ -2186,6 +2186,11 @@ async def _enrich_media_metadata(entry):
     if not isinstance(entry, dict) or not entry.get("title"):
         return False
     key = entry.get("_cache_key") or ""
+    identity_before_enrichment = {
+        field: entry.get(field)
+        for field in ("title", "year", "tmdb_id", "imdb_id", "poster_url", "backdrop_url")
+    }
+    artwork_update_failed = False
     try:
         is_tv = bool(entry.get("is_tv"))
         target_dir = entry.get("target_dir")
