@@ -5641,6 +5641,123 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             except OSError:
                 pass
 
+    def _move_managed_strm(old_path, new_path, expected_content, chat_id, message_id):
+        """Move only the .strm pointer proven to reference this Telegram message.
+
+        The target is never overwritten. Existing subtitle/NFO sidecars move only
+        when their destination is absent (or byte-identical); unrelated files and
+        folder-level artwork are left untouched.
+        """
+        if not old_path or not os.path.isfile(old_path):
+            return True
+        old_abs = os.path.normcase(os.path.abspath(old_path))
+        new_abs = os.path.normcase(os.path.abspath(new_path))
+        if old_abs == new_abs:
+            return True
+        try:
+            with open(old_path, "r", encoding="utf-8", errors="ignore") as fh:
+                old_content = fh.read().strip()
+        except OSError as exc:
+            logger.warning(f"[PATH-MIGRATION] Cannot read old pointer '{old_path}': {exc}")
+            return False
+        expected = str(expected_content or "").strip()
+        has_same_message = (
+            old_content == expected
+            or f"/{chat_id}:{message_id}/" in old_content
+            or f"message_id={message_id}" in old_content and str(chat_id) in old_content
+        )
+        if not has_same_message:
+            logger.warning(
+                f"[PATH-MIGRATION] Refusing to move pointer with different source identity: '{old_path}'"
+            )
+            return False
+
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+        if os.path.exists(new_path):
+            try:
+                with open(new_path, "r", encoding="utf-8", errors="ignore") as fh:
+                    destination_content = fh.read().strip()
+            except OSError:
+                destination_content = ""
+            if not destination_content or not (
+                destination_content == expected
+                or f"/{chat_id}:{message_id}/" in destination_content
+                or (f"message_id={message_id}" in destination_content and str(chat_id) in destination_content)
+            ):
+                logger.warning(
+                    f"[PATH-MIGRATION] Destination belongs to a different source; preserving both: "
+                    f"'{old_path}' -> '{new_path}'"
+                )
+                return False
+            try:
+                os.remove(old_path)  # identical .strm pointer only; underlying Telegram media is untouched
+                logger.info(f"[PATH-MIGRATION] Coalesced identical source pointer '{old_path}' into '{new_path}'")
+            except OSError as exc:
+                logger.warning(f"[PATH-MIGRATION] Could not coalesce duplicate pointer '{old_path}': {exc}")
+                return False
+        else:
+            try:
+                shutil.move(old_path, new_path)
+                logger.info(f"[PATH-MIGRATION] Moved managed .strm '{old_path}' -> '{new_path}'")
+            except Exception as exc:
+                logger.warning(f"[PATH-MIGRATION] Move failed '{old_path}' -> '{new_path}': {exc}")
+                return False
+
+        old_dir = os.path.dirname(old_path)
+        old_stem = os.path.splitext(os.path.basename(old_path))[0]
+        new_stem = os.path.splitext(os.path.basename(new_path))[0]
+        safe_sidecar_exts = {".nfo", ".srt", ".ass", ".ssa", ".vtt", ".sub", ".sbv", ".smi", ".idx", ".sup"}
+        try:
+            names = os.listdir(old_dir)
+        except OSError:
+            names = []
+        for sidecar_name in names:
+            if not sidecar_name.startswith(old_stem + "."):
+                continue
+            extension = os.path.splitext(sidecar_name)[1].lower()
+            if extension not in safe_sidecar_exts:
+                continue
+            old_sidecar = os.path.join(old_dir, sidecar_name)
+            if not os.path.isfile(old_sidecar):
+                continue
+            new_sidecar = os.path.join(os.path.dirname(new_path), new_stem + sidecar_name[len(old_stem):])
+            if os.path.exists(new_sidecar):
+                if _same_file_bytes(old_sidecar, new_sidecar):
+                    try:
+                        os.remove(old_sidecar)
+                    except OSError:
+                        pass
+                else:
+                    _record_review_job(
+                        {"source_path": old_sidecar, "destination_path": new_sidecar},
+                        confidence=0.0,
+                        reason="path_migration_sidecar_conflict",
+                    )
+                continue
+            try:
+                shutil.move(old_sidecar, new_sidecar)
+            except Exception as exc:
+                logger.warning(f"[PATH-MIGRATION] Sidecar move deferred '{old_sidecar}': {type(exc).__name__}")
+        try:
+            os.rmdir(old_dir)
+        except OSError:
+            pass
+        return True
+
+    def _same_file_bytes(left, right):
+        try:
+            if os.path.getsize(left) != os.path.getsize(right):
+                return False
+            with open(left, "rb") as lf, open(right, "rb") as rf:
+                while True:
+                    lb, rb = lf.read(1024 * 1024), rf.read(1024 * 1024)
+                    if lb != rb:
+                        return False
+                    if not lb:
+                        return True
+        except OSError:
+            return False
+
     # Step 1: Scan untracked stream pointers and directories on disk (route to review queue; clean genuinely empty folders)
     valid_dirs = set()
     valid_strms = set()
@@ -5722,6 +5839,8 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             previous_imdb_id = data.get("imdb_id")
             previous_title = data.get("title") or data.get("clean_title") or ""
             previous_year = data.get("year")
+            previous_strm_path = data.get("strm_path")
+            original_data = dict(data)
             schema_needs_reconcile = data.get("_library_reconcile_version") != 2
             raw_name = data.get("file_name") or data.get("raw_name") or data.get("title") or ""
             raw_lower = raw_name.lower()
@@ -5834,6 +5953,21 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             cid = data.get("chat_id") or _chat
             mid = data.get("msg_id") or _msg
             strm_content = _stream_url(cid, mid)
+            if previous_strm_path and os.path.normcase(os.path.abspath(previous_strm_path)) != os.path.normcase(os.path.abspath(new_strm_path)):
+                if not _move_managed_strm(previous_strm_path, new_strm_path, strm_content, cid, mid):
+                    _record_review_job(
+                        {
+                            "file_name": raw_name,
+                            "source_path": previous_strm_path,
+                            "target_path": new_strm_path,
+                            "chat_id": cid,
+                            "msg_id": mid,
+                        },
+                        confidence=0.0,
+                        reason="managed_path_migration_conflict",
+                    )
+                    FILE_ID_CACHE[key] = original_data
+                    continue
             strm_changed = _write_text_if_changed(new_strm_path, strm_content)
 
             # Write NFO file
