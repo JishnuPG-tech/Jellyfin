@@ -3358,35 +3358,31 @@ def _create_strm_file_sync(entry):
         show_root = tv_show_root(SHOWS_DIR, language, show_name, year)
         os.makedirs(show_root, exist_ok=True)
     os.makedirs(target_dir, exist_ok=True)
-    strm_filename = f"{strm_base_name}.strm"
-
-    strm_path = os.path.join(target_dir, strm_filename)
     if chat_id:
         stream_url = _stream_url(chat_id, msg_id)
     else:
         stream_url = f"http://127.0.0.1:{PORT}/stream_file?file_id={file_id}&message_id={msg_id}&filename={clean_title}.mp4"
 
-    # Avoid rewriting unchanged .strm files to prevent Jellyfin filesystem watcher
-    # from detecting file change and pruning extracted metadata & posters.
-    if os.path.exists(strm_path) and os.path.getsize(strm_path) > 10:
+    # Never overwrite a different Telegram upload at the same title/year path.
+    strm_base_name, strm_path, should_write = _choose_safe_strm_path(
+        entry, target_dir, strm_base_name, stream_url
+    )
+    strm_filename = os.path.basename(strm_path)
+    entry["strm_base"] = strm_base_name
+    if should_write:
+        tmp_path = f"{strm_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         try:
-            with open(strm_path, "r", encoding="utf-8") as f:
-                existing_content = f.read().strip()
-            if existing_content == stream_url:
-                entry["target_dir"] = target_dir
-                entry["show_root"] = show_root
-                entry["strm_base"] = strm_base_name
-                entry["strm_path"] = strm_path
-                return strm_filename, target_dir, show_root
-        except Exception:
-            pass
-
-    tmp_path = f"{strm_path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.write(stream_url)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, strm_path)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(stream_url)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, strm_path)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
 
     entry["target_dir"] = target_dir
     entry["show_root"] = show_root
@@ -3539,7 +3535,9 @@ async def purge_media_item(
             try:
                 remaining = os.listdir(target_dir)
                 known_app_nfo = {"movie.nfo", "tvshow.nfo"}
-                if remaining and all(f.lower() in known_app_nfo or f.lower().endswith(".nfo") for f in remaining):
+                if strm_path:
+                    known_app_nfo.add(f"{os.path.splitext(os.path.basename(strm_path))[0]}.nfo".lower())
+                if remaining and all(f.lower() in known_app_nfo for f in remaining):
                     for sf in remaining:
                         try:
                             os.remove(os.path.join(target_dir, sf))
@@ -3787,6 +3785,99 @@ def extract_version_tag(path: str) -> str:
                 tags.append(codec.upper())
                 break
     return " ".join(tags)
+
+
+def _stream_source_identity(value: str):
+    """Extract the stable Telegram source identity from a local stream URL."""
+    text = str(value or "").strip()
+    parsed = urllib.parse.urlparse(text)
+    match = re.search(r"/stream/(-?\d+)/(\d+)(?:/|$)", parsed.path)
+    if match:
+        return ("chat-message", match.group(1), match.group(2))
+    query = urllib.parse.parse_qs(parsed.query)
+    message_id = (query.get("message_id") or query.get("msg_id") or [""])[0]
+    chat_id = (query.get("chat_id") or [""])[0]
+    file_id = (query.get("file_id") or [""])[0]
+    if message_id and chat_id:
+        return ("chat-message", str(chat_id), str(message_id))
+    if message_id and file_id:
+        return ("file-message", str(file_id), str(message_id))
+    return None
+
+
+def _choose_safe_strm_path(entry: Dict, target_dir: str, requested_base: str, stream_url: str):
+    """Select a .strm path without overwriting another Telegram source.
+
+    If the canonical title path is occupied by another source, create a Jellyfin
+    alternate-version filename using release quality/source tags, then a stable
+    source-ID suffix if needed. Returns (actual_base, path, should_write).
+    """
+    os.makedirs(target_dir, exist_ok=True)
+    canonical_path = os.path.join(target_dir, f"{requested_base}.strm")
+    if not os.path.exists(canonical_path):
+        return requested_base, canonical_path, True
+
+    try:
+        with open(canonical_path, "r", encoding="utf-8", errors="ignore") as f:
+            existing = f.read().strip()
+    except OSError:
+        existing = ""
+
+    if existing == str(stream_url or "").strip():
+        return requested_base, canonical_path, False
+
+    current_identity = _stream_source_identity(stream_url)
+    existing_identity = _stream_source_identity(existing)
+    if current_identity and existing_identity == current_identity:
+        # Same Telegram message, only the local URL format/host changed.
+        return requested_base, canonical_path, True
+
+    release_name = (
+        entry.get("file_name")
+        or entry.get("raw_name")
+        or entry.get("caption")
+        or entry.get("title")
+        or ""
+    )
+    version_tag = extract_version_tag(str(release_name))
+    source_id = re.sub(r"[^A-Za-z0-9]+", "-", f"{entry.get('chat_id') or 'chat'}-{entry.get('msg_id') or entry.get('file_id') or 'source'}").strip("-")
+    suffixes = []
+    if version_tag:
+        suffixes.append(version_tag)
+        suffixes.append(f"{version_tag} - SOURCE-{source_id}")
+    suffixes.append(f"ALT-{source_id}")
+    # Deterministic numbered fallbacks prevent a third release from clobbering
+    # a previously preserved variant with the same resolution/source tags.
+    suffixes.extend(f"ALT-{source_id}-{index}" for index in range(2, 12))
+
+    seen = set()
+    for suffix in suffixes:
+        suffix = re.sub(r'[<>:"/\\\\|?*\\x00-\\x1f]+', "", str(suffix)).strip(" ._-")
+        suffix = re.sub(r"\\s+", " ", suffix)
+        if not suffix or suffix.casefold() in seen:
+            continue
+        seen.add(suffix.casefold())
+        variant_base = f"{requested_base} - {suffix}"
+        variant_path = os.path.join(target_dir, f"{variant_base}.strm")
+        if not os.path.exists(variant_path):
+            logger.warning(
+                f"[STRM-VERSION] Canonical path occupied by another source; preserving alternate release at '{variant_path}'"
+            )
+            return variant_base, variant_path, True
+        try:
+            with open(variant_path, "r", encoding="utf-8", errors="ignore") as f:
+                variant_content = f.read().strip()
+        except OSError:
+            variant_content = ""
+        if variant_content == str(stream_url or "").strip():
+            return variant_base, variant_path, False
+        variant_identity = _stream_source_identity(variant_content)
+        if current_identity and variant_identity == current_identity:
+            return variant_base, variant_path, True
+
+    # Extremely unlikely fallback: a UUID suffix prevents destructive overwrite.
+    variant_base = f"{requested_base} - ALT-{source_id}-{uuid.uuid4().hex[:8]}"
+    return variant_base, os.path.join(target_dir, f"{variant_base}.strm"), True
 
 
 async def deduplicate_jellyfin_items():
@@ -6085,10 +6176,7 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
 
 
 def migrate_double_year_folders(library_root: str):
-    """Find and safely migrate legacy duplicate-year folders like 'Title (YYYY) (YYYY)'
-    into canonical 'Title (YYYY)'. Moves files, normalizes filenames, updates FILE_ID_CACHE,
-    and removes the old folder with os.rmdir without deleting media.
-    """
+    """Safely normalize double-year folders without overwriting files or dangling cache paths."""
     if not os.path.isdir(library_root):
         return
     cache_dirty = False
@@ -6100,54 +6188,82 @@ def migrate_double_year_folders(library_root: str):
             base_title = match.group(1).strip()
             year = match.group(2)
             canonical_name = f"{base_title} ({year})"
-            old_dir = os.path.join(root, d)
-            new_dir = os.path.join(root, canonical_name)
+            old_dir = os.path.normpath(os.path.join(root, d))
+            new_dir = os.path.normpath(os.path.join(root, canonical_name))
             logger.info(f"[MIGRATE-YEAR] Found double-year folder '{old_dir}' -> normalizing to '{new_dir}'")
             os.makedirs(new_dir, exist_ok=True)
+            moved_files = {}
+
             for sub_root, _, files in os.walk(old_dir):
                 rel = os.path.relpath(sub_root, old_dir)
                 target_sub = os.path.join(new_dir, rel) if rel != "." else new_dir
                 os.makedirs(target_sub, exist_ok=True)
                 for fn in files:
-                    src_file = os.path.join(sub_root, fn)
+                    src_file = os.path.normpath(os.path.join(sub_root, fn))
                     fn_norm = re.sub(r"\s*\((\d{4})\)\s*\(\1\)", r" (\1)", fn)
-                    dst_file = os.path.join(target_sub, fn_norm)
-                    if not os.path.exists(dst_file):
+                    dst_file = os.path.normpath(os.path.join(target_sub, fn_norm))
+                    if os.path.lexists(dst_file):
+                        logger.warning(
+                            f"[MIGRATE-YEAR] Destination collision; preserving source and destination: '{src_file}' -> '{dst_file}'"
+                        )
                         try:
-                            shutil.move(src_file, dst_file)
-                            logger.info(f"[MIGRATE-YEAR] Moved '{src_file}' -> '{dst_file}'")
-                        except Exception as e:
-                            logger.warning(f"[MIGRATE-YEAR] Failed moving '{src_file}': {e}")
-            for k, v in FILE_ID_CACHE.items():
-                if not isinstance(v, dict):
-                    continue
-                changed = False
-                td = v.get("target_dir")
-                if td and os.path.normpath(td).startswith(os.path.normpath(old_dir)):
-                    v["target_dir"] = os.path.normpath(td).replace(os.path.normpath(old_dir), os.path.normpath(new_dir), 1)
-                    changed = True
-                sp = v.get("strm_path")
-                if sp and os.path.normpath(sp).startswith(os.path.normpath(old_dir)):
-                    new_sp = os.path.normpath(sp).replace(os.path.normpath(old_dir), os.path.normpath(new_dir), 1)
-                    new_sp = re.sub(r"\s*\((\d{4})\)\s*\(\1\)", r" (\1)", new_sp)
-                    v["strm_path"] = new_sp
-                    changed = True
-                sr = v.get("show_root")
-                if sr and os.path.normpath(sr).startswith(os.path.normpath(old_dir)):
-                    v["show_root"] = os.path.normpath(sr).replace(os.path.normpath(old_dir), os.path.normpath(new_dir), 1)
-                    changed = True
-                if changed:
-                    cache_dirty = True
-            for sub_root, sub_dirs, _ in os.walk(old_dir, topdown=False):
-                for sd in sub_dirs:
+                            _record_review_job(
+                                {"source_path": src_file, "destination_path": dst_file},
+                                confidence=0.0,
+                                reason="double_year_destination_conflict",
+                            )
+                        except Exception:
+                            pass
+                        continue
                     try:
-                        os.rmdir(os.path.join(sub_root, sd))
+                        shutil.move(src_file, dst_file)
+                        moved_files[src_file] = dst_file
+                        logger.info(f"[MIGRATE-YEAR] Moved '{src_file}' -> '{dst_file}'")
+                    except Exception as exc:
+                        logger.warning(f"[MIGRATE-YEAR] Failed moving '{src_file}': {exc}")
+
+            for key, value in list(FILE_ID_CACHE.items()):
+                if not isinstance(value, dict):
+                    continue
+                old_sp = os.path.normpath(str(value.get("strm_path") or ""))
+                new_sp = moved_files.get(old_sp)
+                if not new_sp or not os.path.isfile(new_sp):
+                    # Do not point the cache at a canonical path unless this row's
+                    # own .strm was actually moved. Preserve conflicting paths for review.
+                    if old_sp == old_dir or old_sp.startswith(old_dir + os.sep):
+                        logger.warning(
+                            f"[MIGRATE-YEAR] Cache path was not moved; retaining original pointer: {old_sp}"
+                        )
+                        try:
+                            _record_review_job(
+                                {"cache_key": key, "strm_path": old_sp, "source_dir": old_dir},
+                                confidence=0.0,
+                                reason="double_year_cache_path_not_moved",
+                            )
+                        except Exception:
+                            pass
+                    continue
+
+                value["strm_path"] = new_sp
+                old_td = os.path.normpath(str(value.get("target_dir") or ""))
+                if old_td == old_dir or old_td.startswith(old_dir + os.sep):
+                    value["target_dir"] = new_dir + old_td[len(old_dir):]
+                old_sr = os.path.normpath(str(value.get("show_root") or ""))
+                if old_sr == old_dir or old_sr.startswith(old_dir + os.sep):
+                    value["show_root"] = new_dir + old_sr[len(old_dir):]
+                cache_dirty = True
+
+            for sub_root, sub_dirs, _ in os.walk(old_dir, topdown=False):
+                for subdir in sub_dirs:
+                    try:
+                        os.rmdir(os.path.join(sub_root, subdir))
                     except OSError:
                         pass
             try:
                 os.rmdir(old_dir)
                 logger.info(f"[MIGRATE-YEAR] Successfully removed empty old directory '{old_dir}'")
             except OSError:
+                # Non-empty means a collision or a file we could not move. Keep it.
                 pass
     if cache_dirty:
         _save_cache_sync()
