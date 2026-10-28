@@ -30,7 +30,12 @@ jobs:
       - name: Install application and test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pytest
+          python -m pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: Prepare isolated filesystem used by legacy tests
+        run: |
+          sudo mkdir -p /data
+          sudo chown "$(id -u):$(id -g)" /data
 
       - name: Compile modified Python files
         run: |
@@ -43,4 +48,4 @@ jobs:
       - name: Run regression suite
         env:
           PYTHONPATH: apex
-        run: python -m pytest apex/tests -q
+        run: python -m pytest apex/tests -q -o asyncio_mode=auto
