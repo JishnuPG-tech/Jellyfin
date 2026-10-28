@@ -6124,6 +6124,22 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                 show_root = tv_show_root(SHOWS_DIR, lang, official_title, official_year)
                 data["show_root"] = show_root
                 new_strm_base = data["strm_base"]
+
+                # Existing episode paths are the most reliable link to the actual
+                # Telegram source. Do not rename/move an entire TV series during a
+                # metadata-only repair; that caused old Series/Season DB rows and
+                # missing episode paths during scans. NFOs carry the canonical title.
+                if old_strm_path and os.path.isfile(old_strm_path):
+                    target_dir = os.path.dirname(os.path.normpath(old_strm_path))
+                    new_strm_base = os.path.splitext(os.path.basename(old_strm_path))[0]
+                    season_dir = os.path.dirname(target_dir)
+                    show_root = (
+                        season_dir
+                        if re.fullmatch(r"(?i)season\s*\d+", os.path.basename(target_dir))
+                        else target_dir
+                    )
+                    data["show_root"] = show_root
+                    data["strm_base"] = new_strm_base
             else:
                 data["is_tv"] = False
                 data["strm_base"] = strm_base(data)
@@ -6174,19 +6190,22 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                 or requested_base != new_strm_base
             )
 
-            # Move this source's existing pointer only if the allocator selected a free target.
+            # Movie folder migrations move the tracked pointer and sidecars together.
+            # TV paths were intentionally kept stable above. All destination conflicts
+            # are review-only; the helper never overwrites an existing file.
             if (
-                old_strm_path
+                not is_tv
+                and old_strm_path
                 and os.path.isfile(old_strm_path)
                 and os.path.normpath(old_strm_path) != os.path.normpath(new_strm_path)
-                and not os.path.exists(new_strm_path)
+                and not os.path.lexists(new_strm_path)
             ):
-                try:
-                    shutil.move(old_strm_path, new_strm_path)
+                if _move_tracked_strm_and_sidecars(old_strm_path, new_strm_path):
                     item_changed = True
-                    logger.info(f"[STRM-MIGRATE] Moved tracked pointer '{old_strm_path}' -> '{new_strm_path}'")
-                except Exception as move_exc:
-                    logger.warning(f"[STRM-MIGRATE] Could not move tracked pointer '{old_strm_path}': {move_exc}")
+                else:
+                    logger.warning(
+                        f"[STRM-MIGRATE] Preserved source pointer after unsuccessful safe move: '{old_strm_path}'"
+                    )
 
             if should_write:
                 item_changed = _write_text_if_changed(new_strm_path, strm_content) or item_changed
