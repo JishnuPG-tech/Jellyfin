@@ -1985,22 +1985,22 @@ async def _enrich_media_metadata(entry):
                 return re.sub(r"[^a-z0-9]+", "", value)
 
             if expected_tmdb:
-                tmdb_value = re.search(r"<tmdbid>\\s*(\\d+)\\s*</tmdbid>", raw_nfo, re.I)
-                tmdb_unique = re.search(r'<uniqueid[^>]*type=["\\']tmdb["\\'][^>]*>\\s*(\\d+)\\s*</uniqueid>', raw_nfo, re.I)
+                tmdb_value = re.search(r"<tmdbid>\s*(\d+)\s*</tmdbid>", raw_nfo, re.I)
+                tmdb_unique = re.search(r"""<uniqueid[^>]*type=["']tmdb["'][^>]*>\s*(\d+)\s*</uniqueid>""", raw_nfo, re.I)
                 values = {m.group(1) for m in (tmdb_value, tmdb_unique) if m}
                 if str(expected_tmdb) not in values:
                     return False
             if expected_imdb:
-                imdb_value = re.search(r"<imdbid>\\s*(tt\\d+)\\s*</imdbid>", raw_nfo, re.I)
-                imdb_unique = re.search(r'<uniqueid[^>]*type=["\\']imdb["\\'][^>]*>\\s*(tt\\d+)\\s*</uniqueid>', raw_nfo, re.I)
+                imdb_value = re.search(r"<imdbid>\s*(tt\d+)\s*</imdbid>", raw_nfo, re.I)
+                imdb_unique = re.search(r"""<uniqueid[^>]*type=["']imdb["'][^>]*>\s*(tt\d+)\s*</uniqueid>""", raw_nfo, re.I)
                 values = {m.group(1) for m in (imdb_value, imdb_unique) if m}
                 if str(expected_imdb).lower() not in values:
                     return False
-            title_match = re.search(r"<title>\\s*(.*?)\\s*</title>", raw_nfo, re.I | re.S)
+            title_match = re.search(r"<title>\s*(.*?)\s*</title>", raw_nfo, re.I | re.S)
             if expected_title and title_match and _flat(title_match.group(1)) != _flat(expected_title):
                 return False
             if expected_year:
-                year_match = re.search(r"<year>\\s*(\\d{4})\\s*</year>", raw_nfo, re.I)
+                year_match = re.search(r"<year>\s*(\d{4})\s*</year>", raw_nfo, re.I)
                 if year_match and str(expected_year) != year_match.group(1):
                     return False
             return True
