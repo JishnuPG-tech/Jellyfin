@@ -2360,10 +2360,10 @@ async def _enrich_media_metadata(entry):
                 or str(entry.get("year") or "") != "2026"
             )
             entry["language"] = "Malayalam"
-            entry["title"] = "Aadu 3"
-            entry["clean_title"] = "Aadu 3"
-            entry["search_title"] = "aadu 3"
-            entry["strm_base"] = "Aadu 3 (2026)"
+            entry["title"] = "Aadu 3 Part 1"
+            entry["clean_title"] = "Aadu 3 Part 1"
+            entry["search_title"] = "aadu 3 part 1"
+            entry["strm_base"] = "Aadu 3 Part 1 (2026)"
             entry["year"] = 2026
             entry["tmdb_id"] = int(_aadu_expected_tmdb_id)
             entry["imdb_id"] = _aadu_expected_imdb_id
