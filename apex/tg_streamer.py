@@ -1972,12 +1972,55 @@ async def _enrich_media_metadata(entry):
         has_identity = bool(known_tmdb and tmdb_verified)
         force_art = bool(entry.get("_force_art_refresh"))
 
+        def _nfo_matches_identity(nfo_path, expected_title, expected_year, expected_tmdb, expected_imdb):
+            """Verify local NFO IDs/title/year before the idempotency fast path."""
+            try:
+                with open(nfo_path, "r", encoding="utf-8", errors="ignore") as nf:
+                    raw_nfo = nf.read(256 * 1024).lower()
+            except OSError:
+                return False
+
+            def _flat(value):
+                value = re.sub(r"&(?:amp|apos|quot|lt|gt);", " ", str(value or "").lower())
+                return re.sub(r"[^a-z0-9]+", "", value)
+
+            if expected_tmdb:
+                tmdb_value = re.search(r"<tmdbid>\\s*(\\d+)\\s*</tmdbid>", raw_nfo, re.I)
+                tmdb_unique = re.search(r'<uniqueid[^>]*type=["\\']tmdb["\\'][^>]*>\\s*(\\d+)\\s*</uniqueid>', raw_nfo, re.I)
+                values = {m.group(1) for m in (tmdb_value, tmdb_unique) if m}
+                if str(expected_tmdb) not in values:
+                    return False
+            if expected_imdb:
+                imdb_value = re.search(r"<imdbid>\\s*(tt\\d+)\\s*</imdbid>", raw_nfo, re.I)
+                imdb_unique = re.search(r'<uniqueid[^>]*type=["\\']imdb["\\'][^>]*>\\s*(tt\\d+)\\s*</uniqueid>', raw_nfo, re.I)
+                values = {m.group(1) for m in (imdb_value, imdb_unique) if m}
+                if str(expected_imdb).lower() not in values:
+                    return False
+            title_match = re.search(r"<title>\\s*(.*?)\\s*</title>", raw_nfo, re.I | re.S)
+            if expected_title and title_match and _flat(title_match.group(1)) != _flat(expected_title):
+                return False
+            if expected_year:
+                year_match = re.search(r"<year>\\s*(\\d{4})\\s*</year>", raw_nfo, re.I)
+                if year_match and str(expected_year) != year_match.group(1):
+                    return False
+            return True
+
+        expected_title = entry.get("tmdb_title") or entry.get("title") or entry.get("clean_title")
+        expected_year = entry.get("tmdb_year") or entry.get("year")
+        expected_imdb = entry.get("imdb_id") or cached_record.get("imdb_id")
+
         if has_identity and not force_art:
             if is_tv and show_root:
                 tv_nfo = os.path.join(show_root, "tvshow.nfo")
                 tv_backdrop = os.path.join(show_root, "backdrop.jpg")
                 has_backdrop = os.path.exists(tv_backdrop) and os.path.getsize(tv_backdrop) >= 15000
-                if os.path.exists(tv_nfo) and _poster_art_ok(show_root) and has_backdrop and not _nfo_needs_repair(tv_nfo):
+                if (
+                    os.path.exists(tv_nfo)
+                    and _poster_art_ok(show_root)
+                    and has_backdrop
+                    and not _nfo_needs_repair(tv_nfo)
+                    and _nfo_matches_identity(tv_nfo, expected_title, expected_year, known_tmdb, expected_imdb)
+                ):
                     return True
             elif not is_tv:
                 movie_nfo = os.path.join(
@@ -1987,8 +2030,13 @@ async def _enrich_media_metadata(entry):
                 nfo_file = movie_nfo if os.path.exists(movie_nfo) else generic_nfo
                 movie_backdrop = os.path.join(target_dir, "backdrop.jpg")
                 has_backdrop = os.path.exists(movie_backdrop) and os.path.getsize(movie_backdrop) >= 15000
-                if (os.path.exists(nfo_file) and _poster_art_ok(target_dir)
-                        and has_backdrop and not _nfo_needs_repair(nfo_file)):
+                if (
+                    os.path.exists(nfo_file)
+                    and _poster_art_ok(target_dir)
+                    and has_backdrop
+                    and not _nfo_needs_repair(nfo_file)
+                    and _nfo_matches_identity(nfo_file, expected_title, expected_year, known_tmdb, expected_imdb)
+                ):
                     return True
 
         query = entry.get("search_title") or entry.get("show_name") or entry.get("title")
