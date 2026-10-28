@@ -2405,14 +2405,12 @@ async def _enrich_media_metadata(entry):
                             entry["title"] = "Iron Man 3"
                             entry["clean_title"] = "Iron Man 3"
                             entry["search_title"] = "iron man 3"
-                            entry["strm_base"] = "Iron Man 3 (2013)"
                             entry["tmdb_id"] = 68721
                             entry["imdb_id"] = "tt1300854"
                             entry["year"] = 2013
                             entry["_force_art_refresh"] = True
-                            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-                            entry["target_dir"] = target_dir
-                            entry["strm_path"] = os.path.join(target_dir, "Iron Man 3 (2013).strm")
+                            # The reindexer owns path migration; don't publish a
+                            # new strm_path before physically moving the old pointer.
                             logger.info("[TMDB] Resolved Iron Man 3 directly to TMDB ID 68721")
                     except Exception as _exc:
                         pass
@@ -2425,13 +2423,9 @@ async def _enrich_media_metadata(entry):
                             used_query = "Iron Man 2"
                             entry["title"] = "Iron Man 2"
                             entry["clean_title"] = "Iron Man 2"
-                            entry["strm_base"] = "Iron Man 2 (2010)"
                             entry["tmdb_id"] = 10138
                             entry["year"] = 2010
                             entry["_force_art_refresh"] = True
-                            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-                            entry["target_dir"] = target_dir
-                            entry["strm_path"] = os.path.join(target_dir, "Iron Man 2 (2010).strm")
                             logger.info("[TMDB] Resolved Iron Man 2 directly to TMDB ID 10138")
                     except Exception as _exc:
                         pass
@@ -2444,13 +2438,9 @@ async def _enrich_media_metadata(entry):
                             used_query = "Iron Man"
                             entry["title"] = "Iron Man"
                             entry["clean_title"] = "Iron Man"
-                            entry["strm_base"] = "Iron Man (2008)"
                             entry["tmdb_id"] = 1726
                             entry["year"] = 2008
                             entry["_force_art_refresh"] = True
-                            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-                            entry["target_dir"] = target_dir
-                            entry["strm_path"] = os.path.join(target_dir, "Iron Man (2008).strm")
                             logger.info("[TMDB] Resolved Iron Man directly to TMDB ID 1726")
                     except Exception as _exc:
                         pass
@@ -2473,36 +2463,13 @@ async def _enrich_media_metadata(entry):
             entry["title"] = "Aadu 3 Part 1"
             entry["clean_title"] = "Aadu 3 Part 1"
             entry["search_title"] = "aadu 3 part 1"
-            entry["strm_base"] = "Aadu 3 Part 1 (2026)"
             entry["year"] = 2026
             entry["tmdb_id"] = int(_aadu_expected_tmdb_id)
             entry["imdb_id"] = _aadu_expected_imdb_id
-            # Do not force-download every boot; only refresh on identity drift.
+            # Do not mutate/move filesystem paths from the enrichment worker.
+            # The serialized reindex pass will relocate the tracked STRM and its
+            # sidecars together after the identity correction has been persisted.
             entry["_force_art_refresh"] = _aadu_identity_changed
-            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-            entry["target_dir"] = target_dir
-            entry["strm_path"] = os.path.join(target_dir, "Aadu 3 Part 1 (2026).strm")
-
-            # Relocate legacy folders without deleting sidecars or overwriting any destination.
-            for old_lang in ("Tamil", "Unknown"):
-                for old_f in ("Aadu 3 (2026)", "Aadu 3 (2026) (2026)", "Aadu 3 Part 1 (2026)"):
-                    old_cand_dir = os.path.join(MOVIES_DIR, old_lang, old_f)
-                    if not os.path.isdir(old_cand_dir) or os.path.normpath(old_cand_dir).lower() == os.path.normpath(target_dir).lower():
-                        continue
-                    moved_map = _move_legacy_folder_contents_preserving_conflicts(
-                        old_cand_dir, target_dir, preferred_strm_name="Aadu 3 Part 1 (2026).strm"
-                    )
-                    for cached in FILE_ID_CACHE.values():
-                        if not isinstance(cached, dict):
-                            continue
-                        cached_strm = cached.get("strm_path")
-                        if cached_strm and os.path.normpath(cached_strm) in moved_map:
-                            cached["strm_path"] = moved_map[os.path.normpath(cached_strm)]
-                            cached["target_dir"] = target_dir
-                        cached_target = cached.get("target_dir")
-                        if cached_target and os.path.normpath(cached_target) == os.path.normpath(old_cand_dir):
-                            if not os.path.exists(old_cand_dir) or not os.listdir(old_cand_dir):
-                                cached["target_dir"] = target_dir
             if not hit:
                 for aadu_cand in ("Aadu 3 Part 1", "Aadu 3", "ആട് 3"):
                     try:
@@ -2527,14 +2494,10 @@ async def _enrich_media_metadata(entry):
             entry["title"] = "Khalifa"
             entry["clean_title"] = "Khalifa"
             entry["search_title"] = "khalifa"
-            entry["strm_base"] = "Khalifa (2026)"
             entry["year"] = 2026
             entry["tmdb_id"] = 1036081
             entry["imdb_id"] = "tt22797990"
             entry["_force_art_refresh"] = True
-            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-            entry["target_dir"] = target_dir
-            entry["strm_path"] = os.path.join(target_dir, "Khalifa (2026).strm")
             hit = {
                 "id": 1036081,
                 "title": "Khalifa",
@@ -2574,11 +2537,8 @@ async def _enrich_media_metadata(entry):
             e_num = int(entry.get("episode") or 1)
             entry["season"] = s_num
             entry["episode"] = e_num
-            entry["strm_base"] = f"It: Welcome to Derry S{s_num:02d}E{e_num:02d}"
-            show_root = tv_show_root(SHOWS_DIR, entry.get("language") or "English", "It: Welcome to Derry", 2025)
-            entry["show_root"] = show_root
-            entry["target_dir"] = os.path.join(show_root, f"Season {s_num:02d}")
-            entry["strm_path"] = os.path.join(entry["target_dir"], f"{entry['strm_base']}.strm")
+            # Keep the path which points to the existing episode. The reindexer
+            # now preserves stable TV paths and does not move the series root.
             hit = {
                 "id": 200875,
                 "name": "It: Welcome to Derry",
