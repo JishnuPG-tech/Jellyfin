@@ -2756,8 +2756,7 @@ async def _enrich_media_metadata(entry):
                     except Exception:
                         pass
                 if not os.path.exists(nfo_path) or _nfo_needs_repair(nfo_path) or force_art:
-                    with open(nfo_path, "w", encoding="utf-8") as f:
-                        f.write(build_tvshow_nfo(detail))
+                    _write_text_if_changed(nfo_path, build_tvshow_nfo(detail))
                 poster_url = _best_image("poster_path")
                 if poster_url and (force_art or not _image_is_hd(poster_path, _POSTER_MIN_WIDTH)):
                     if await _download_image(session, _resize_tmdb_image(poster_url, "original"), poster_path):
@@ -2835,8 +2834,7 @@ async def _enrich_media_metadata(entry):
                             break
                     if ep_detail:
                         ep_nfo = os.path.join(target_dir, f"{entry.get('strm_base', strm_base(entry))}.nfo")
-                        with open(ep_nfo, "w", encoding="utf-8") as f:
-                            f.write(build_episode_nfo(ep_detail))
+                        _write_text_if_changed(ep_nfo, build_episode_nfo(ep_detail))
             else:
                 force_art = bool(entry.get("_force_art_refresh"))
                 nfo_path = os.path.join(
@@ -2852,13 +2850,9 @@ async def _enrich_media_metadata(entry):
                         except Exception:
                             pass
 
-                with open(nfo_path, "w", encoding="utf-8") as f:
-                    f.write(build_movie_nfo(detail))
-                try:
-                    with open(nfo_path, "rb") as src, open(movie_nfo, "wb") as dst:
-                        dst.write(src.read())
-                except OSError:
-                    pass
+                movie_nfo_content = build_movie_nfo(detail)
+                _write_text_if_changed(nfo_path, movie_nfo_content)
+                _write_text_if_changed(movie_nfo, movie_nfo_content)
                 poster_url = _best_image("poster_path")
                 movie_poster = os.path.join(target_dir, "poster.jpg")
                 if poster_url and (force_art or not _image_is_hd(movie_poster, _POSTER_MIN_WIDTH)):
@@ -3853,7 +3847,7 @@ def _choose_safe_strm_path(entry: Dict, target_dir: str, requested_base: str, st
     seen = set()
     for suffix in suffixes:
         suffix = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "", str(suffix)).strip(" ._-")
-        suffix = re.sub(r"\\s+", " ", suffix)
+        suffix = re.sub(r"\s+", " ", suffix)
         if not suffix or suffix.casefold() in seen:
             continue
         seen.add(suffix.casefold())
