@@ -1265,3 +1265,38 @@ def test_refresh_refuses_basename_only_match_for_an_unrelated_path(tmp_path):
 
     assert ok is False
     assert posted == []
+
+
+def test_choose_safe_strm_path_preserves_existing_source_and_reuses_its_variant(tmp_path):
+    choose = _extract_top_level_function(
+        "_choose_safe_strm_path",
+        {"extract_version_tag": lambda path: "720P WEB-DL" if "720p" in str(path).lower() else ""},
+    )
+    canonical = tmp_path / "Movies" / "English" / "Spider-Man Homecoming (2017)" / "Spider-Man Homecoming (2017).strm"
+    canonical.parent.mkdir(parents=True)
+    original_url = "http://127.0.0.1:8080/stream/-100/101/video.mp4"
+    alternate_url = "http://127.0.0.1:8080/stream/-100/202/video.mp4"
+    canonical.write_text(original_url, encoding="utf-8")
+
+    entry = {
+        "chat_id": -100,
+        "msg_id": 202,
+        "file_name": "Spider.Man.Homecoming.2017.720p.WEB-DL.x264.mkv",
+        "title": "Spider-Man Homecoming",
+    }
+    base, path, should_write = choose(
+        entry, str(canonical.parent), "Spider-Man Homecoming (2017)", alternate_url
+    )
+    assert path != str(canonical)
+    assert base.startswith("Spider-Man Homecoming (2017) - ")
+    assert should_write is True
+    assert canonical.read_text(encoding="utf-8") == original_url
+
+    Path(path).write_text(alternate_url, encoding="utf-8")
+    base2, path2, should_write2 = choose(
+        entry, str(canonical.parent), "Spider-Man Homecoming (2017)", alternate_url
+    )
+    assert base2 == base
+    assert path2 == path
+    assert should_write2 is False
+    assert canonical.read_text(encoding="utf-8") == original_url
