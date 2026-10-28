@@ -3852,7 +3852,7 @@ def _choose_safe_strm_path(entry: Dict, target_dir: str, requested_base: str, st
 
     seen = set()
     for suffix in suffixes:
-        suffix = re.sub(r'[<>:"/\\\\|?*\\x00-\\x1f]+', "", str(suffix)).strip(" ._-")
+        suffix = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "", str(suffix)).strip(" ._-")
         suffix = re.sub(r"\\s+", " ", suffix)
         if not suffix or suffix.casefold() in seen:
             continue
@@ -5996,27 +5996,17 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             os.makedirs(target_dir, exist_ok=True)
             new_strm_path = os.path.join(target_dir, f"{new_strm_base}.strm")
 
-            # Refuse to overwrite a different Telegram stream with the same canonical filename.
+            # Resolve the canonical path through the same collision-safe allocator used
+            # during ingestion. This recovers existing alternate versions by source URL
+            # instead of repeatedly sending them to review on every startup.
             _chat, _msg = _split_cache_key(key)
             cid = data.get("chat_id") or _chat
             mid = data.get("msg_id") or _msg
             strm_content = _stream_url(cid, mid)
-            if os.path.isfile(new_strm_path) and os.path.normpath(new_strm_path) != os.path.normpath(old_strm_path):
-                try:
-                    with open(new_strm_path, "r", encoding="utf-8", errors="ignore") as existing_stream:
-                        existing_content = existing_stream.read(4096).strip()
-                except OSError:
-                    existing_content = ""
-                if existing_content and existing_content != strm_content.strip():
-                    logger.error(
-                        f"[STRM-COLLISION] Refusing to overwrite {new_strm_path}; it points to a different Telegram source"
-                    )
-                    _record_review_job(
-                        {"source_path": old_strm_path, "target_path": new_strm_path, "file_name": raw_name},
-                        confidence=0.0,
-                        reason="canonical_strm_path_collision",
-                    )
-                    continue
+            requested_base = new_strm_base
+            new_strm_base, new_strm_path, should_write = _choose_safe_strm_path(
+                data, target_dir, requested_base, strm_content
+            )
 
             item_changed = bool(
                 old_metadata_schema < 2
@@ -6025,11 +6015,10 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                 or old_imdb != str(imdb_id or "")
                 or old_tmdb_id != str(data.get("tmdb_id") or "")
                 or (old_strm_path and os.path.normpath(old_strm_path) != os.path.normpath(new_strm_path))
+                or requested_base != new_strm_base
             )
 
-            # If the cached path moved, move the known .strm pointer only when the
-            # destination is free. Source media remains in Telegram; no source file
-            # or unrelated sidecar is deleted by this operation.
+            # Move this source's existing pointer only if the allocator selected a free target.
             if (
                 old_strm_path
                 and os.path.isfile(old_strm_path)
@@ -6043,9 +6032,19 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                 except Exception as move_exc:
                     logger.warning(f"[STRM-MIGRATE] Could not move tracked pointer '{old_strm_path}': {move_exc}")
 
-            item_changed = _write_text_if_changed(new_strm_path, strm_content) or item_changed
+            if should_write:
+                item_changed = _write_text_if_changed(new_strm_path, strm_content) or item_changed
+            elif not os.path.isfile(new_strm_path):
+                logger.error(f"[STRM-PATH] Allocator selected a missing destination for '{raw_name}': {new_strm_path}")
+                _record_review_job(
+                    {"source_path": old_strm_path, "target_path": new_strm_path, "file_name": raw_name},
+                    confidence=0.0,
+                    reason="allocated_strm_path_missing",
+                )
+                continue
             data["target_dir"] = target_dir
             data["strm_path"] = new_strm_path
+            data["strm_base"] = new_strm_base
             data["_metadata_schema_version"] = 2
 
             # Write NFO file
