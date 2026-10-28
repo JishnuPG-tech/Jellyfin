@@ -2840,6 +2840,8 @@ async def _enrich_media_metadata(entry):
                                         dst.write(src.read())
                                 except OSError:
                                     pass
+                    else:
+                        artwork_update_failed = True
                 backdrop_url = _best_image("backdrop_path")
                 if backdrop_url and (force_art or not _image_is_hd(backdrop_path, _BACKDROP_MIN_WIDTH)):
                     if await _download_image(session, _resize_tmdb_image(backdrop_url, "original"), backdrop_path):
@@ -2850,6 +2852,8 @@ async def _enrich_media_metadata(entry):
                                     dst.write(src.read())
                             except OSError:
                                 pass
+                    else:
+                        artwork_update_failed = True
                 elif not _image_is_hd(backdrop_path, _BACKDROP_MIN_WIDTH):
                     if _generate_fallback_backdrop(poster_path, backdrop_path):
                         for extra in ("fanart.jpg", "landscape.jpg", "thumb.jpg"):
@@ -2930,6 +2934,8 @@ async def _enrich_media_metadata(entry):
                                 dst.write(src.read())
                         except OSError:
                             pass
+                    else:
+                        artwork_update_failed = True
                 backdrop_url = _best_image("backdrop_path")
                 movie_backdrop = os.path.join(target_dir, "backdrop.jpg")
                 if backdrop_url and (force_art or not _image_is_hd(movie_backdrop, _BACKDROP_MIN_WIDTH)):
@@ -2941,6 +2947,8 @@ async def _enrich_media_metadata(entry):
                                     dst.write(src.read())
                             except OSError:
                                 pass
+                    else:
+                        artwork_update_failed = True
                 elif not _image_is_hd(movie_backdrop, _BACKDROP_MIN_WIDTH):
                     if _generate_fallback_backdrop(movie_poster, movie_backdrop):
                         for extra in ("fanart.jpg", "landscape.jpg", "thumb.jpg"):
@@ -2973,6 +2981,23 @@ async def _enrich_media_metadata(entry):
                             b_url = f"https://image.tmdb.org/t/p/original{b_fp}"
                             await _download_image(session, b_url, b_dst)
 
+        # Consume the one-shot refresh flag only after the authoritative NFO was
+        # written and any requested primary artwork download succeeded.
+        if entry.get("_force_art_refresh") and not artwork_update_failed:
+            identity_nfo = (
+                os.path.join(show_root or target_dir, "tvshow.nfo")
+                if is_tv else os.path.join(target_dir, "movie.nfo")
+            )
+            try:
+                with open(identity_nfo, "r", encoding="utf-8", errors="replace") as check_nfo:
+                    nfo_text = check_nfo.read(8192)
+                tmdb_ok = not tmdb_id or str(tmdb_id) in nfo_text
+                imdb_ok = not imdb_id or str(imdb_id) in nfo_text
+                if tmdb_ok and imdb_ok:
+                    entry.pop("_force_art_refresh", None)
+            except OSError:
+                pass
+
         prev = FILE_ID_CACHE.get(key)
         if isinstance(prev, dict):
             prev["tmdb_id"] = tmdb_id
@@ -2987,8 +3012,11 @@ async def _enrich_media_metadata(entry):
                 # language/target move is never lost (restore must not recreate
                 # the stale-language copy from an un-updated cache entry).
                 for _field in (
-                    "language", "target_dir", "show_root", "strm_path",
-                    "_prev_strm_path", "strm_base", "imdb_id",
+                    "title", "clean_title", "search_title", "year", "tmdb_id",
+                    "tmdb_title", "tmdb_year", "imdb_id", "poster_url", "backdrop_url",
+                    "overview", "genres", "language", "is_tv", "show_name", "season",
+                    "episode", "target_dir", "show_root", "strm_path",
+                    "_prev_strm_path", "strm_base", "_force_art_refresh",
                 ):
                     if _field in entry:
                         prev[_field] = entry[_field]
