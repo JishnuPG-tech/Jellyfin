@@ -5755,22 +5755,20 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                 "id": data.get("tmdb_id") if data.get("_tmdb_verified") else "",
                 "genres": [{"name": g} if isinstance(g, str) else g for g in genres] if genres else [],
             }
+            nfo_changed = False
             if is_tv:
                 tv_nfo = os.path.join(show_root, "tvshow.nfo")
-                with open(tv_nfo, "w", encoding="utf-8") as nf:
-                    nf.write(build_tvshow_nfo(nfo_detail))
+                nfo_changed = _write_text_if_changed(tv_nfo, build_tvshow_nfo(nfo_detail)) or nfo_changed
                 ep_nfo = os.path.join(target_dir, f"{new_strm_base}.nfo")
                 ep_detail = {
                     "season_number": s_num,
                     "episode_number": e_num,
                     "name": f"Episode {e_num}",
                     "overview": overview,
-                    "id": data.get("tmdb_id") or "",
+                    "id": data.get("tmdb_id") if data.get("_tmdb_verified") else "",
                 }
-                with open(ep_nfo, "w", encoding="utf-8") as nf:
-                    nf.write(build_episode_nfo(ep_detail))
+                nfo_changed = _write_text_if_changed(ep_nfo, build_episode_nfo(ep_detail)) or nfo_changed
             else:
-                nfo_changed = False
                 for nfo_p in (os.path.join(target_dir, f"{new_strm_base}.nfo"), os.path.join(target_dir, "movie.nfo")):
                     nfo_changed = _write_text_if_changed(nfo_p, build_movie_nfo(nfo_detail)) or nfo_changed
 
