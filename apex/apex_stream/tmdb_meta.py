@@ -381,7 +381,7 @@ def _clean_search_title(text: str) -> str:
     # source filename. In particular, "@WMR_SpiderMan.Homecoming..." becomes
     # "SpiderMan Homecoming..." before title scoring.
     text = re.sub(
-        r"(?i)^\\s*(?:@?WMR|MM[._ -]*Linkz|PAHE(?:[._ -]*IN)?|YTS(?:[._ -]*MX)?|PSA|"
+        r"(?i)^\s*(?:@?WMR|MM[._ -]*Linkz|PAHE(?:[._ -]*IN)?|YTS(?:[._ -]*MX)?|PSA|"
         r"TEAM[._ -]*GOAT[._ -]*BOT|PROSEARCH(?:[._ -]*BOT)?)[._ -]+",
         " ",
         str(text or ""),
