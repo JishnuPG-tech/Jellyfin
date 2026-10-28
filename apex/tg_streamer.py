@@ -3576,7 +3576,8 @@ async def purge_media_item(
 
 async def refresh_jellyfin_item_by_path(
     strm_path, alt_paths=None, retries=4, delay=1.5,
-    expected_title=None, expected_year=None, expected_tmdb_id=None, expected_imdb_id=None
+    expected_title=None, expected_year=None, expected_tmdb_id=None, expected_imdb_id=None,
+    expected_is_tv=False, expected_season=None, expected_episode=None
 ):
     """Refresh only the Jellyfin item tied to this exact physical .strm path.
 
@@ -3606,7 +3607,7 @@ async def refresh_jellyfin_item_by_path(
     params = {
         "Recursive": "true",
         "IncludeItemTypes": "Movie,Series,Episode",
-        "Fields": "Path,SeriesId,SeasonId,ProviderIds",
+        "Fields": "Path,SeriesId,SeasonId,ProviderIds,Type,IndexNumber,ParentIndexNumber",
         "Limit": "10000",
     }
     if api_key:
@@ -3701,7 +3702,9 @@ async def refresh_jellyfin_item_by_path(
 
                 mismatches = []
                 for verify_attempt in range(4):
-                    verify_params = {"Fields": "Path,ProviderIds"}
+                    verify_params = {
+                        "Fields": "Path,ProviderIds,Type,SeriesId,SeasonId,IndexNumber,ParentIndexNumber,Name,ProductionYear"
+                    }
                     if api_key:
                         verify_params["api_key"] = api_key
                     async with session.get(
@@ -3712,36 +3715,93 @@ async def refresh_jellyfin_item_by_path(
                     ) as verify_response:
                         if verify_response.status == 200:
                             current = await verify_response.json()
-                            if expected_title not in (None, "") and _normal_title(current.get("Name")) != _normal_title(expected_title):
+                            identity_item = current
+                            if expected_is_tv:
+                                if str(current.get("Type") or "").casefold() != "episode":
+                                    mismatches = [m for m in mismatches if not m.startswith("item type expected=")]
+                                    mismatches.append(f"item type expected='Episode' actual={current.get('Type')!r}")
+                                else:
+                                    mismatches = [m for m in mismatches if not m.startswith("item type expected=")]
+                                if expected_season not in (None, ""):
+                                    try:
+                                        season_ok = int(current.get("ParentIndexNumber")) == int(expected_season)
+                                    except (TypeError, ValueError):
+                                        season_ok = False
+                                    if not season_ok:
+                                        mismatches = [m for m in mismatches if not m.startswith("season expected=")]
+                                        mismatches.append(
+                                            f"season expected={expected_season!r} actual={current.get('ParentIndexNumber')!r}"
+                                        )
+                                    else:
+                                        mismatches = [m for m in mismatches if not m.startswith("season expected=")]
+                                if expected_episode not in (None, ""):
+                                    try:
+                                        episode_ok = int(current.get("IndexNumber")) == int(expected_episode)
+                                    except (TypeError, ValueError):
+                                        episode_ok = False
+                                    if not episode_ok:
+                                        mismatches = [m for m in mismatches if not m.startswith("episode expected=")]
+                                        mismatches.append(
+                                            f"episode expected={expected_episode!r} actual={current.get('IndexNumber')!r}"
+                                        )
+                                    else:
+                                        mismatches = [m for m in mismatches if not m.startswith("episode expected=")]
+
+                                series_id = current.get("SeriesId")
+                                if not series_id:
+                                    mismatches = [m for m in mismatches if not m.startswith("series identity unavailable=")]
+                                    mismatches.append("series identity unavailable=episode has no SeriesId")
+                                else:
+                                    series_params = {"Fields": "Name,ProductionYear,ProviderIds"}
+                                    if api_key:
+                                        series_params["api_key"] = api_key
+                                    async with session.get(
+                                        f"http://127.0.0.1:8096/Items/{series_id}",
+                                        params=series_params,
+                                        headers=headers,
+                                        timeout=15,
+                                    ) as series_response:
+                                        if series_response.status == 200:
+                                            identity_item = await series_response.json()
+                                            mismatches = [m for m in mismatches if not m.startswith("series identity unavailable=")]
+                                        else:
+                                            mismatches = [m for m in mismatches if not m.startswith("series identity unavailable=")]
+                                            mismatches.append(
+                                                f"series identity unavailable=HTTP {series_response.status} for {series_id}"
+                                            )
+
+                            if expected_title not in (None, "") and _normal_title(identity_item.get("Name")) != _normal_title(expected_title):
+                                mismatches = [m for m in mismatches if not m.startswith("title expected=")]
                                 mismatches.append(
-                                    f"title expected={expected_title!r} actual={current.get('Name')!r}"
+                                    f"title expected={expected_title!r} actual={identity_item.get('Name')!r}"
                                 )
                             else:
                                 mismatches = [m for m in mismatches if not m.startswith("title expected=")]
                             if expected_year not in (None, ""):
                                 try:
-                                    year_ok = int(current.get("ProductionYear")) == int(expected_year)
+                                    year_ok = int(identity_item.get("ProductionYear")) == int(expected_year)
                                 except (TypeError, ValueError):
                                     year_ok = False
                                 if not year_ok:
                                     mismatches = [m for m in mismatches if not m.startswith("year expected=")]
                                     mismatches.append(
-                                        f"year expected={expected_year!r} actual={current.get('ProductionYear')!r}"
+                                        f"year expected={expected_year!r} actual={identity_item.get('ProductionYear')!r}"
                                     )
                                 else:
                                     mismatches = [m for m in mismatches if not m.startswith("year expected=")]
-                            if not _providers_match(current):
+                            if not _providers_match(identity_item):
                                 mismatches = [m for m in mismatches if not m.startswith("provider IDs expected=")]
                                 mismatches.append(
                                     f"provider IDs expected=TMDB:{expected_tmdb_id!r}/IMDb:{expected_imdb_id!r} "
-                                    f"actual={current.get('ProviderIds')!r}"
+                                    f"actual={identity_item.get('ProviderIds')!r}"
                                 )
                             else:
                                 mismatches = [m for m in mismatches if not m.startswith("provider IDs expected=")]
                             if not mismatches:
                                 logger.info(
                                     f"[JELLYFIN-VERIFY] Identity verified for '{os.path.basename(strm_path)}' "
-                                    f"(ID={item_id}, title={current.get('Name')!r}, year={current.get('ProductionYear')!r})"
+                                    f"(item_id={item_id}, identity_name={identity_item.get('Name')!r}, "
+                                    f"identity_year={identity_item.get('ProductionYear')!r}, is_tv_episode={expected_is_tv})"
                                 )
                                 return True
                     if verify_attempt < 3:
@@ -6073,15 +6133,9 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             if is_tv:
                 tv_nfo = os.path.join(show_root, "tvshow.nfo")
                 item_changed = _write_text_if_changed(tv_nfo, build_tvshow_nfo(nfo_detail)) or item_changed
-                ep_nfo = os.path.join(target_dir, f"{new_strm_base}.nfo")
-                ep_detail = {
-                    "season_number": s_num,
-                    "episode_number": e_num,
-                    "name": f"Episode {e_num}",
-                    "overview": overview,
-                    "id": data.get("tmdb_id") or "",
-                }
-                item_changed = _write_text_if_changed(ep_nfo, build_episode_nfo(ep_detail)) or item_changed
+                # Leave episode NFO to enrich_media_metadata, which resolves the
+                # TMDB episode endpoint and has its own episode ID/title/air date.
+                # Using the Series TMDB ID here corrupts each episode's identity.
             else:
                 for nfo_p in (os.path.join(target_dir, f"{new_strm_base}.nfo"), os.path.join(target_dir, "movie.nfo")):
                     item_changed = _write_text_if_changed(nfo_p, build_movie_nfo(nfo_detail)) or item_changed
@@ -6139,6 +6193,9 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                     "year": official_year,
                     "tmdb_id": data.get("tmdb_id"),
                     "imdb_id": imdb_id,
+                    "is_tv": is_tv,
+                    "season": season if is_tv else None,
+                    "episode": episode if is_tv else None,
                 })
             updated_count += 1
             logger.info(
@@ -6172,6 +6229,9 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                     expected_year=job.get("year"),
                     expected_tmdb_id=job.get("tmdb_id"),
                     expected_imdb_id=job.get("imdb_id"),
+                    expected_is_tv=bool(job.get("is_tv")),
+                    expected_season=job.get("season"),
+                    expected_episode=job.get("episode"),
                 )
                 if not ok:
                     logger.error(f"[IMDB-REINDEX] Metadata postcondition failed for {job['path']}; routed to review if match existed.")
