@@ -1034,6 +1034,7 @@ def _extract_top_level_function(name, extra_ns=None):
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
     ns = {
         "os": os,
+        "re": re,
         "shutil": shutil,
         "uuid": uuid,
         "Dict": Dict,
