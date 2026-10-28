@@ -2350,13 +2350,25 @@ async def _enrich_media_metadata(entry):
         if "aadu" in raw_name_lower and ("3" in raw_name_lower or "part" in raw_name_lower):
             if hit and hit.get("id") in (324976, 489709):
                 hit = None
+            _aadu_expected_tmdb_id = "1715385"
+            _aadu_expected_imdb_id = "tt8142672"
+            _aadu_identity_changed = (
+                str(entry.get("tmdb_id") or "") != _aadu_expected_tmdb_id
+                or str(entry.get("imdb_id") or "") != _aadu_expected_imdb_id
+                or str(entry.get("title") or entry.get("clean_title") or "").casefold()
+                    not in {"aadu 3", "aadu 3 part 1"}
+                or str(entry.get("year") or "") != "2026"
+            )
             entry["language"] = "Malayalam"
-            entry["title"] = "Aadu 3 Part 1"
-            entry["clean_title"] = "Aadu 3 Part 1"
-            entry["search_title"] = "aadu 3 part 1"
-            entry["strm_base"] = "Aadu 3 Part 1 (2026)"
+            entry["title"] = "Aadu 3"
+            entry["clean_title"] = "Aadu 3"
+            entry["search_title"] = "aadu 3"
+            entry["strm_base"] = "Aadu 3 (2026)"
             entry["year"] = 2026
-            entry["_force_art_refresh"] = True
+            entry["tmdb_id"] = int(_aadu_expected_tmdb_id)
+            entry["imdb_id"] = _aadu_expected_imdb_id
+            # Do not force-download every boot; only refresh on identity drift.
+            entry["_force_art_refresh"] = _aadu_identity_changed
             target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
             entry["target_dir"] = target_dir
             entry["strm_path"] = os.path.join(target_dir, "Aadu 3 Part 1 (2026).strm")
