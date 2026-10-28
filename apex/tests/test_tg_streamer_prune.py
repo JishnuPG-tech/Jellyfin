@@ -1270,7 +1270,10 @@ def test_refresh_refuses_basename_only_match_for_an_unrelated_path(tmp_path):
 def test_choose_safe_strm_path_preserves_existing_source_and_reuses_its_variant(tmp_path):
     choose = _extract_top_level_function(
         "_choose_safe_strm_path",
-        {"extract_version_tag": lambda path: "720P WEB-DL" if "720p" in str(path).lower() else ""},
+        {
+            "extract_version_tag": lambda path: "720P WEB-DL" if "720p" in str(path).lower() else "",
+            "_stream_source_identity": lambda value: tuple(re.search(r"/stream/(-?\\d+)/(\\d+)(?:/|$)", str(value or "")).groups()) if re.search(r"/stream/(-?\\d+)/(\\d+)(?:/|$)", str(value or "")) else None,
+        },
     )
     canonical = tmp_path / "Movies" / "English" / "Spider-Man Homecoming (2017)" / "Spider-Man Homecoming (2017).strm"
     canonical.parent.mkdir(parents=True)
