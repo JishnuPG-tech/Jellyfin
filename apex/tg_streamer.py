@@ -4859,7 +4859,10 @@ async def _configured_channel_sync_loop():
     await asyncio.sleep(15)
     while True:
         try:
-            await _sync_configured_channel_once()
+            if globals().get("_RECONCILE_RUNNING", False):
+                logger.info("[SYNC] Skipping channel history scan while library reconciliation is mutating paths.")
+            else:
+                await _sync_configured_channel_once()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -5904,59 +5907,103 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
 
 
 def migrate_double_year_folders(library_root: str):
-    """Find and safely migrate legacy duplicate-year folders like 'Title (YYYY) (YYYY)'
-    into canonical 'Title (YYYY)'. Moves files, normalizes filenames, updates FILE_ID_CACHE,
-    and removes the old folder with os.rmdir without deleting media.
+    """Safely normalize duplicate-year folders without losing cache/file consistency.
+
+    A destination collision is never overwritten. Identical .strm pointers may be
+    coalesced only after their contents are compared byte-for-byte; all other
+    collisions are preserved and sent to review. Cache paths are changed only for
+    files that actually moved (or identical pointers whose destination is verified).
     """
     if not os.path.isdir(library_root):
         return
     cache_dirty = False
-    for root, dirs, _ in os.walk(library_root, topdown=True):
+    moved_paths = {}
+    root_norm = os.path.normcase(os.path.abspath(library_root))
+
+    def _within(path, parent):
+        try:
+            return os.path.commonpath([os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.abspath(parent))]) == os.path.normcase(os.path.abspath(parent))
+        except (ValueError, TypeError):
+            return False
+
+    def _same_bytes(left, right):
+        try:
+            if os.path.getsize(left) != os.path.getsize(right):
+                return False
+            with open(left, "rb") as lf, open(right, "rb") as rf:
+                while True:
+                    lb = lf.read(1024 * 1024)
+                    rb = rf.read(1024 * 1024)
+                    if lb != rb:
+                        return False
+                    if not lb:
+                        return True
+        except OSError:
+            return False
+
+    def _review_conflict(src, dst):
+        logger.warning(f"[MIGRATE-YEAR] Destination conflict; preserving both paths: source='{src}' destination='{dst}'")
+        review = globals().get("_record_review_job")
+        if callable(review):
+            try:
+                review(
+                    {"source_path": src, "destination_path": dst, "library_root": library_root},
+                    confidence=0.0,
+                    reason="double_year_migration_destination_conflict",
+                )
+            except Exception:
+                pass
+
+    # Bottom-up walk ensures child directories are handled before their parent.
+    for root, dirs, _ in os.walk(library_root, topdown=False):
         for d in list(dirs):
             match = re.search(r"^(.*?)\s*\((\d{4})\)\s*\(\2\)$", d)
             if not match:
                 continue
             base_title = match.group(1).strip()
             year = match.group(2)
-            canonical_name = f"{base_title} ({year})"
             old_dir = os.path.join(root, d)
-            new_dir = os.path.join(root, canonical_name)
-            logger.info(f"[MIGRATE-YEAR] Found double-year folder '{old_dir}' -> normalizing to '{new_dir}'")
+            new_dir = os.path.join(root, f"{base_title} ({year})")
+            if not _within(old_dir, library_root):
+                continue
+            logger.info(f"[MIGRATE-YEAR] Reconciling '{old_dir}' -> '{new_dir}'")
             os.makedirs(new_dir, exist_ok=True)
-            for sub_root, _, files in os.walk(old_dir):
+
+            for sub_root, _, files in os.walk(old_dir, topdown=True):
                 rel = os.path.relpath(sub_root, old_dir)
-                target_sub = os.path.join(new_dir, rel) if rel != "." else new_dir
+                target_sub = new_dir if rel == "." else os.path.join(new_dir, rel)
                 os.makedirs(target_sub, exist_ok=True)
                 for fn in files:
                     src_file = os.path.join(sub_root, fn)
                     fn_norm = re.sub(r"\s*\((\d{4})\)\s*\(\1\)", r" (\1)", fn)
                     dst_file = os.path.join(target_sub, fn_norm)
-                    if not os.path.exists(dst_file):
-                        try:
-                            shutil.move(src_file, dst_file)
-                            logger.info(f"[MIGRATE-YEAR] Moved '{src_file}' -> '{dst_file}'")
-                        except Exception as e:
-                            logger.warning(f"[MIGRATE-YEAR] Failed moving '{src_file}': {e}")
-            for k, v in FILE_ID_CACHE.items():
-                if not isinstance(v, dict):
-                    continue
-                changed = False
-                td = v.get("target_dir")
-                if td and os.path.normpath(td).startswith(os.path.normpath(old_dir)):
-                    v["target_dir"] = os.path.normpath(td).replace(os.path.normpath(old_dir), os.path.normpath(new_dir), 1)
-                    changed = True
-                sp = v.get("strm_path")
-                if sp and os.path.normpath(sp).startswith(os.path.normpath(old_dir)):
-                    new_sp = os.path.normpath(sp).replace(os.path.normpath(old_dir), os.path.normpath(new_dir), 1)
-                    new_sp = re.sub(r"\s*\((\d{4})\)\s*\(\1\)", r" (\1)", new_sp)
-                    v["strm_path"] = new_sp
-                    changed = True
-                sr = v.get("show_root")
-                if sr and os.path.normpath(sr).startswith(os.path.normpath(old_dir)):
-                    v["show_root"] = os.path.normpath(sr).replace(os.path.normpath(old_dir), os.path.normpath(new_dir), 1)
-                    changed = True
-                if changed:
-                    cache_dirty = True
+                    if os.path.normcase(os.path.abspath(src_file)) == os.path.normcase(os.path.abspath(dst_file)):
+                        continue
+
+                    if os.path.exists(dst_file):
+                        # A duplicate .strm pointer can be removed only if its exact
+                        # URL/content is identical and the destination remains present.
+                        if fn.lower().endswith(".strm") and _same_bytes(src_file, dst_file):
+                            try:
+                                os.remove(src_file)
+                                moved_paths[os.path.normcase(os.path.abspath(src_file))] = os.path.abspath(dst_file)
+                                logger.info(f"[MIGRATE-YEAR] Coalesced identical .strm pointer '{src_file}' -> '{dst_file}'")
+                            except OSError as exc:
+                                logger.warning(f"[MIGRATE-YEAR] Could not coalesce identical pointer '{src_file}': {exc}")
+                        else:
+                            _review_conflict(src_file, dst_file)
+                        continue
+
+                    try:
+                        shutil.move(src_file, dst_file)
+                        moved_paths[os.path.normcase(os.path.abspath(src_file))] = os.path.abspath(dst_file)
+                        logger.info(f"[MIGRATE-YEAR] Moved '{src_file}' -> '{dst_file}'")
+                    except Exception as exc:
+                        logger.warning(f"[MIGRATE-YEAR] Failed moving '{src_file}' -> '{dst_file}': {exc}")
+                        _review_conflict(src_file, dst_file)
+
+            # Prune only empty directories. Unknown files and conflicting sidecars
+            # remain in place; never use recursive deletion here.
             for sub_root, sub_dirs, _ in os.walk(old_dir, topdown=False):
                 for sd in sub_dirs:
                     try:
@@ -5965,12 +6012,30 @@ def migrate_double_year_folders(library_root: str):
                         pass
             try:
                 os.rmdir(old_dir)
-                logger.info(f"[MIGRATE-YEAR] Successfully removed empty old directory '{old_dir}'")
+                logger.info(f"[MIGRATE-YEAR] Removed empty old directory '{old_dir}'")
             except OSError:
+                # A conflict or unknown file remains; deliberately keep the folder.
                 pass
+
+    # Update cache references only when the exact .strm path was moved/coalesced.
+    normalized_moves = {src: dst for src, dst in moved_paths.items()}
+    for key, value in FILE_ID_CACHE.items():
+        if not isinstance(value, dict):
+            continue
+        source_path = value.get("strm_path")
+        if not source_path:
+            continue
+        normalized_source = os.path.normcase(os.path.abspath(os.path.normpath(source_path)))
+        destination = normalized_moves.get(normalized_source)
+        if not destination or not os.path.isfile(destination):
+            continue
+        value["strm_path"] = destination
+        value["target_dir"] = os.path.dirname(destination)
+        value["strm_base"] = os.path.splitext(os.path.basename(destination))[0]
+        cache_dirty = True
+
     if cache_dirty:
         _save_cache_sync()
-
 
 _RECONCILE_RUNNING = False
 
@@ -6470,6 +6535,12 @@ async def start_background_tasks(app):
         while True:
             try:
                 await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
+                if globals().get("_RECONCILE_RUNNING", False):
+                    logger.info("[RECONCILE] Deferring deduplication while reindex/migration is active.")
+                    continue
+                if await is_jellyfin_scanning():
+                    logger.info("[RECONCILE] Deferring deduplication until Jellyfin's library scan is idle.")
+                    continue
                 await deduplicate_jellyfin_items()
             except asyncio.CancelledError:
                 raise
