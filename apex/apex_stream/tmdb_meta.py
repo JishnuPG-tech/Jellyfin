@@ -375,7 +375,17 @@ def _detect_year(text: Optional[str]) -> Optional[int]:
 
 
 def _clean_search_title(text: str) -> str:
-    """A title ready to send to the TMDB search API (no year/release tags)."""
+    """A title ready to send to metadata providers (without release-group prefixes)."""
+    # Remove known uploader/release-group prefixes only at the start. Do not
+    # strip arbitrary tokens from the middle of a title or alter the preserved
+    # source filename. In particular, "@WMR_SpiderMan.Homecoming..." becomes
+    # "SpiderMan Homecoming..." before title scoring.
+    text = re.sub(
+        r"(?i)^\\s*(?:@?WMR|MM[._ -]*Linkz|PAHE(?:[._ -]*IN)?|YTS(?:[._ -]*MX)?|PSA|"
+        r"TEAM[._ -]*GOAT[._ -]*BOT|PROSEARCH(?:[._ -]*BOT)?)[._ -]+",
+        " ",
+        str(text or ""),
+    )
     text = _SIZE_RE.sub(" ", text)
     text = _strip_noise(_drop_dotted_group_tail(text))
     text = YEAR_RE.sub(" ", text)
