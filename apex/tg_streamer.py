@@ -1964,11 +1964,12 @@ async def _enrich_media_metadata(entry):
 
         # Idempotency gate: if metadata is on disk AND has valid identity,
         # avoid re-hitting the API on restart.
-        has_identity = bool(
-            entry.get("imdb_id") or entry.get("tmdb_id")
-            or (isinstance(FILE_ID_CACHE.get(key), dict) and (FILE_ID_CACHE[key].get("imdb_id") or FILE_ID_CACHE[key].get("tmdb_id")))
-        )
-        known_tmdb = int(entry.get("tmdb_id") or (FILE_ID_CACHE[key].get("tmdb_id") if isinstance(FILE_ID_CACHE.get(key), dict) else 0) or 0)
+        cached_record = FILE_ID_CACHE.get(key) if isinstance(FILE_ID_CACHE.get(key), dict) else {}
+        # A merely present TMDB ID is not proof of a correct identity. Legacy
+        # caches must be revalidated once before their NFO/metadata can be trusted.
+        known_tmdb = int(entry.get("tmdb_id") or cached_record.get("tmdb_id") or 0)
+        tmdb_verified = bool(entry.get("_tmdb_verified") or cached_record.get("_tmdb_verified"))
+        has_identity = bool(known_tmdb and tmdb_verified)
         force_art = bool(entry.get("_force_art_refresh"))
 
         if has_identity and not force_art:
@@ -2010,37 +2011,76 @@ async def _enrich_media_metadata(entry):
         # If this item was already verified with a valid TMDB ID, lock directly to that ID
         # NEVER re-run fuzzy text search against candidates for an already verified movie!
         # Reject synthetic or known 404 IDs (e.g. 210879, 5568976, 3215778)
-        if known_tmdb and known_tmdb not in (210879, 5568976, 3215778):
+        if known_tmdb and tmdb_verified:
             hit = {"id": known_tmdb}
             used_query = f"tmdb:{known_tmdb}"
             logger.info(f"[TMDB-LOCK] Preserved verified identity tmdb_id={known_tmdb} for '{entry.get('title')}'")
+        elif known_tmdb:
+            # Do not carry an unverified legacy ID into a new NFO. The existing
+            # IMDb identity (when available) is used below to resolve TMDB again.
+            logger.info(f"[TMDB-VERIFY] Revalidating legacy TMDB ID {known_tmdb} for '{entry.get('title')}'")
+            entry.pop("tmdb_id", None)
+            entry.pop("tmdb_title", None)
+            entry.pop("tmdb_year", None)
+            entry.pop("_tmdb_verified", None)
+            if isinstance(cached_record, dict):
+                cached_record.pop("tmdb_id", None)
+                cached_record.pop("tmdb_title", None)
+                cached_record.pop("tmdb_year", None)
+                cached_record.pop("_tmdb_verified", None)
         # Tier-0: an embedded IMDb id (Radarr-style "{imdb-tt12345678}",
         # "[tt1234567]") resolves deterministically through /find, bypassing
         # every transliteration/spacing ambiguity of fuzzy text search.
-        imdb_id = extract_imdb_id(
+        embedded_imdb_id = extract_imdb_id(
             entry.get("file_name")
             or entry.get("raw_name")
             or entry.get("caption")
             or entry.get("search_title")
             or entry.get("title")
         )
+        # Reuse the cached IMDb ID as a lookup hint, but validate its TMDB result
+        # against the expected title/year before accepting it as authoritative.
+        imdb_id = embedded_imdb_id or entry.get("imdb_id") or cached_record.get("imdb_id")
         if imdb_id:
             try:
                 fresults = await _tmdb_find(imdb_id)
             except Exception as _exc:
                 fresults = []
             if fresults:
-                for fr in fresults:
-                    if fr.get("media_type") == media_type:
-                        hit = fr
-                        break
-                if not hit:
-                    hit = next(iter(fresults), None)
-            if hit:
-                used_query = imdb_id
-                logger.info(
-                    f"[TMDB-ID] '{entry.get('title')}' resolved via {imdb_id} (tmdb_id={hit.get('id')})"
-                )
+                type_results = [fr for fr in fresults if fr.get("media_type") == media_type]
+                if embedded_imdb_id:
+                    # An ID embedded in the uploaded release is explicit source data.
+                    hit = type_results[0] if type_results else None
+                elif type_results:
+                    expected = entry.get("clean_title") or entry.get("title") or entry.get("search_title") or query
+                    # Cached IMDb IDs can also be stale. Require a plausible title/year
+                    # match before trusting their mapped TMDB identity.
+                    def _title_tokens(value):
+                        return set(re.findall(r"[a-z0-9]+", str(value or "").lower()))
+                    expected_tokens = _title_tokens(expected)
+                    result = type_results[0]
+                    result_tokens = _title_tokens(result.get("title") or result.get("name"))
+                    overlap = len(expected_tokens & result_tokens) / max(1, len(expected_tokens | result_tokens))
+                    result_year = _tmdb_year(result)
+                    expected_year = entry.get("year")
+                    year_ok = True
+                    if expected_year and result_year:
+                        year_gap = abs(int(expected_year) - int(result_year))
+                        year_ok = year_gap <= (3 if media_type == "tv" else 1)
+                    if overlap >= 0.5 and year_ok:
+                        hit = result
+                    else:
+                        logger.warning(
+                            f"[TMDB-ID] Cached IMDb identity '{imdb_id}' conflicts with expected "
+                            f"'{expected}' ({expected_year}); candidate='{result.get('title') or result.get('name')}' "
+                            f"({result_year}). Ignoring cached ID and falling back to title matching."
+                        )
+                        imdb_id = None
+                if hit:
+                    used_query = imdb_id or embedded_imdb_id
+                    logger.info(
+                        f"[TMDB-ID] '{entry.get('title')}' resolved via {used_query} (tmdb_id={hit.get('id')})"
+                    )
         # Tier-1: text search against candidates in English / default so Latin query
         # matches TMDB's Latin titles, with language affinity applied in best_tmdb_match.
         # Tier-1 (PRIMARY): Official IMDb Suggestion API (omkarcloud/imdb-scraper)
@@ -2816,6 +2856,11 @@ async def _enrich_media_metadata(entry):
                 detail.get("name") or detail.get("title") or hit.get("name") or hit.get("title")
             )
             prev["tmdb_year"] = _tmdb_year(detail)
+            prev["_tmdb_verified"] = bool(
+                TMDB_API_KEY and tmdb_id and detail.get("id") == tmdb_id
+                and (detail.get("title") or detail.get("name"))
+            )
+            entry["_tmdb_verified"] = prev["_tmdb_verified"]
             if prev is not entry:
                 # Mirror organize-time fields onto the persisted object so a
                 # language/target move is never lost (restore must not recreate
