@@ -1867,6 +1867,118 @@ async def _ai_disambiguate_candidates(raw_context, candidates, media_type="movie
     return None
 
 
+def _write_text_if_changed(path: str, content: str) -> bool:
+    """Atomically write text only when bytes differ, avoiding false Jellyfin file-change events."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    try:
+        with open(path, "r", encoding="utf-8") as existing:
+            if existing.read() == content:
+                return False
+    except (OSError, UnicodeError):
+        pass
+
+    tmp_path = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as out:
+            out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_path, path)
+        return True
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _strip_known_release_group_prefix(name: str) -> str:
+    """Remove known uploader prefixes from a *matching copy* of a filename.
+
+    The original Telegram filename is kept untouched for source traceability.
+    Prefix removal is intentionally allow-listed so genuine title text is not
+    stripped accidentally.
+    """
+    text = str(name or "").strip()
+    prefixes = ("@WMR", "@ProSearch Bot", "@ProSearch", "@Team_Goat_Bot", "@MSone")
+    for prefix in prefixes:
+        if text.casefold().startswith(prefix.casefold()):
+            tail = text[len(prefix):]
+            if not tail or tail[0] in " _.-":
+                return tail.lstrip(" _.-")
+    return text
+
+
+def _move_legacy_folder_contents_preserving_conflicts(
+    source_dir: str, target_dir: str, preferred_strm_name: Optional[str] = None
+) -> Dict[str, str]:
+    """Move legacy sidecars without deleting or overwriting destination files.
+
+    Returns a source->destination map for successfully moved files. Conflicts
+    stay in the source folder and are routed to review; only genuinely empty
+    directories are removed with os.rmdir.
+    """
+    moved: Dict[str, str] = {}
+    if not source_dir or not target_dir:
+        return moved
+    source_norm = os.path.normpath(source_dir)
+    target_norm = os.path.normpath(target_dir)
+    if source_norm == target_norm or not os.path.isdir(source_norm):
+        return moved
+
+    try:
+        os.makedirs(target_norm, exist_ok=True)
+        top_level_strms = [
+            f for f in os.listdir(source_norm)
+            if f.lower().endswith(".strm") and os.path.isfile(os.path.join(source_norm, f))
+        ]
+    except OSError as exc:
+        logger.warning(f"[MIGRATE-SAFE] Cannot inspect '{source_norm}': {exc}")
+        return moved
+
+    for current_root, subdirs, filenames in os.walk(source_norm, topdown=False):
+        rel = os.path.relpath(current_root, source_norm)
+        dest_root = target_norm if rel == "." else os.path.join(target_norm, rel)
+        for filename in filenames:
+            src = os.path.join(current_root, filename)
+            dest_name = filename
+            if rel == "." and preferred_strm_name and len(top_level_strms) == 1 and filename == top_level_strms[0]:
+                dest_name = preferred_strm_name
+            dst = os.path.join(dest_root, dest_name)
+            if os.path.lexists(dst):
+                logger.warning(
+                    f"[MIGRATE-SAFE] Destination conflict; preserving both files: '{src}' -> '{dst}'"
+                )
+                try:
+                    _record_review_job(
+                        {"source_path": src, "destination_path": dst, "source_dir": source_norm},
+                        confidence=0.0,
+                        reason="migration_destination_conflict",
+                    )
+                except Exception:
+                    pass
+                continue
+            try:
+                os.makedirs(os.path.dirname(dst) or target_norm, exist_ok=True)
+                shutil.move(src, dst)
+                moved[os.path.normpath(src)] = os.path.normpath(dst)
+                logger.info(f"[MIGRATE-SAFE] Moved '{src}' -> '{dst}'")
+            except Exception as exc:
+                logger.warning(f"[MIGRATE-SAFE] Failed to move '{src}': {exc}")
+        for subdir in subdirs:
+            try:
+                os.rmdir(os.path.join(current_root, subdir))
+            except OSError:
+                pass
+        try:
+            os.rmdir(current_root)
+        except OSError:
+            pass
+    return moved
+
+
 async def _download_image(session, url, save_path):
     """Download an image (e.g. TMDB poster/backdrop) to save_path with size & corruption guards."""
     try:
@@ -2239,33 +2351,26 @@ async def _enrich_media_metadata(entry):
             entry["target_dir"] = target_dir
             entry["strm_path"] = os.path.join(target_dir, "Aadu 3 Part 1 (2026).strm")
 
-            # Relocate any legacy/misplaced Tamil directory into canonical Malayalam directory
+            # Relocate legacy folders without deleting sidecars or overwriting any destination.
             for old_lang in ("Tamil", "Unknown"):
                 for old_f in ("Aadu 3 (2026)", "Aadu 3 (2026) (2026)", "Aadu 3 Part 1 (2026)"):
                     old_cand_dir = os.path.join(MOVIES_DIR, old_lang, old_f)
-                    if os.path.isdir(old_cand_dir) and os.path.normpath(old_cand_dir).lower() != os.path.normpath(target_dir).lower():
-                        for sf in os.listdir(old_cand_dir):
-                            if sf.endswith(".strm"):
-                                old_sf = os.path.join(old_cand_dir, sf)
-                                new_sf = os.path.join(target_dir, "Aadu 3 Part 1 (2026).strm")
-                                if not os.path.exists(new_sf):
-                                    try:
-                                        os.makedirs(target_dir, exist_ok=True)
-                                        shutil.move(old_sf, new_sf)
-                                        logger.info(f"[MIGRATE-LANG] Relocated misplaced '{old_sf}' -> '{new_sf}'")
-                                    except Exception as e:
-                                        logger.warning(f"[MIGRATE-LANG] Move failed: {e}")
-                        try:
-                            for f in os.listdir(old_cand_dir):
-                                if not f.endswith(".strm"):
-                                    try:
-                                        os.remove(os.path.join(old_cand_dir, f))
-                                    except OSError:
-                                        pass
-                            os.rmdir(old_cand_dir)
-                            logger.info(f"[MIGRATE-LANG] Cleaned empty misplaced folder: {old_cand_dir}")
-                        except OSError:
-                            pass
+                    if not os.path.isdir(old_cand_dir) or os.path.normpath(old_cand_dir).lower() == os.path.normpath(target_dir).lower():
+                        continue
+                    moved_map = _move_legacy_folder_contents_preserving_conflicts(
+                        old_cand_dir, target_dir, preferred_strm_name="Aadu 3 Part 1 (2026).strm"
+                    )
+                    for cached in FILE_ID_CACHE.values():
+                        if not isinstance(cached, dict):
+                            continue
+                        cached_strm = cached.get("strm_path")
+                        if cached_strm and os.path.normpath(cached_strm) in moved_map:
+                            cached["strm_path"] = moved_map[os.path.normpath(cached_strm)]
+                            cached["target_dir"] = target_dir
+                        cached_target = cached.get("target_dir")
+                        if cached_target and os.path.normpath(cached_target) == os.path.normpath(old_cand_dir):
+                            if not os.path.exists(old_cand_dir) or not os.listdir(old_cand_dir):
+                                cached["target_dir"] = target_dir
             if not hit:
                 for aadu_cand in ("Aadu 3 Part 1", "Aadu 3", "ആട് 3"):
                     try:
@@ -3467,43 +3572,61 @@ async def purge_media_item(
     return purged_titles
 
 
-async def refresh_jellyfin_item_by_path(strm_path, alt_paths=None, retries=12, delay=5.0):
-    """Locate the Jellyfin item for a given `.strm` path and trigger a full
-    metadata refresh so the NFO/poster written by TMDB enrichment are re-read.
+async def refresh_jellyfin_item_by_path(
+    strm_path, alt_paths=None, retries=4, delay=1.5,
+    expected_title=None, expected_year=None, expected_tmdb_id=None, expected_imdb_id=None
+):
+    """Refresh only the Jellyfin item tied to this exact physical .strm path.
 
-    A plain /Library/Refresh does NOT re-identify an already-indexed item (its
-    name is stable), so Jellyfin keeps the provisional folder-based identity.
-    This forces an item-level FullRefresh which consumes the local .nfo.
-
-    The item may not be indexed yet (the .strm can be created and even moved to
-    its language folder seconds before this runs), so we poll. Matching is by
-    exact path, by any `alt_paths` (e.g. the pre-move path), and finally by the
-    .strm basename so a Jellyfin-side folder move still resolves. Every few
-    attempts a library scan is nudged so a freshly moved file gets indexed.
+    Exact alternate paths must be supplied by the caller from the same cache
+    record when a migration changed the path. Never fall back to matching only
+    by basename/title: that can refresh an unrelated movie with a similar name.
+    A successful HTTP response is not considered success until the stored item
+    metadata satisfies the supplied identity postconditions.
     """
-    if not strm_path:
+    if not strm_path or not os.path.isfile(strm_path):
+        logger.warning(f"[JELLYFIN] Refresh skipped: target .strm does not exist: {strm_path}")
         return False
     headers = _jellyfin_auth_header()
     if not headers:
         return False
     api_key = _read_jellyfin_api_key()
-    base = os.path.basename(strm_path).lower()
-    paths = [strm_path]
-    if alt_paths:
-        paths.extend(alt_paths)
-    norm_paths = {os.path.normpath(p).lower() for p in paths if p}
-    for attempt in range(retries):
+    norm_paths = {os.path.normpath(strm_path)}
+    existing_alt_paths = []
+    for candidate in (alt_paths or []):
+        if candidate and os.path.isfile(candidate):
+            existing_alt_paths.append(os.path.normpath(candidate))
+            norm_paths.add(os.path.normpath(candidate))
+
+    params = {
+        "Recursive": "true",
+        "IncludeItemTypes": "Movie,Series,Episode",
+        "Fields": "Path,SeriesId,SeasonId,ProviderIds",
+        "Limit": "10000",
+    }
+    if api_key:
+        params["api_key"] = api_key
+
+    def _normal_title(value):
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+    def _providers_match(item):
+        provider_ids = item.get("ProviderIds") or {}
+        normalized_ids = {str(k).casefold(): str(v) for k, v in provider_ids.items()}
+        checks = []
+        if expected_tmdb_id not in (None, ""):
+            actual = normalized_ids.get("tmdb", "")
+            checks.append(actual == str(expected_tmdb_id))
+        if expected_imdb_id not in (None, ""):
+            actual = normalized_ids.get("imdb", "")
+            checks.append(actual == str(expected_imdb_id))
+        return all(checks)
+
+    last_match = None
+    for attempt in range(max(1, int(retries))):
         try:
             connector = aiohttp.TCPConnector(family=socket.AF_INET)
             async with aiohttp.ClientSession(connector=connector) as session:
-                params = {
-                    "Recursive": "true",
-                    "IncludeItemTypes": "Movie,Series,Episode",
-                    "Fields": "Path,SeriesId,SeasonId,Type",
-                    "Limit": "10000",
-                }
-                if api_key:
-                    params["api_key"] = api_key
                 async with session.get(
                     "http://127.0.0.1:8096/Items",
                     params=params,
@@ -3511,111 +3634,140 @@ async def refresh_jellyfin_item_by_path(strm_path, alt_paths=None, retries=12, d
                     timeout=30,
                 ) as response:
                     if response.status != 200:
-                        continue
-                    payload = await response.json()
-                items = payload.get("Items") or []
-                matched_item = next(
-                    (
+                        logger.warning(f"[JELLYFIN] Item lookup returned HTTP {response.status}")
+                        items = []
+                    else:
+                        payload = await response.json()
+                        items = payload.get("Items") or []
+
+                # Exact path gets priority. Alternate paths are accepted only if
+                # the old .strm still exists, so stale DB rows cannot be refreshed
+                # after a completed filesystem migration.
+                target_norm = os.path.normpath(strm_path)
+                target_matches = [
+                    it for it in items
+                    if os.path.normpath(str(it.get("Path") or "")) == target_norm
+                ]
+                matched_item = target_matches[0] if target_matches else None
+                if not matched_item and existing_alt_paths:
+                    alt_matches = [
                         it for it in items
-                        if os.path.normpath(str(it.get("Path") or "")).lower() in norm_paths
-                    ),
-                    None,
-                )
+                        if os.path.normpath(str(it.get("Path") or "")) in existing_alt_paths
+                    ]
+                    matched_item = alt_matches[0] if alt_matches else None
+
                 if not matched_item:
-                    # Fallback 1: match by basename
-                    matched_item = next(
-                        (
-                            it for it in items
-                            if os.path.basename(str(it.get("Path") or "")).lower() == base
-                        ),
-                        None,
-                    )
-                if not matched_item:
-                    # Fallback 2: alphanumeric normalized match (handles colon / hyphen differences like "It: Welcome to Derry" vs "IT Welcome to Derry")
-                    clean_target = re.sub(r"[^a-z0-9]+", "", os.path.splitext(base)[0])
-                    if clean_target:
-                        matched_item = next(
-                            (
-                                it for it in items
-                                if re.sub(r"[^a-z0-9]+", "", os.path.splitext(os.path.basename(str(it.get("Path") or "")))[0].lower()) == clean_target
-                            ),
-                            None,
-                        )
-                if not matched_item:
-                    # Fallback 3: Double-year / Part normalization match
-                    # Handles legacy folder drift such as "Aadu 3 (2026) (2026)" vs "Aadu 3 Part 1 (2026)"
-                    def _strip_drift(p):
-                        fn = os.path.basename(str(p or "")).lower()
-                        s = re.sub(r"\((\d{4})\)\s*\(\1\)", r"(\1)", fn)
-                        s = re.sub(r"\bpart\s*\d+\b", "", s)
-                        return re.sub(r"[^a-z0-9]+", "", s)
-                    target_drift = _strip_drift(strm_path)
-                    if target_drift:
-                        matched_item = next(
-                            (
-                                it for it in items
-                                if _strip_drift(it.get("Path")) == target_drift
-                            ),
-                            None,
-                        )
-                if not matched_item:
-                    # Fallback 4: Core title + year matching
-                    parsed_target = parse_media_meta(os.path.splitext(base)[0])
-                    target_title = re.sub(r"[^a-z0-9]+", "", (parsed_target.get("clean_title") or "").lower())
-                    target_year = parsed_target.get("year")
-                    if target_title:
-                        for it in items:
-                            it_path = str(it.get("Path") or "")
-                            it_name = str(it.get("Name") or "")
-                            parsed_it = parse_media_meta(os.path.splitext(os.path.basename(it_path))[0] or it_name)
-                            it_title = re.sub(r"[^a-z0-9]+", "", (parsed_it.get("clean_title") or it_name).lower())
-                            it_year = it.get("ProductionYear") or parsed_it.get("year")
-                            if target_title in it_title or it_title in target_title:
-                                if (not target_year or not it_year) or abs(int(target_year) - int(it_year)) <= 1:
-                                    matched_item = it
-                                    break
-                if not matched_item:
-                    # Every few attempts, nudge a library scan so a freshly
-                    # created/moved .strm is indexed before the next lookup.
-                    if attempt > 0 and attempt % 3 == 0:
-                        try:
-                            await request_jellyfin_scan()
-                        except Exception:
-                            pass
-                    await asyncio.sleep(delay)
+                    if attempt + 1 < max(1, int(retries)):
+                        await asyncio.sleep(delay)
                     continue
+
+                last_match = matched_item
+                item_id = matched_item.get("Id")
+                if not item_id:
+                    logger.warning(f"[JELLYFIN] Matched path has no item ID: {strm_path}")
+                    return False
+
                 refresh_params = {
                     "metadataRefreshMode": "FullRefresh",
                     "replaceAllMetadata": "true",
                     "replaceAllImages": "false",
                 }
-                refresh_ids = [matched_item.get("Id")]
-                series_id = matched_item.get("SeriesId")
-                season_id = matched_item.get("SeasonId")
-                if series_id and series_id not in refresh_ids:
-                    refresh_ids.append(series_id)
-                if season_id and season_id not in refresh_ids:
-                    refresh_ids.append(season_id)
+                async with session.post(
+                    f"http://127.0.0.1:8096/Items/{item_id}/Refresh",
+                    params=refresh_params,
+                    headers=headers,
+                    timeout=15,
+                ) as refresh_response:
+                    if not 200 <= refresh_response.status < 300:
+                        logger.warning(
+                            f"[JELLYFIN] Refresh request failed for item {item_id}: HTTP {refresh_response.status}"
+                        )
+                        if attempt + 1 < max(1, int(retries)):
+                            await asyncio.sleep(delay)
+                        continue
 
-                for rid in refresh_ids:
-                    try:
-                        async with session.post(
-                            f"http://127.0.0.1:8096/Items/{rid}/Refresh",
-                            params=refresh_params,
-                            headers=headers,
-                            timeout=15,
-                        ) as response:
-                            pass
-                    except Exception:
-                        pass
-                logger.info(f"[JELLYFIN] Full metadata refresh queued for {os.path.basename(strm_path)} (IDs: {refresh_ids})")
-                return True
+                # Callers without expected metadata get HTTP-level confirmation
+                # only; reindex callers pass the expected identity and are verified.
+                if all(x in (None, "") for x in (
+                    expected_title, expected_year, expected_tmdb_id, expected_imdb_id
+                )):
+                    logger.info(f"[JELLYFIN] Item refresh accepted for '{os.path.basename(strm_path)}' (ID={item_id})")
+                    return True
+
+                mismatches = []
+                for verify_attempt in range(4):
+                    verify_params = {"Fields": "Path,ProviderIds"}
+                    if api_key:
+                        verify_params["api_key"] = api_key
+                    async with session.get(
+                        f"http://127.0.0.1:8096/Items/{item_id}",
+                        params=verify_params,
+                        headers=headers,
+                        timeout=15,
+                    ) as verify_response:
+                        if verify_response.status == 200:
+                            current = await verify_response.json()
+                            if expected_title not in (None, "") and _normal_title(current.get("Name")) != _normal_title(expected_title):
+                                mismatches.append(
+                                    f"title expected={expected_title!r} actual={current.get('Name')!r}"
+                                )
+                            else:
+                                mismatches = [m for m in mismatches if not m.startswith("title expected=")]
+                            if expected_year not in (None, ""):
+                                try:
+                                    year_ok = int(current.get("ProductionYear")) == int(expected_year)
+                                except (TypeError, ValueError):
+                                    year_ok = False
+                                if not year_ok:
+                                    mismatches = [m for m in mismatches if not m.startswith("year expected=")]
+                                    mismatches.append(
+                                        f"year expected={expected_year!r} actual={current.get('ProductionYear')!r}"
+                                    )
+                                else:
+                                    mismatches = [m for m in mismatches if not m.startswith("year expected=")]
+                            if not _providers_match(current):
+                                mismatches = [m for m in mismatches if not m.startswith("provider IDs expected=")]
+                                mismatches.append(
+                                    f"provider IDs expected=TMDB:{expected_tmdb_id!r}/IMDb:{expected_imdb_id!r} "
+                                    f"actual={current.get('ProviderIds')!r}"
+                                )
+                            else:
+                                mismatches = [m for m in mismatches if not m.startswith("provider IDs expected=")]
+                            if not mismatches:
+                                logger.info(
+                                    f"[JELLYFIN-VERIFY] Identity verified for '{os.path.basename(strm_path)}' "
+                                    f"(ID={item_id}, title={current.get('Name')!r}, year={current.get('ProductionYear')!r})"
+                                )
+                                return True
+                    if verify_attempt < 3:
+                        await asyncio.sleep(min(max(delay, 0.1), 1.0))
+
+                detail = "; ".join(mismatches) or "Jellyfin item could not be read back"
+                logger.error(f"[JELLYFIN-VERIFY] Refresh not verified for '{strm_path}': {detail}")
+                try:
+                    _record_review_job(
+                        {
+                            "item_id": item_id,
+                            "path": strm_path,
+                            "expected_title": expected_title,
+                            "expected_year": expected_year,
+                            "expected_tmdb_id": expected_tmdb_id,
+                            "expected_imdb_id": expected_imdb_id,
+                            "actual": last_match,
+                        },
+                        confidence=0.0,
+                        reason="metadata_refresh_postcondition_failed",
+                    )
+                except Exception:
+                    pass
+                return False
         except Exception as exc:
-            logger.info(f"[JELLYFIN] Item refresh attempt {attempt + 1} failed: {type(exc).__name__}")
-        await asyncio.sleep(delay)
-    logger.warning(f"[JELLYFIN] Could not locate/refresh Jellyfin item for {strm_path}")
-    return False
+            logger.warning(f"[JELLYFIN] Item refresh attempt {attempt + 1} failed: {type(exc).__name__}")
+            if attempt + 1 < max(1, int(retries)):
+                await asyncio.sleep(delay)
 
+    logger.warning(f"[JELLYFIN] Could not locate/verify Jellyfin item for exact path {strm_path}")
+    return False
 
 def extract_version_tag(path: str) -> str:
     """Extract resolution and source edition tags from a media filename (e.g. 1080P BLURAY, 720P WEB-DL)."""
@@ -5609,13 +5761,23 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
     refreshed_paths = []
     connector = aiohttp.TCPConnector(family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
-        for key, data in list(FILE_ID_CACHE.items()):
-            if not isinstance(data, dict):
+        for key, cached_data in list(FILE_ID_CACHE.items()):
+            if not isinstance(cached_data, dict):
                 continue
+            # Work on a copy so review/conflict exits cannot partially mutate the live cache row.
+            data = dict(cached_data)
+            old_title = str(data.get("title") or data.get("clean_title") or "")
+            old_year = data.get("year")
+            old_imdb = str(data.get("imdb_id") or "")
+            old_tmdb_id = str(data.get("tmdb_id") or "")
+            old_strm_path = str(data.get("strm_path") or "")
+            old_target = str(data.get("target_dir") or "")
+            old_metadata_schema = int(data.get("_metadata_schema_version") or 0)
             raw_name = data.get("file_name") or data.get("raw_name") or data.get("title") or ""
             raw_lower = raw_name.lower()
-            parsed = parse_media_meta(raw_name)
-            ext = extract_media_info(raw_name)
+            matching_name = _strip_known_release_group_prefix(raw_name)
+            parsed = parse_media_meta(matching_name)
+            ext = extract_media_info(matching_name)
             is_tv = bool(ext.get("is_tv") or data.get("is_tv") or parsed.get("is_tv"))
             mtype = "tv" if is_tv else "movie"
             title = ext.get("title") or parsed.get("clean_title") or data.get("clean_title") or data.get("title") or ""
@@ -5625,10 +5787,54 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             lang = data.get("language") or parsed.get("language") or DEFAULT_LANGUAGE
 
             imdb_hit = await _fetch_imdb_suggestion(title, year, mtype)
-            if not imdb_hit and year:
-                imdb_hit = await _fetch_imdb_suggestion(title, None, mtype)
             if not imdb_hit and parsed.get("title") and parsed["title"] != title:
+                # Preserve year constraints on fallback queries; a yearless retry can
+                # silently select an unrelated film from a different release year.
                 imdb_hit = await _fetch_imdb_suggestion(parsed["title"], year, mtype)
+
+            candidate_imdb_id = str((imdb_hit or {}).get("id") or "")
+            invalid_legacy_tmdb_ids = {"210879", "5568976", "3215778"}
+            identity_needs_crosscheck = bool(
+                candidate_imdb_id
+                and (not old_tmdb_id or old_tmdb_id in invalid_legacy_tmdb_ids or candidate_imdb_id != old_imdb)
+            )
+            if identity_needs_crosscheck:
+                resolved_tmdb_id = None
+                try:
+                    imdb_matches = await _tmdb_find(candidate_imdb_id)
+                    for imdb_match in (imdb_matches or []):
+                        if imdb_match.get("media_type") == ("tv" if is_tv else "movie"):
+                            resolved_tmdb_id = str(imdb_match.get("id") or "") or None
+                            break
+                except Exception as id_exc:
+                    logger.warning(f"[IDENTITY-CHECK] Could not cross-check IMDb {candidate_imdb_id} for '{raw_name}': {id_exc}")
+
+                if old_tmdb_id and old_tmdb_id not in invalid_legacy_tmdb_ids:
+                    if not resolved_tmdb_id or resolved_tmdb_id != old_tmdb_id:
+                        logger.error(
+                            f"[IDENTITY-CONFLICT] Refusing to combine IMDb {candidate_imdb_id} with cached "
+                            f"TMDB {old_tmdb_id} for '{raw_name}' (resolved TMDB={resolved_tmdb_id!r}); routing to review"
+                        )
+                        _record_review_job(
+                            {
+                                **data,
+                                "candidate_imdb_id": candidate_imdb_id,
+                                "candidate_tmdb_id": resolved_tmdb_id,
+                            },
+                            confidence=0.0,
+                            reason="provider_identity_conflict",
+                        )
+                        continue
+                elif resolved_tmdb_id:
+                    data["tmdb_id"] = resolved_tmdb_id
+                    logger.info(
+                        f"[IDENTITY-CHECK] Repaired legacy TMDB ID for '{raw_name}': {old_tmdb_id or 'missing'} -> {resolved_tmdb_id}"
+                    )
+                elif old_tmdb_id in invalid_legacy_tmdb_ids:
+                    data.pop("tmdb_id", None)
+                    logger.warning(
+                        f"[IDENTITY-CHECK] Removed known-invalid TMDB ID for '{raw_name}'; keeping the IMDb identity"
+                    )
 
             official_title = (imdb_hit.get("l") if imdb_hit else None) or title
             official_year = (imdb_hit.get("y") if imdb_hit else None) or year
@@ -5659,8 +5865,6 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             if backdrop_url:
                 data["backdrop_url"] = str(backdrop_url)
 
-            old_target = data.get("target_dir")
-            old_imdb = data.get("imdb_id")
             if is_tv:
                 s_num = int(season or data.get("season") or 1)
                 e_num = int(episode or data.get("episode") or 1)
@@ -5699,17 +5903,59 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                     pass
 
             os.makedirs(target_dir, exist_ok=True)
-            data["target_dir"] = target_dir
             new_strm_path = os.path.join(target_dir, f"{new_strm_base}.strm")
-            data["strm_path"] = new_strm_path
 
-            # Write genuine .strm file
+            # Refuse to overwrite a different Telegram stream with the same canonical filename.
             _chat, _msg = _split_cache_key(key)
             cid = data.get("chat_id") or _chat
             mid = data.get("msg_id") or _msg
             strm_content = _stream_url(cid, mid)
-            with open(new_strm_path, "w", encoding="utf-8") as sf:
-                sf.write(strm_content)
+            if os.path.isfile(new_strm_path) and os.path.normpath(new_strm_path) != os.path.normpath(old_strm_path):
+                try:
+                    with open(new_strm_path, "r", encoding="utf-8", errors="ignore") as existing_stream:
+                        existing_content = existing_stream.read(4096).strip()
+                except OSError:
+                    existing_content = ""
+                if existing_content and existing_content != strm_content.strip():
+                    logger.error(
+                        f"[STRM-COLLISION] Refusing to overwrite {new_strm_path}; it points to a different Telegram source"
+                    )
+                    _record_review_job(
+                        {"source_path": old_strm_path, "target_path": new_strm_path, "file_name": raw_name},
+                        confidence=0.0,
+                        reason="canonical_strm_path_collision",
+                    )
+                    continue
+
+            item_changed = bool(
+                old_metadata_schema < 2
+                or old_title.casefold() != str(official_title or "").casefold()
+                or str(old_year or "") != str(official_year or "")
+                or old_imdb != str(imdb_id or "")
+                or old_tmdb_id != str(data.get("tmdb_id") or "")
+                or (old_strm_path and os.path.normpath(old_strm_path) != os.path.normpath(new_strm_path))
+            )
+
+            # If the cached path moved, move the known .strm pointer only when the
+            # destination is free. Source media remains in Telegram; no source file
+            # or unrelated sidecar is deleted by this operation.
+            if (
+                old_strm_path
+                and os.path.isfile(old_strm_path)
+                and os.path.normpath(old_strm_path) != os.path.normpath(new_strm_path)
+                and not os.path.exists(new_strm_path)
+            ):
+                try:
+                    shutil.move(old_strm_path, new_strm_path)
+                    item_changed = True
+                    logger.info(f"[STRM-MIGRATE] Moved tracked pointer '{old_strm_path}' -> '{new_strm_path}'")
+                except Exception as move_exc:
+                    logger.warning(f"[STRM-MIGRATE] Could not move tracked pointer '{old_strm_path}': {move_exc}")
+
+            item_changed = _write_text_if_changed(new_strm_path, strm_content) or item_changed
+            data["target_dir"] = target_dir
+            data["strm_path"] = new_strm_path
+            data["_metadata_schema_version"] = 2
 
             # Write NFO file
             nfo_detail = {
@@ -5727,8 +5973,7 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             }
             if is_tv:
                 tv_nfo = os.path.join(show_root, "tvshow.nfo")
-                with open(tv_nfo, "w", encoding="utf-8") as nf:
-                    nf.write(build_tvshow_nfo(nfo_detail))
+                item_changed = _write_text_if_changed(tv_nfo, build_tvshow_nfo(nfo_detail)) or item_changed
                 ep_nfo = os.path.join(target_dir, f"{new_strm_base}.nfo")
                 ep_detail = {
                     "season_number": s_num,
@@ -5737,28 +5982,24 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                     "overview": overview,
                     "id": data.get("tmdb_id") or "",
                 }
-                with open(ep_nfo, "w", encoding="utf-8") as nf:
-                    nf.write(build_episode_nfo(ep_detail))
+                item_changed = _write_text_if_changed(ep_nfo, build_episode_nfo(ep_detail)) or item_changed
             else:
                 for nfo_p in (os.path.join(target_dir, f"{new_strm_base}.nfo"), os.path.join(target_dir, "movie.nfo")):
-                    with open(nfo_p, "w", encoding="utf-8") as nf:
-                        nf.write(build_movie_nfo(nfo_detail))
+                    item_changed = _write_text_if_changed(nfo_p, build_movie_nfo(nfo_detail)) or item_changed
 
-            # Download genuine Amazon poster & backdrop
+            # Download artwork without deleting existing files first. Failed/undersized
+            # replacements must leave the last known-good image intact.
             art_dir = show_root if is_tv else target_dir
-            if force_all or (old_imdb and imdb_id and old_imdb != imdb_id):
-                for stale_art in ("poster.jpg", "folder.jpg", "thumb.jpg", "backdrop.jpg", "fanart.jpg", "landscape.jpg", "season01-poster.jpg", "season-all-poster.jpg"):
-                    for check_dir in (art_dir, target_dir):
-                        stale_p = os.path.join(check_dir, stale_art)
-                        if os.path.exists(stale_p):
-                            try:
-                                os.remove(stale_p)
-                            except OSError:
-                                pass
+            art_identity_changed = bool(
+                force_all
+                or (old_imdb and imdb_id and old_imdb != str(imdb_id))
+                or (old_tmdb_id and old_tmdb_id != str(data.get("tmdb_id") or ""))
+            )
             if poster_url:
                 p_dst = os.path.join(art_dir, "poster.jpg")
-                if force_all or not os.path.exists(p_dst) or os.path.getsize(p_dst) < 15000:
+                if art_identity_changed or not os.path.exists(p_dst) or os.path.getsize(p_dst) < 15000:
                     if await _download_image(session, poster_url, p_dst):
+                        item_changed = True
                         for copy_name in ("folder.jpg", "thumb.jpg"):
                             try:
                                 with open(p_dst, "rb") as s, open(os.path.join(art_dir, copy_name), "wb") as d:
@@ -5780,8 +6021,9 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                                     pass
             if backdrop_url:
                 b_dst = os.path.join(art_dir, "backdrop.jpg")
-                if force_all or not os.path.exists(b_dst) or os.path.getsize(b_dst) < 15000:
+                if art_identity_changed or not os.path.exists(b_dst) or os.path.getsize(b_dst) < 15000:
                     if await _download_image(session, backdrop_url, b_dst):
+                        item_changed = True
                         for copy_name in ("fanart.jpg", "landscape.jpg"):
                             try:
                                 with open(b_dst, "rb") as s, open(os.path.join(art_dir, copy_name), "wb") as d:
@@ -5790,26 +6032,53 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
                                 pass
 
             FILE_ID_CACHE[key] = data
-            refreshed_paths.append(new_strm_path)
+            if item_changed:
+                refreshed_paths.append({
+                    "path": new_strm_path,
+                    "alt_paths": [old_strm_path] if old_strm_path and os.path.normpath(old_strm_path) != os.path.normpath(new_strm_path) else [],
+                    "title": official_title,
+                    "year": official_year,
+                    "tmdb_id": data.get("tmdb_id"),
+                    "imdb_id": imdb_id,
+                })
             updated_count += 1
-            logger.info(f"[IMDB-REINDEX] Successfully re-indexed '{official_title}' ({official_year}) [{imdb_id}]")
+            logger.info(
+                f"[IMDB-REINDEX] Processed '{official_title}' ({official_year}) [{imdb_id}] "
+                f"(changed={item_changed})"
+            )
 
         await save_cache_async()
 
-    # Step 3: Deduplicate & purge stale items from Jellyfin SQLite DB
-    await deduplicate_jellyfin_items()
+    # Step 3: Reconcile the database, but avoid forcing a library scan on an unchanged pass.
+    dedup_result = await deduplicate_jellyfin_items()
+    needs_scan = bool(refreshed_paths or (dedup_result or {}).get("removed", 0) or (dedup_result or {}).get("stale", 0))
+    if needs_scan:
+        await request_jellyfin_scan()
+    else:
+        logger.info("[IMDB-REINDEX] No filesystem/metadata changes; skipping redundant Jellyfin scan.")
 
-    # Step 4: Batch trigger single Jellyfin scan after reindexing completes
-    await request_jellyfin_scan()
-
-    # Step 5: Refresh newly created / updated items with bounded concurrency
+    # Step 4: Refresh changed items only. Refresh the leaf item, never its parent
+    # Season/Series for every episode; parent refreshes caused concurrent cancellation
+    # and repeated metadata churn in the runtime logs.
     async def _bounded_refreshes():
         sem = asyncio.Semaphore(4)
-        async def _one(p):
+        async def _one(job):
             async with sem:
-                await refresh_jellyfin_item_by_path(p, retries=2, delay=2.0)
-        await asyncio.gather(*(_one(p) for p in refreshed_paths), return_exceptions=True)
-    asyncio.create_task(_bounded_refreshes())
+                ok = await refresh_jellyfin_item_by_path(
+                    job["path"],
+                    alt_paths=job.get("alt_paths"),
+                    retries=4,
+                    delay=1.5,
+                    expected_title=job.get("title"),
+                    expected_year=job.get("year"),
+                    expected_tmdb_id=job.get("tmdb_id"),
+                    expected_imdb_id=job.get("imdb_id"),
+                )
+                if not ok:
+                    logger.error(f"[IMDB-REINDEX] Metadata postcondition failed for {job['path']}; routed to review if match existed.")
+        if refreshed_paths:
+            await asyncio.gather(*(_one(job) for job in refreshed_paths), return_exceptions=True)
+    await _bounded_refreshes()
 
     logger.info(f"[IMDB-REINDEX] Completed full IMDb re-indexing of {updated_count} media items.")
     return updated_count
