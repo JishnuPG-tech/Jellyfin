@@ -2413,7 +2413,10 @@ async def _enrich_media_metadata(entry):
                             entry["tmdb_id"] = 68721
                             entry["imdb_id"] = "tt1300854"
                             entry["year"] = 2013
-                            entry["_force_art_refresh"] = True
+                            entry["_force_art_refresh"] = bool(entry.get("_force_art_refresh")) or any(
+                str(identity_before_enrichment.get(_field) or "") != str(entry.get(_field) or "")
+                for _field in identity_before_enrichment
+            )
                             # The reindexer owns path migration; don't publish a
                             # new strm_path before physically moving the old pointer.
                             logger.info("[TMDB] Resolved Iron Man 3 directly to TMDB ID 68721")
@@ -2430,7 +2433,10 @@ async def _enrich_media_metadata(entry):
                             entry["clean_title"] = "Iron Man 2"
                             entry["tmdb_id"] = 10138
                             entry["year"] = 2010
-                            entry["_force_art_refresh"] = True
+                            entry["_force_art_refresh"] = bool(entry.get("_force_art_refresh")) or any(
+                str(identity_before_enrichment.get(_field) or "") != str(entry.get(_field) or "")
+                for _field in identity_before_enrichment
+            )
                             logger.info("[TMDB] Resolved Iron Man 2 directly to TMDB ID 10138")
                     except Exception as _exc:
                         pass
@@ -2445,7 +2451,10 @@ async def _enrich_media_metadata(entry):
                             entry["clean_title"] = "Iron Man"
                             entry["tmdb_id"] = 1726
                             entry["year"] = 2008
-                            entry["_force_art_refresh"] = True
+                            entry["_force_art_refresh"] = bool(entry.get("_force_art_refresh")) or any(
+                str(identity_before_enrichment.get(_field) or "") != str(entry.get(_field) or "")
+                for _field in identity_before_enrichment
+            )
                             logger.info("[TMDB] Resolved Iron Man directly to TMDB ID 1726")
                     except Exception as _exc:
                         pass
@@ -2502,7 +2511,10 @@ async def _enrich_media_metadata(entry):
             entry["year"] = 2026
             entry["tmdb_id"] = 1036081
             entry["imdb_id"] = "tt22797990"
-            entry["_force_art_refresh"] = True
+            entry["_force_art_refresh"] = bool(entry.get("_force_art_refresh")) or any(
+                str(identity_before_enrichment.get(_field) or "") != str(entry.get(_field) or "")
+                for _field in identity_before_enrichment
+            )
             hit = {
                 "id": 1036081,
                 "title": "Khalifa",
@@ -2537,7 +2549,10 @@ async def _enrich_media_metadata(entry):
             entry["year"] = 2025
             entry["imdb_id"] = "tt19244304"
             entry["tmdb_id"] = 200875
-            entry["_force_art_refresh"] = True
+            entry["_force_art_refresh"] = bool(entry.get("_force_art_refresh")) or any(
+                str(identity_before_enrichment.get(_field) or "") != str(entry.get(_field) or "")
+                for _field in identity_before_enrichment
+            )
             s_num = int(entry.get("season") or 1)
             e_num = int(entry.get("episode") or 1)
             entry["season"] = s_num
