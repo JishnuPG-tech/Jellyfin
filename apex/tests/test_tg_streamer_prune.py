@@ -1028,30 +1028,203 @@ def test_same_movie_multiple_releases_consolidated_as_alternate_versions(tmp_pat
     assert len(deleted_item_ids) == 0
 
 
-def test_refresh_jellyfin_item_handles_double_year_and_preserves_artwork(tmp_path):
-    """Verify that refresh_jellyfin_item_by_path:
-    1. Resolves Jellyfin items even when path drifted with legacy double-year (e.g. 'Aadu 3 (2026) (2026)').
-    2. Sends replaceAllImages='false' so authentic local posters/backdrops are NEVER replaced.
-    3. Handles mismatch between 'Aadu 3 Part 1 (2026)' and 'Aadu 3 (2026)'.
-    """
+def _extract_top_level_function(name, extra_ns=None):
     tree = ast.parse(SRC.read_text(encoding="utf-8"))
-    node = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "refresh_jellyfin_item_by_path")
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    ns = {
+        "os": os,
+        "shutil": shutil,
+        "uuid": uuid,
+        "Dict": Dict,
+        "Optional": Optional,
+        "logger": type(
+            "_Sink",
+            (),
+            {
+                "info": lambda *a, **k: None,
+                "warning": lambda *a, **k: None,
+                "error": lambda *a, **k: None,
+            },
+        )(),
+        "_record_review_job": lambda *a, **k: None,
+    }
+    if extra_ns:
+        ns.update(extra_ns)
+    exec(compile(ast.Module([node], []), "<ast>", "exec"), ns)
+    return ns[name]
 
-    # Target path that Apex wants to refresh
-    target_path = "/data/jellyfin/media/Movies/Malayalam/Aadu 3 Part 1 (2026)/Aadu 3 Part 1 (2026).strm"
 
-    # Legacy Jellyfin item registered with double-year under Tamil
-    jellyfin_items = [
-        {
-            "Id": "aadu-item-123",
-            "Name": "Karuppu Aadu",
-            "Type": "Movie",
-            "Path": "/data/jellyfin/media/Movies/Tamil/Aadu 3 (2026) (2026)/Aadu 3 (2026) (2026).strm",
-            "ProductionYear": 2020,
-        }
-    ]
+def test_write_text_if_changed_is_idempotent(tmp_path):
+    import uuid
 
+    write_if_changed = _extract_top_level_function("_write_text_if_changed")
+    path = tmp_path / "movie.nfo"
+
+    assert write_if_changed(str(path), "<movie>correct</movie>") is True
+    first_bytes = path.read_bytes()
+    first_mtime = path.stat().st_mtime_ns
+
+    assert write_if_changed(str(path), "<movie>correct</movie>") is False
+    assert path.read_bytes() == first_bytes
+    assert path.stat().st_mtime_ns == first_mtime
+    assert not list(tmp_path.glob("*.tmp.*"))
+
+
+def test_release_group_prefix_is_removed_only_from_matching_copy():
+    strip_prefix = _extract_top_level_function("_strip_known_release_group_prefix")
+    assert strip_prefix("@WMR_SpiderMan.Homecoming.2017.720p.mkv") == "SpiderMan.Homecoming.2017.720p.mkv"
+    assert strip_prefix("@WMR Resident Evil Apocalypse (2004).mkv") == "Resident Evil Apocalypse (2004).mkv"
+    assert strip_prefix("Spider-Man: Homecoming (2017).mkv") == "Spider-Man: Homecoming (2017).mkv"
+
+
+def test_legacy_folder_migration_preserves_sidecars_and_conflicts(tmp_path):
+    move_contents = _extract_top_level_function("_move_legacy_folder_contents_preserving_conflicts")
+    source = tmp_path / "Tamil" / "Aadu 3 (2026) (2026)"
+    target = tmp_path / "Malayalam" / "Aadu 3 Part 1 (2026)"
+    source.mkdir(parents=True)
+    target.mkdir(parents=True)
+
+    (source / "Aadu 3 (2026) (2026).strm").write_text("http://stream/46", encoding="utf-8")
+    (source / "movie.nfo").write_text("<movie>verified Aadu metadata</movie>", encoding="utf-8")
+    (source / "poster.jpg").write_bytes(b"legacy-poster")
+    (target / "poster.jpg").write_bytes(b"canonical-poster")
+
+    moved = move_contents(str(source), str(target), preferred_strm_name="Aadu 3 Part 1 (2026).strm")
+
+    assert (target / "Aadu 3 Part 1 (2026).strm").read_text(encoding="utf-8") == "http://stream/46"
+    assert (target / "movie.nfo").read_text(encoding="utf-8") == "<movie>verified Aadu metadata</movie>"
+    assert (target / "poster.jpg").read_bytes() == b"canonical-poster"
+    # Conflicting artwork is preserved rather than deleted or overwritten.
+    assert (source / "poster.jpg").read_bytes() == b"legacy-poster"
+    assert str(source / "Aadu 3 (2026) (2026).strm") in moved
+    assert source.exists()
+
+
+def test_refresh_uses_explicit_legacy_path_and_verifies_identity(tmp_path):
+    tree = ast.parse(SRC.read_text(encoding="utf-8"))
+    node = next(
+        n for n in tree.body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "refresh_jellyfin_item_by_path"
+    )
+
+    target_path = tmp_path / "Movies" / "Malayalam" / "Aadu 3 Part 1 (2026)" / "Aadu 3 Part 1 (2026).strm"
+    legacy_path = tmp_path / "Movies" / "Tamil" / "Aadu 3 (2026) (2026)" / "Aadu 3 (2026) (2026).strm"
+    target_path.parent.mkdir(parents=True)
+    legacy_path.parent.mkdir(parents=True)
+    target_path.write_text("http://stream/46", encoding="utf-8")
+    legacy_path.write_text("http://stream/46", encoding="utf-8")
+
+    jellyfin_items = [{
+        "Id": "aadu-item-123",
+        "Name": "Karuppu Aadu",
+        "Type": "Movie",
+        "Path": str(legacy_path),
+        "ProductionYear": 2020,
+        "ProviderIds": {"Tmdb": "1715385", "Imdb": "tt8142672"},
+    }]
+    refreshed_item = {
+        "Id": "aadu-item-123",
+        "Name": "Aadu 3",
+        "Type": "Movie",
+        "Path": str(legacy_path),
+        "ProductionYear": 2026,
+        "ProviderIds": {"Tmdb": "1715385", "Imdb": "tt8142672"},
+    }
     captured_post_calls = []
+
+    class MockResponse:
+        def __init__(self, status=200, json_data=None):
+            self.status = status
+            self._json = json_data or {}
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def json(self): return self._json
+
+    class MockSession:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def get(self, url, params=None, headers=None, timeout=None):
+            if url.endswith("/Items"):
+                return MockResponse(200, {"Items": jellyfin_items})
+            if url.endswith("/Items/aadu-item-123"):
+                return MockResponse(200, refreshed_item)
+            return MockResponse(404, {})
+        def post(self, url, params=None, headers=None, timeout=None):
+            captured_post_calls.append({"url": url, "params": params})
+            return MockResponse(204)
+
+    class MockAiohttp:
+        class TCPConnector:
+            def __init__(self, *a, **k): pass
+        ClientSession = MockSession
+
+    import socket
+    ns = {
+        "logger": type(
+            "_Sink",
+            (),
+            {
+                "info": lambda *a, **k: None,
+                "warning": lambda *a, **k: None,
+                "error": lambda *a, **k: None,
+            },
+        )(),
+        "os": os,
+        "re": re,
+        "socket": socket,
+        "aiohttp": MockAiohttp(),
+        "asyncio": asyncio,
+        "_jellyfin_auth_header": lambda: {"X-Emby-Token": "test-token"},
+        "_read_jellyfin_api_key": lambda: "test-token",
+        "_record_review_job": lambda *a, **k: None,
+    }
+    exec(compile(ast.Module([node], []), "<ast>", "exec"), ns)
+    refresh_func = ns["refresh_jellyfin_item_by_path"]
+
+    ok = asyncio.run(
+        refresh_func(
+            str(target_path),
+            alt_paths=[str(legacy_path)],
+            retries=1,
+            delay=0,
+            expected_title="Aadu 3",
+            expected_year=2026,
+            expected_tmdb_id=1715385,
+            expected_imdb_id="tt8142672",
+        )
+    )
+
+    assert ok is True
+    assert len(captured_post_calls) == 1  # never refresh SeasonId/SeriesId for an episode item
+    post_call = captured_post_calls[0]
+    assert "aadu-item-123" in post_call["url"]
+    assert post_call["params"].get("metadataRefreshMode") == "FullRefresh"
+    assert post_call["params"].get("replaceAllMetadata") == "true"
+    assert post_call["params"].get("replaceAllImages") == "false"
+
+
+def test_refresh_refuses_basename_only_match_for_an_unrelated_path(tmp_path):
+    tree = ast.parse(SRC.read_text(encoding="utf-8"))
+    node = next(
+        n for n in tree.body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "refresh_jellyfin_item_by_path"
+    )
+    target_path = tmp_path / "Movies" / "English" / "Spider-Man Homecoming (2017)" / "Spider-Man Homecoming (2017).strm"
+    unrelated_path = tmp_path / "Movies" / "Other" / "Spider-Man Homecoming (2017)" / "Spider-Man Homecoming (2017).strm"
+    target_path.parent.mkdir(parents=True)
+    unrelated_path.parent.mkdir(parents=True)
+    target_path.write_text("http://stream/target", encoding="utf-8")
+    unrelated_path.write_text("http://stream/unrelated", encoding="utf-8")
+    jellyfin_items = [{
+        "Id": "wrong-item-id",
+        "Name": "Spider-Man: Homecoming",
+        "Type": "Movie",
+        "Path": str(unrelated_path),
+        "ProductionYear": 2017,
+        "ProviderIds": {"Imdb": "tt2250912"},
+    }]
+    posted = []
 
     class MockResponse:
         def __init__(self, status=200, json_data=None):
@@ -1068,7 +1241,7 @@ def test_refresh_jellyfin_item_handles_double_year_and_preserves_artwork(tmp_pat
         def get(self, url, params=None, headers=None, timeout=None):
             return MockResponse(200, {"Items": jellyfin_items})
         def post(self, url, params=None, headers=None, timeout=None):
-            captured_post_calls.append({"url": url, "params": params})
+            posted.append(url)
             return MockResponse(204)
 
     class MockAiohttp:
@@ -1078,7 +1251,7 @@ def test_refresh_jellyfin_item_handles_double_year_and_preserves_artwork(tmp_pat
 
     import socket
     ns = {
-        "logger": type("_Sink", (), {"info": lambda *a, **k: None, "warning": lambda *a, **k: None})(),
+        "logger": type("_Sink", (), {"info": lambda *a, **k: None, "warning": lambda *a, **k: None, "error": lambda *a, **k: None})(),
         "os": os,
         "re": re,
         "socket": socket,
@@ -1086,22 +1259,9 @@ def test_refresh_jellyfin_item_handles_double_year_and_preserves_artwork(tmp_pat
         "asyncio": asyncio,
         "_jellyfin_auth_header": lambda: {"X-Emby-Token": "test-token"},
         "_read_jellyfin_api_key": lambda: "test-token",
-        "request_jellyfin_scan": lambda: None,
-        "parse_media_meta": lambda name: {
-            "clean_title": "Aadu 3" if "aadu" in name.lower() else name,
-            "year": 2026 if "2026" in name else 2020,
-        },
     }
     exec(compile(ast.Module([node], []), "<ast>", "exec"), ns)
-    refresh_func = ns["refresh_jellyfin_item_by_path"]
+    ok = asyncio.run(ns["refresh_jellyfin_item_by_path"](str(target_path), retries=1, delay=0))
 
-    ok = asyncio.run(refresh_func(target_path, retries=1))
-
-    assert ok is True
-    assert len(captured_post_calls) >= 1
-    post_call = captured_post_calls[0]
-    assert "aadu-item-123" in post_call["url"]
-    assert post_call["params"].get("metadataRefreshMode") == "FullRefresh"
-    assert post_call["params"].get("replaceAllMetadata") == "true"
-    # CRITICAL: Artwork must be preserved intact!
-    assert post_call["params"].get("replaceAllImages") == "false"
+    assert ok is False
+    assert posted == []
