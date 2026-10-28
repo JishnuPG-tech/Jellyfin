@@ -2266,9 +2266,6 @@ async def _enrich_media_metadata(entry):
                             entry["imdb_id"] = "tt1300854"
                             entry["year"] = 2013
                             entry["_force_art_refresh"] = True
-                            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-                            entry["target_dir"] = target_dir
-                            entry["strm_path"] = os.path.join(target_dir, "Iron Man 3 (2013).strm")
                             logger.info("[TMDB] Resolved Iron Man 3 directly to TMDB ID 68721")
                     except Exception as _exc:
                         pass
@@ -2285,9 +2282,6 @@ async def _enrich_media_metadata(entry):
                             entry["tmdb_id"] = 10138
                             entry["year"] = 2010
                             entry["_force_art_refresh"] = True
-                            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-                            entry["target_dir"] = target_dir
-                            entry["strm_path"] = os.path.join(target_dir, "Iron Man 2 (2010).strm")
                             logger.info("[TMDB] Resolved Iron Man 2 directly to TMDB ID 10138")
                     except Exception as _exc:
                         pass
@@ -2304,70 +2298,50 @@ async def _enrich_media_metadata(entry):
                             entry["tmdb_id"] = 1726
                             entry["year"] = 2008
                             entry["_force_art_refresh"] = True
-                            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-                            entry["target_dir"] = target_dir
-                            entry["strm_path"] = os.path.join(target_dir, "Iron Man (2008).strm")
                             logger.info("[TMDB] Resolved Iron Man directly to TMDB ID 1726")
                     except Exception as _exc:
                         pass
 
-        # "Aadu 3" / "Aadu 3 Part 1" (2026 Malayalam blockbuster comedy):
-        # Prevent any misclassification to Aadu 1 (2015, TMDB 324976) or Aadu 2 (2017, TMDB 489709)
+        # "Aadu 3" is a title/language hint only. Do not move files or assign
+        # an ID here: path migration is handled by the guarded reindex migration,
+        # and provider identity must pass normal title/year/language verification.
         if "aadu" in raw_name_lower and ("3" in raw_name_lower or "part" in raw_name_lower):
-            if hit and hit.get("id") in (324976, 489709):
-                hit = None
             entry["language"] = "Malayalam"
-            entry["title"] = "Aadu 3 Part 1"
-            entry["clean_title"] = "Aadu 3 Part 1"
-            entry["search_title"] = "aadu 3 part 1"
-            entry["strm_base"] = "Aadu 3 Part 1 (2026)"
+            entry["title"] = "Aadu 3"
+            entry["clean_title"] = "Aadu 3"
+            entry["search_title"] = "aadu 3"
             entry["year"] = 2026
-            entry["_force_art_refresh"] = True
-            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-            entry["target_dir"] = target_dir
-            entry["strm_path"] = os.path.join(target_dir, "Aadu 3 Part 1 (2026).strm")
-
-            # Relocate any legacy/misplaced Tamil directory into canonical Malayalam directory
-            for old_lang in ("Tamil", "Unknown"):
-                for old_f in ("Aadu 3 (2026)", "Aadu 3 (2026) (2026)", "Aadu 3 Part 1 (2026)"):
-                    old_cand_dir = os.path.join(MOVIES_DIR, old_lang, old_f)
-                    if os.path.isdir(old_cand_dir) and os.path.normpath(old_cand_dir).lower() != os.path.normpath(target_dir).lower():
-                        for sf in os.listdir(old_cand_dir):
-                            if sf.endswith(".strm"):
-                                old_sf = os.path.join(old_cand_dir, sf)
-                                new_sf = os.path.join(target_dir, "Aadu 3 Part 1 (2026).strm")
-                                if not os.path.exists(new_sf):
-                                    try:
-                                        os.makedirs(target_dir, exist_ok=True)
-                                        shutil.move(old_sf, new_sf)
-                                        logger.info(f"[MIGRATE-LANG] Relocated misplaced '{old_sf}' -> '{new_sf}'")
-                                    except Exception as e:
-                                        logger.warning(f"[MIGRATE-LANG] Move failed: {e}")
-                        try:
-                            for f in os.listdir(old_cand_dir):
-                                if not f.endswith(".strm"):
-                                    try:
-                                        os.remove(os.path.join(old_cand_dir, f))
-                                    except OSError:
-                                        pass
-                            os.rmdir(old_cand_dir)
-                            logger.info(f"[MIGRATE-LANG] Cleaned empty misplaced folder: {old_cand_dir}")
-                        except OSError:
-                            pass
+            if hit:
+                candidate_title = str(hit.get("title") or hit.get("name") or "")
+                candidate_year = _tmdb_year(hit)
+                candidate_norm = re.sub(r"[^a-z0-9]+", "", candidate_title.lower())
+                title_ok = "aadu" in candidate_norm and "3" in candidate_norm
+                year_ok = candidate_year is None or abs(int(candidate_year) - 2026) <= 1
+                if not (title_ok and year_ok):
+                    logger.warning(
+                        f"[TMDB-VERIFY] Rejecting Aadu candidate '{candidate_title}' "
+                        f"({candidate_year}); expected Aadu 3 around 2026"
+                    )
+                    hit = None
             if not hit:
-                for aadu_cand in ("Aadu 3 Part 1", "Aadu 3", "ആട് 3"):
+                for aadu_cand in ("Aadu 3", "Aadu 3 Part 1", "ആട് 3"):
                     try:
                         aadu_res = await _tmdb_search("movie", aadu_cand, 2026, language="en-US")
                         if not aadu_res:
                             aadu_res = await _tmdb_search("movie", aadu_cand, None, language="ml")
-                        a_match = best_tmdb_match(aadu_res, "Aadu 3 Part 1", "movie", 2026, language="ml")
-                        if a_match and a_match.get("id") not in (324976, 489709):
-                            hit = a_match
-                            used_query = aadu_cand
-                            break
+                        a_match = best_tmdb_match(aadu_res, "Aadu 3", "movie", 2026, language="ml")
+                        if a_match:
+                            candidate_title = str(a_match.get("title") or a_match.get("name") or "")
+                            candidate_year = _tmdb_year(a_match)
+                            candidate_norm = re.sub(r"[^a-z0-9]+", "", candidate_title.lower())
+                            if "aadu" in candidate_norm and "3" in candidate_norm and (
+                                candidate_year is None or abs(int(candidate_year) - 2026) <= 1
+                            ):
+                                hit = a_match
+                                used_query = aadu_cand
+                                break
                     except Exception:
                         pass
-
 
         # "Khalifa" (2026 Malayalam action-thriller starring Prithviraj Sukumaran, IMDb tt22797990):
         # Prevent any misclassification to unrelated indie films like "Queer Khalifa" (TMDB 1283921)
@@ -2378,14 +2352,10 @@ async def _enrich_media_metadata(entry):
             entry["title"] = "Khalifa"
             entry["clean_title"] = "Khalifa"
             entry["search_title"] = "khalifa"
-            entry["strm_base"] = "Khalifa (2026)"
             entry["year"] = 2026
             entry["tmdb_id"] = 1036081
             entry["imdb_id"] = "tt22797990"
             entry["_force_art_refresh"] = True
-            target_dir = strm_dir(MOVIES_DIR, SHOWS_DIR, entry)
-            entry["target_dir"] = target_dir
-            entry["strm_path"] = os.path.join(target_dir, "Khalifa (2026).strm")
             hit = {
                 "id": 1036081,
                 "title": "Khalifa",
