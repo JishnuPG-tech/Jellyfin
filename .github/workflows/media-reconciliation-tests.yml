@@ -1,0 +1,46 @@
+name: Media Reconciliation Regression Tests
+
+on:
+  push:
+    branches:
+      - fix/reconciliation-metadata-safety-2026-10-28
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install application and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Compile modified Python files
+        run: |
+          python -m py_compile \
+            apex/tg_streamer.py \
+            apex/apex_stream/tmdb_meta.py \
+            apex/tests/test_tg_streamer_prune.py \
+            apex/tests/test_tmdb_meta.py
+
+      - name: Run regression suite
+        env:
+          PYTHONPATH: apex
+        run: python -m pytest apex/tests -q
