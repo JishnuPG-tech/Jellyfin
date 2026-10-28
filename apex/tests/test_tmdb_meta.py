@@ -29,6 +29,12 @@ class TestParseMediaMeta:
         assert "malayalam" not in meta["search_title"]
         assert "wmr" not in meta["search_title"]
 
+    def test_leading_release_group_handle_is_removed_before_identity_matching(self):
+        meta = parse_media_meta("@WMR_SpiderMan.Homecoming.2017.720p.BluRay.x264.mp4")
+        assert meta["year"] == 2017
+        assert meta["search_title"] == "spiderman homecoming"
+        assert "wmr" not in meta["search_title"]
+
     def test_tv_sxe(self):
         meta = parse_media_meta("Breaking Bad S01E01 720p x264")
         assert meta["is_tv"] is True
