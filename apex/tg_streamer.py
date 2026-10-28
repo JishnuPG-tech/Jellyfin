@@ -1578,7 +1578,12 @@ async def _fetch_imdb_suggestion(query: str, year: Optional[int] = None, media_t
                         else:
                             title_score = 0.0
 
-                        if title_score <= 0.0:
+                        # Fail closed on weak title evidence. A matching year alone must
+                        # not make "Karuppu Aadu" match "Aadu", or "Iron Man" match
+                        # "Iron Man 3". One-token queries require exact normalized title.
+                        if len(target_tokens) <= 1 and s_norm != target_str:
+                            continue
+                        if title_score < 2.0:
                             continue
 
                         # 2. Year alignment score with strict movie vs tv validation
@@ -1907,7 +1912,12 @@ def _strip_known_release_group_prefix(name: str) -> str:
         if text.casefold().startswith(prefix.casefold()):
             tail = text[len(prefix):]
             if not tail or tail[0] in " _.-":
-                return tail.lstrip(" _.-")
+                text = tail.lstrip(" _.-")
+                break
+    # Normalize camel-case release names in the matching copy only:
+    # SpiderMan -> Spider Man; ITWelcome -> IT Welcome. The raw filename is kept.
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
+    text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", text)
     return text
 
 
@@ -3576,8 +3586,8 @@ async def refresh_jellyfin_item_by_path(
     A successful HTTP response is not considered success until the stored item
     metadata satisfies the supplied identity postconditions.
     """
-    if not strm_path or not os.path.isfile(strm_path):
-        logger.warning(f"[JELLYFIN] Refresh skipped: target .strm does not exist: {strm_path}")
+    if not strm_path:
+        logger.warning("[JELLYFIN] Refresh skipped: no target .strm path supplied")
         return False
     headers = _jellyfin_auth_header()
     if not headers:
@@ -3589,6 +3599,9 @@ async def refresh_jellyfin_item_by_path(
         if candidate and os.path.isfile(candidate):
             existing_alt_paths.append(os.path.normpath(candidate))
             norm_paths.add(os.path.normpath(candidate))
+    if not os.path.isfile(strm_path) and not existing_alt_paths:
+        logger.warning(f"[JELLYFIN] Refresh skipped: neither target nor explicit legacy .strm exists: {strm_path}")
+        return False
 
     params = {
         "Recursive": "true",
@@ -5865,7 +5878,9 @@ async def reindex_all_with_imdb(force_all: bool = True) -> int:
             ext = extract_media_info(matching_name)
             is_tv = bool(ext.get("is_tv") or data.get("is_tv") or parsed.get("is_tv"))
             mtype = "tv" if is_tv else "movie"
-            title = ext.get("title") or parsed.get("clean_title") or data.get("clean_title") or data.get("title") or ""
+            title = _strip_known_release_group_prefix(
+                ext.get("title") or parsed.get("clean_title") or data.get("clean_title") or data.get("title") or ""
+            )
             year = ext.get("year") or parsed.get("year") or data.get("year")
             season = ext.get("season") or data.get("season") or 1
             episode = ext.get("episode") or data.get("episode") or 1
